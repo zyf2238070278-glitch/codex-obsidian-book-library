@@ -2,9 +2,10 @@ import errno
 import os
 import shutil
 import stat
-from collections.abc import Iterator
+from collections.abc import Iterator, Set
 from contextlib import contextmanager
 from pathlib import Path
+from threading import Lock
 
 from book_agent.config import AppPaths
 
@@ -25,11 +26,16 @@ _RESERVE_OPEN_FLAGS = (
     | getattr(os, "O_CLOEXEC", 0)
     | getattr(os, "O_NOFOLLOW", 0)
 )
+_FileIdentity = tuple[int, int]
 
 
 class VaultManager:
     def __init__(self, paths: AppPaths) -> None:
         self.paths = paths
+        self._ownership_lock = Lock()
+        self._owned_staged: dict[Path, _FileIdentity] = {}
+        self._issued_names: set[str] = set()
+        self._reserved_names: set[str] = set()
 
     def ensure_layout(self) -> None:
         directories = (
@@ -52,25 +58,44 @@ class VaultManager:
                 "inbox",
                 create=False,
             ) as (inbox, inbox_fd):
-                target_name, target_fd, target_info = self._reserve_target(
+                target_name, target_fd, target_info = self._reserve_stage_target(
                     inbox_fd,
                     resolved_source.name,
                     stat.S_IMODE(source_info.st_mode),
                 )
-                self._copy_to_reserved_target(
-                    source_fd,
-                    source_info,
-                    inbox_fd,
-                    target_name,
-                    target_fd,
-                    target_info,
-                    source,
-                )
-                return inbox / target_name
+                try:
+                    self._copy_to_reserved_target(
+                        source_fd,
+                        source_info,
+                        inbox_fd,
+                        target_name,
+                        target_fd,
+                        target_info,
+                        source,
+                    )
+                except BaseException:
+                    self._release_stage_reservation(target_name)
+                    raise
+
+                staged = inbox / target_name
+                self._record_staged_ownership(staged, target_name, target_info)
+                return staged
         finally:
             os.close(source_fd)
 
     def promote(self, staged: Path) -> Path:
+        staged_path, identity = self._consume_staged_ownership(staged)
+        try:
+            return self._promote_owned(staged_path, identity)
+        except BaseException:
+            self._restore_staged_ownership(staged_path, identity)
+            raise
+
+    def _promote_owned(
+        self,
+        staged: Path,
+        identity: _FileIdentity,
+    ) -> Path:
         with self._managed_directory(
             self.paths.inbox,
             "inbox",
@@ -81,6 +106,11 @@ class VaultManager:
                 inbox,
                 inbox_fd,
             )
+            if self._identity(staged_info) != identity:
+                raise ValueError(
+                    f"Staged file no longer matches the generation created by this "
+                    f"VaultManager: {staged}"
+                )
             with self._managed_directory(
                 self.paths.originals,
                 "originals",
@@ -160,6 +190,78 @@ class VaultManager:
                     raise
 
         raise AssertionError("candidate name generation is infinite")
+
+    def _reserve_stage_target(
+        self,
+        directory_fd: int,
+        filename: str,
+        mode: int,
+    ) -> tuple[str, int, os.stat_result]:
+        with self._ownership_lock:
+            unavailable_names = self._issued_names | self._reserved_names
+            reserved = self._reserve_target(
+                directory_fd,
+                filename,
+                mode,
+                excluded_names=unavailable_names,
+            )
+            self._reserved_names.add(reserved[0])
+            return reserved
+
+    def _record_staged_ownership(
+        self,
+        staged: Path,
+        staged_name: str,
+        staged_info: os.stat_result,
+    ) -> None:
+        with self._ownership_lock:
+            self._reserved_names.discard(staged_name)
+            self._issued_names.add(staged_name)
+            self._owned_staged[staged] = self._identity(staged_info)
+
+    def _release_stage_reservation(self, staged_name: str) -> None:
+        with self._ownership_lock:
+            self._reserved_names.discard(staged_name)
+
+    def _consume_staged_ownership(
+        self,
+        staged: Path,
+    ) -> tuple[Path, _FileIdentity]:
+        staged_path = self._normalized_staged_path(staged)
+        with self._ownership_lock:
+            try:
+                identity = self._owned_staged.pop(staged_path)
+            except KeyError as exc:
+                raise ValueError(
+                    f"Staged path was not created by this VaultManager or has "
+                    f"already been promoted: {staged}"
+                ) from exc
+        return staged_path, identity
+
+    def _restore_staged_ownership(
+        self,
+        staged: Path,
+        identity: _FileIdentity,
+    ) -> None:
+        try:
+            current = staged.lstat()
+        except OSError:
+            return
+        if not stat.S_ISREG(current.st_mode) or self._identity(current) != identity:
+            return
+
+        with self._ownership_lock:
+            self._owned_staged.setdefault(staged, identity)
+
+    @staticmethod
+    def _normalized_staged_path(staged: Path) -> Path:
+        try:
+            expanded = Path(staged).expanduser()
+            return Path(os.path.abspath(os.fspath(expanded)))
+        except (OSError, RuntimeError, TypeError) as exc:
+            raise ValueError(
+                f"Staged path was not created by this VaultManager: {staged}"
+            ) from exc
 
     def _open_source(self, source: Path) -> tuple[Path, int, os.stat_result]:
         try:
@@ -331,8 +433,12 @@ class VaultManager:
         directory_fd: int,
         filename: str,
         mode: int,
+        *,
+        excluded_names: Set[str] = frozenset(),
     ) -> tuple[str, int, os.stat_result]:
         for candidate_name in VaultManager._candidate_names(filename):
+            if candidate_name in excluded_names:
+                continue
             try:
                 target_fd = os.open(
                     candidate_name,
@@ -527,7 +633,11 @@ class VaultManager:
 
     @staticmethod
     def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
-        return first.st_dev == second.st_dev and first.st_ino == second.st_ino
+        return VaultManager._identity(first) == VaultManager._identity(second)
+
+    @staticmethod
+    def _identity(file_info: os.stat_result) -> _FileIdentity:
+        return file_info.st_dev, file_info.st_ino
 
     @staticmethod
     def _entry_matches(

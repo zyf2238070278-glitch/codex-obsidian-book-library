@@ -80,18 +80,25 @@ def test_promote_rejects_symlinked_originals_outside_project(
     paths.root.mkdir()
     manager = VaultManager(paths)
     manager.ensure_layout()
+    source = tmp_path / "book.txt"
+    source.write_text("secret", encoding="utf-8")
+    staged = manager.stage(source)
     outside = tmp_path / "outside"
     outside.mkdir()
     paths.originals.rmdir()
     paths.originals.symlink_to(outside, target_is_directory=True)
-    staged = paths.inbox / "book.txt"
-    staged.write_text("secret", encoding="utf-8")
 
     with pytest.raises(ValueError, match="originals"):
         manager.promote(staged)
 
     assert staged.is_file()
     assert not (outside / "book.txt").exists()
+    paths.originals.unlink()
+    paths.originals.mkdir()
+
+    promoted = manager.promote(staged)
+
+    assert promoted.read_text(encoding="utf-8") == "secret"
 
 
 def test_stage_treats_dangling_target_symlink_as_occupied(tmp_path: Path) -> None:
@@ -161,7 +168,7 @@ def test_promote_rejects_directory_in_inbox(tmp_path: Path) -> None:
     staged_directory = paths.inbox / "book"
     staged_directory.mkdir()
 
-    with pytest.raises(ValueError, match="direct regular file"):
+    with pytest.raises(ValueError, match="created by this VaultManager"):
         manager.promote(staged_directory)
 
     assert staged_directory.is_dir()
@@ -176,7 +183,7 @@ def test_promote_rejects_non_direct_inbox_entry(tmp_path: Path) -> None:
     staged = nested / "book.txt"
     staged.write_text("nested", encoding="utf-8")
 
-    with pytest.raises(ValueError, match="direct regular file"):
+    with pytest.raises(ValueError, match="created by this VaultManager"):
         manager.promote(staged)
 
     assert staged.is_file()
@@ -186,9 +193,12 @@ def test_promote_rejects_symlinked_inbox_entry(tmp_path: Path) -> None:
     paths = AppPaths.from_root(tmp_path)
     manager = VaultManager(paths)
     manager.ensure_layout()
+    source = tmp_path / "book.txt"
+    source.write_text("original", encoding="utf-8")
+    staged_symlink = manager.stage(source)
     real_file = paths.inbox / "real.txt"
     real_file.write_text("real", encoding="utf-8")
-    staged_symlink = paths.inbox / "book.txt"
+    staged_symlink.unlink()
     staged_symlink.symlink_to(real_file.name)
 
     with pytest.raises(ValueError, match="direct regular file"):
@@ -204,8 +214,9 @@ def test_promote_treats_dangling_target_symlink_as_occupied(
     paths = AppPaths.from_root(tmp_path)
     manager = VaultManager(paths)
     manager.ensure_layout()
-    staged = paths.inbox / "book.txt"
-    staged.write_text("inside", encoding="utf-8")
+    source = tmp_path / "book.txt"
+    source.write_text("inside", encoding="utf-8")
+    staged = manager.stage(source)
     external_target = tmp_path / "external.txt"
     dangling = paths.originals / "book.txt"
     dangling.symlink_to(external_target)
@@ -223,10 +234,11 @@ def test_concurrent_promote_calls_claim_staged_file_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     paths = AppPaths.from_root(tmp_path)
-    managers = (VaultManager(paths), VaultManager(paths))
-    managers[0].ensure_layout()
-    staged = paths.inbox / "source.txt"
-    staged.write_text("payload", encoding="utf-8")
+    manager = VaultManager(paths)
+    manager.ensure_layout()
+    source = tmp_path / "source.txt"
+    source.write_text("payload", encoding="utf-8")
+    staged = manager.stage(source)
     staged_info = staged.stat()
     inbox_info = paths.inbox.stat()
     public_unlink_barrier = Barrier(2)
@@ -268,7 +280,7 @@ def test_concurrent_promote_calls_claim_staged_file_once(
             return exc
 
     with ThreadPoolExecutor(max_workers=2) as executor:
-        results = list(executor.map(promote, managers))
+        results = list(executor.map(promote, (manager, manager)))
 
     successes = [result for result in results if isinstance(result, Path)]
     failures = [result for result in results if isinstance(result, ValueError)]
@@ -276,7 +288,7 @@ def test_concurrent_promote_calls_claim_staged_file_once(
     assert len(staged_unlink_attempts) == 1
     assert len(successes) == 1
     assert len(failures) == 1
-    assert "already being promoted" in str(failures[0])
+    assert "already" in str(failures[0])
     assert len(originals) == 1
     assert originals[0].read_text(encoding="utf-8") == "payload"
     assert list(paths.inbox.iterdir()) == []
@@ -289,8 +301,9 @@ def test_promote_cleans_candidate_if_staged_entry_changes_during_link(
     paths = AppPaths.from_root(tmp_path)
     manager = VaultManager(paths)
     manager.ensure_layout()
-    staged = paths.inbox / "book.txt"
-    staged.write_text("original", encoding="utf-8")
+    source = tmp_path / "book.txt"
+    source.write_text("original", encoding="utf-8")
+    staged = manager.stage(source)
     original_link = os.link
 
     def replace_then_link(
@@ -336,8 +349,9 @@ def test_promote_cleans_linked_symlink_if_staged_entry_changes_during_link(
     paths = AppPaths.from_root(tmp_path)
     manager = VaultManager(paths)
     manager.ensure_layout()
-    staged = paths.inbox / "book.txt"
-    staged.write_text("original", encoding="utf-8")
+    source = tmp_path / "book.txt"
+    source.write_text("original", encoding="utf-8")
+    staged = manager.stage(source)
     outside = tmp_path / "outside.txt"
     outside.write_text("outside", encoding="utf-8")
     original_link = os.link
@@ -473,3 +487,71 @@ def test_stage_reports_missing_source_as_value_error(tmp_path: Path) -> None:
 
     with pytest.raises(ValueError, match="Source file"):
         manager.stage(tmp_path / "missing.txt")
+
+
+def test_promote_rejects_manually_dropped_regular_file(tmp_path: Path) -> None:
+    paths = AppPaths.from_root(tmp_path)
+    manager = VaultManager(paths)
+    manager.ensure_layout()
+    manual = paths.inbox / "manual.txt"
+    manual.write_text("manual", encoding="utf-8")
+
+    with pytest.raises(ValueError, match="created by this VaultManager"):
+        manager.promote(manual)
+
+    assert manual.read_text(encoding="utf-8") == "manual"
+
+
+def test_promote_rejects_file_staged_by_another_manager(tmp_path: Path) -> None:
+    paths = AppPaths.from_root(tmp_path)
+    owner = VaultManager(paths)
+    other = VaultManager(paths)
+    owner.ensure_layout()
+    source = tmp_path / "book.txt"
+    source.write_text("owned", encoding="utf-8")
+    staged = owner.stage(source)
+
+    with pytest.raises(ValueError, match="created by this VaultManager"):
+        other.promote(staged)
+
+    promoted = owner.promote(staged)
+    assert promoted.read_text(encoding="utf-8") == "owned"
+
+
+def test_stale_promotes_do_not_consume_later_same_name_generations(
+    tmp_path: Path,
+) -> None:
+    paths = AppPaths.from_root(tmp_path / "project")
+    paths.root.mkdir()
+    manager = VaultManager(paths)
+    manager.ensure_layout()
+    payloads = {f"payload-{index}" for index in range(24)}
+    staged_paths: list[Path] = []
+    promoted_paths: list[Path] = []
+    previous_staged: Path | None = None
+
+    for index, payload in enumerate(sorted(payloads)):
+        source_directory = tmp_path / "sources" / str(index)
+        source_directory.mkdir(parents=True)
+        source = source_directory / "book.txt"
+        source.write_text(payload, encoding="utf-8")
+        staged = manager.stage(source)
+        staged_paths.append(staged)
+
+        if previous_staged is not None:
+            with pytest.raises(ValueError, match="created by this VaultManager"):
+                manager.promote(previous_staged)
+
+        promoted_paths.append(manager.promote(staged))
+        previous_staged = staged
+
+    assert previous_staged is not None
+    with pytest.raises(ValueError, match="created by this VaultManager"):
+        manager.promote(previous_staged)
+
+    originals = list(paths.originals.iterdir())
+    assert len({path.name for path in staged_paths}) == 24
+    assert len(promoted_paths) == 24
+    assert len(originals) == 24
+    assert {path.read_text(encoding="utf-8") for path in originals} == payloads
+    assert list(paths.inbox.iterdir()) == []

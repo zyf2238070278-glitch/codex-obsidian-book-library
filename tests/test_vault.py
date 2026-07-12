@@ -3,7 +3,7 @@ import shutil
 import stat
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
-from threading import Barrier
+from threading import Barrier, Lock
 
 import pytest
 
@@ -216,6 +216,70 @@ def test_promote_treats_dangling_target_symlink_as_occupied(
     assert promoted.read_text(encoding="utf-8") == "inside"
     assert dangling.is_symlink()
     assert not external_target.exists()
+
+
+def test_concurrent_promote_calls_claim_staged_file_once(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = AppPaths.from_root(tmp_path)
+    managers = (VaultManager(paths), VaultManager(paths))
+    managers[0].ensure_layout()
+    staged = paths.inbox / "source.txt"
+    staged.write_text("payload", encoding="utf-8")
+    staged_info = staged.stat()
+    inbox_info = paths.inbox.stat()
+    public_unlink_barrier = Barrier(2)
+    attempts_lock = Lock()
+    staged_unlink_attempts: list[str] = []
+    original_unlink = os.unlink
+
+    def synchronized_unlink(
+        path: str,
+        *args: object,
+        dir_fd: int | None = None,
+        **kwargs: object,
+    ) -> None:
+        if dir_fd is not None:
+            directory_info = os.fstat(dir_fd)
+            try:
+                entry_info = os.stat(path, dir_fd=dir_fd, follow_symlinks=False)
+            except FileNotFoundError:
+                entry_info = None
+            if (
+                entry_info is not None
+                and (directory_info.st_dev, directory_info.st_ino)
+                == (inbox_info.st_dev, inbox_info.st_ino)
+                and (entry_info.st_dev, entry_info.st_ino)
+                == (staged_info.st_dev, staged_info.st_ino)
+            ):
+                with attempts_lock:
+                    staged_unlink_attempts.append(path)
+                if path == staged.name:
+                    public_unlink_barrier.wait(timeout=5)
+        original_unlink(path, *args, dir_fd=dir_fd, **kwargs)
+
+    monkeypatch.setattr(os, "unlink", synchronized_unlink)
+
+    def promote(manager: VaultManager) -> Path | ValueError:
+        try:
+            return manager.promote(staged)
+        except ValueError as exc:
+            return exc
+
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        results = list(executor.map(promote, managers))
+
+    successes = [result for result in results if isinstance(result, Path)]
+    failures = [result for result in results if isinstance(result, ValueError)]
+    originals = list(paths.originals.iterdir())
+    assert len(staged_unlink_attempts) == 1
+    assert len(successes) == 1
+    assert len(failures) == 1
+    assert "already being promoted" in str(failures[0])
+    assert len(originals) == 1
+    assert originals[0].read_text(encoding="utf-8") == "payload"
+    assert list(paths.inbox.iterdir()) == []
 
 
 def test_promote_cleans_candidate_if_staged_entry_changes_during_link(

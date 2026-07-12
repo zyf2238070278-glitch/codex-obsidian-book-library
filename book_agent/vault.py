@@ -86,68 +86,78 @@ class VaultManager:
                 "originals",
                 create=False,
             ) as (originals, originals_fd):
-                for target_name in self._candidate_names(staged_name):
-                    try:
-                        os.link(
-                            staged_name,
-                            target_name,
-                            src_dir_fd=inbox_fd,
-                            dst_dir_fd=originals_fd,
-                            follow_symlinks=False,
-                        )
-                    except FileExistsError:
-                        continue
-                    except OSError as exc:
-                        if exc.errno == errno.EEXIST:
-                            continue
-                        if exc.errno == errno.EXDEV:
-                            raise ValueError(
-                                "Inbox and originals must be on the same filesystem"
-                            ) from exc
-                        raise ValueError(
-                            f"Could not safely promote staged file: {staged}"
-                        ) from exc
-
-                    cleanup_info = staged_info
-                    try:
-                        current_staged_info = os.stat(
-                            staged_name,
-                            dir_fd=inbox_fd,
-                            follow_symlinks=False,
-                        )
-                        linked_info = os.stat(
-                            target_name,
-                            dir_fd=originals_fd,
-                            follow_symlinks=False,
-                        )
-                        if self._same_file(current_staged_info, linked_info):
-                            cleanup_info = linked_info
-                        if not self._same_file(
-                            current_staged_info,
-                            staged_info,
-                        ) or not self._same_file(linked_info, staged_info):
-                            raise ValueError(
-                                f"Staged file changed during promotion: {staged}"
+                claim_name = self._claim_staged_entry(
+                    inbox_fd,
+                    staged_name,
+                    staged_info,
+                    staged,
+                )
+                try:
+                    for target_name in self._candidate_names(staged_name):
+                        try:
+                            os.link(
+                                claim_name,
+                                target_name,
+                                src_dir_fd=inbox_fd,
+                                dst_dir_fd=originals_fd,
+                                follow_symlinks=False,
                             )
-                        os.unlink(staged_name, dir_fd=inbox_fd)
-                    except ValueError:
-                        self._unlink_if_same(
-                            originals_fd,
-                            target_name,
-                            cleanup_info,
-                        )
-                        raise
-                    except OSError as exc:
-                        self._unlink_if_same(
-                            originals_fd,
-                            target_name,
-                            cleanup_info,
-                        )
-                        raise ValueError(
-                            f"Could not safely complete promotion: {staged}"
-                        ) from exc
+                        except FileExistsError:
+                            continue
+                        except OSError as exc:
+                            if exc.errno == errno.EEXIST:
+                                continue
+                            if exc.errno == errno.EXDEV:
+                                raise ValueError(
+                                    "Inbox and originals must be on the same filesystem"
+                                ) from exc
+                            raise ValueError(
+                                f"Could not safely promote staged file: {staged}"
+                            ) from exc
 
-                    return originals / target_name
+                        cleanup_info = staged_info
+                        try:
+                            current_claim_info = os.stat(
+                                claim_name,
+                                dir_fd=inbox_fd,
+                                follow_symlinks=False,
+                            )
+                            linked_info = os.stat(
+                                target_name,
+                                dir_fd=originals_fd,
+                                follow_symlinks=False,
+                            )
+                            if self._same_file(current_claim_info, linked_info):
+                                cleanup_info = linked_info
+                            if not self._same_file(
+                                current_claim_info,
+                                staged_info,
+                            ) or not self._same_file(linked_info, staged_info):
+                                raise ValueError(
+                                    f"Staged file changed during promotion: {staged}"
+                                )
+                            os.unlink(claim_name, dir_fd=inbox_fd)
+                        except ValueError:
+                            self._unlink_if_same(
+                                originals_fd,
+                                target_name,
+                                cleanup_info,
+                            )
+                            raise
+                        except OSError as exc:
+                            self._unlink_if_same(
+                                originals_fd,
+                                target_name,
+                                cleanup_info,
+                            )
+                            raise ValueError(
+                                f"Could not safely complete promotion: {staged}"
+                            ) from exc
+
+                        return originals / target_name
+                except BaseException:
+                    self._restore_claim(inbox_fd, claim_name, staged_name)
+                    raise
 
         raise AssertionError("candidate name generation is infinite")
 
@@ -438,6 +448,72 @@ class VaultManager:
             )
 
         return staged_path.name, staged_info
+
+    @staticmethod
+    def _claim_staged_entry(
+        inbox_fd: int,
+        staged_name: str,
+        staged_info: os.stat_result,
+        staged: Path,
+    ) -> str:
+        claim_name, claim_fd, placeholder_info = VaultManager._reserve_target(
+            inbox_fd,
+            f".{staged_name}.claim",
+            0o600,
+        )
+        try:
+            os.close(claim_fd)
+        except OSError as exc:
+            VaultManager._unlink_if_same(inbox_fd, claim_name, placeholder_info)
+            raise ValueError(f"Could not prepare staged file claim: {staged}") from exc
+
+        try:
+            os.replace(
+                staged_name,
+                claim_name,
+                src_dir_fd=inbox_fd,
+                dst_dir_fd=inbox_fd,
+            )
+        except FileNotFoundError as exc:
+            VaultManager._unlink_if_same(inbox_fd, claim_name, placeholder_info)
+            raise ValueError(
+                f"Staged file is already being promoted or unavailable: {staged}"
+            ) from exc
+        except OSError as exc:
+            VaultManager._unlink_if_same(inbox_fd, claim_name, placeholder_info)
+            raise ValueError(f"Could not safely claim staged file: {staged}") from exc
+
+        try:
+            claimed_info = os.stat(
+                claim_name,
+                dir_fd=inbox_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            VaultManager._restore_claim(inbox_fd, claim_name, staged_name)
+            raise ValueError(f"Could not inspect staged file claim: {staged}") from exc
+        if not VaultManager._same_file(claimed_info, staged_info):
+            VaultManager._restore_claim(inbox_fd, claim_name, staged_name)
+            raise ValueError(f"Staged file changed while being claimed: {staged}")
+
+        return claim_name
+
+    @staticmethod
+    def _restore_claim(inbox_fd: int, claim_name: str, staged_name: str) -> None:
+        try:
+            os.link(
+                claim_name,
+                staged_name,
+                src_dir_fd=inbox_fd,
+                dst_dir_fd=inbox_fd,
+                follow_symlinks=False,
+            )
+        except OSError:
+            return
+        try:
+            os.unlink(claim_name, dir_fd=inbox_fd)
+        except OSError:
+            pass
 
     @staticmethod
     def _candidate_names(filename: str) -> Iterator[str]:

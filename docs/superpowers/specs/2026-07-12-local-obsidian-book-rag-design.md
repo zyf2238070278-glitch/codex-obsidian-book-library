@@ -2,7 +2,7 @@
 
 **Date:** 2026-07-12
 
-**Status:** Concept approved in conversation; awaiting written-spec review
+**Status:** Approved by the user on 2026-07-12
 
 **Target:** A local-first book library operated entirely through Codex conversations, with an Obsidian-compatible vault for storage and browsing.
 

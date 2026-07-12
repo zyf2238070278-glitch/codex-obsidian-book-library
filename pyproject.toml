@@ -1,0 +1,30 @@
+[project]
+name = "local-obsidian-book-rag"
+version = "0.1.0"
+requires-python = ">=3.11"
+dependencies = [
+    "beautifulsoup4>=4.12",
+    "ebooklib>=0.18",
+    "mcp>=1.9,<2",
+    "numpy>=1.26",
+    "pymupdf>=1.24",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8",
+    "pytest-cov>=5",
+]
+semantic = [
+    "sentence-transformers>=3",
+]
+
+[tool.uv]
+package = false
+
+[tool.pytest.ini_options]
+pythonpath = ["."]
+testpaths = ["tests"]
+
+[tool.coverage.run]
+source = ["book_agent"]

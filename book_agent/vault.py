@@ -1,7 +1,30 @@
+import errno
+import os
 import shutil
+import stat
+from collections.abc import Iterator
+from contextlib import contextmanager
 from pathlib import Path
 
 from book_agent.config import AppPaths
+
+
+_DIRECTORY_OPEN_FLAGS = (
+    os.O_RDONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_DIRECTORY", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
+_SOURCE_OPEN_FLAGS = (
+    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+)
+_RESERVE_OPEN_FLAGS = (
+    os.O_CREAT
+    | os.O_EXCL
+    | os.O_WRONLY
+    | getattr(os, "O_CLOEXEC", 0)
+    | getattr(os, "O_NOFOLLOW", 0)
+)
 
 
 class VaultManager:
@@ -10,39 +33,447 @@ class VaultManager:
 
     def ensure_layout(self) -> None:
         directories = (
-            self.paths.inbox,
-            self.paths.originals,
-            self.paths.parsed,
-            self.paths.notes,
-            self.paths.models,
-            self.paths.database.parent,
+            ("inbox", self.paths.inbox),
+            ("originals", self.paths.originals),
+            ("parsed", self.paths.parsed),
+            ("notes", self.paths.notes),
+            ("models", self.paths.models),
+            ("database.parent", self.paths.database.parent),
         )
-        for directory in directories:
-            directory.mkdir(parents=True, exist_ok=True)
+        for label, directory in directories:
+            with self._managed_directory(directory, label, create=True):
+                pass
 
     def stage(self, source: Path) -> Path:
-        resolved_source = source.resolve(strict=True)
-        if not resolved_source.is_file():
-            raise ValueError(f"Source is not a file: {source}")
-
-        target = self._available_path(self.paths.inbox / resolved_source.name)
-        return Path(shutil.copy2(resolved_source, target))
+        resolved_source, source_fd, source_info = self._open_source(source)
+        try:
+            with self._managed_directory(
+                self.paths.inbox,
+                "inbox",
+                create=False,
+            ) as (inbox, inbox_fd):
+                target_name, target_fd, target_info = self._reserve_target(
+                    inbox_fd,
+                    resolved_source.name,
+                    stat.S_IMODE(source_info.st_mode),
+                )
+                self._copy_to_reserved_target(
+                    source_fd,
+                    source_info,
+                    inbox_fd,
+                    target_name,
+                    target_fd,
+                    target_info,
+                    source,
+                )
+                return inbox / target_name
+        finally:
+            os.close(source_fd)
 
     def promote(self, staged: Path) -> Path:
-        resolved_staged = staged.resolve(strict=True)
-        resolved_staged.relative_to(self.paths.inbox.resolve(strict=True))
+        with self._managed_directory(
+            self.paths.inbox,
+            "inbox",
+            create=False,
+        ) as (inbox, inbox_fd):
+            staged_name, staged_info = self._direct_regular_entry(
+                staged,
+                inbox,
+                inbox_fd,
+            )
+            with self._managed_directory(
+                self.paths.originals,
+                "originals",
+                create=False,
+            ) as (originals, originals_fd):
+                for target_name in self._candidate_names(staged_name):
+                    try:
+                        os.link(
+                            staged_name,
+                            target_name,
+                            src_dir_fd=inbox_fd,
+                            dst_dir_fd=originals_fd,
+                            follow_symlinks=False,
+                        )
+                    except FileExistsError:
+                        continue
+                    except OSError as exc:
+                        if exc.errno == errno.EEXIST:
+                            continue
+                        if exc.errno == errno.EXDEV:
+                            raise ValueError(
+                                "Inbox and originals must be on the same filesystem"
+                            ) from exc
+                        raise ValueError(
+                            f"Could not safely promote staged file: {staged}"
+                        ) from exc
 
-        target = self._available_path(self.paths.originals / resolved_staged.name)
-        return resolved_staged.replace(target)
+                    cleanup_info = staged_info
+                    try:
+                        current_staged_info = os.stat(
+                            staged_name,
+                            dir_fd=inbox_fd,
+                            follow_symlinks=False,
+                        )
+                        linked_info = os.stat(
+                            target_name,
+                            dir_fd=originals_fd,
+                            follow_symlinks=False,
+                        )
+                        if self._same_file(current_staged_info, linked_info):
+                            cleanup_info = linked_info
+                        if not self._same_file(
+                            current_staged_info,
+                            staged_info,
+                        ) or not self._same_file(linked_info, staged_info):
+                            raise ValueError(
+                                f"Staged file changed during promotion: {staged}"
+                            )
+                        os.unlink(staged_name, dir_fd=inbox_fd)
+                    except ValueError:
+                        self._unlink_if_same(
+                            originals_fd,
+                            target_name,
+                            cleanup_info,
+                        )
+                        raise
+                    except OSError as exc:
+                        self._unlink_if_same(
+                            originals_fd,
+                            target_name,
+                            cleanup_info,
+                        )
+                        raise ValueError(
+                            f"Could not safely complete promotion: {staged}"
+                        ) from exc
+
+                    return originals / target_name
+
+        raise AssertionError("candidate name generation is infinite")
+
+    def _open_source(self, source: Path) -> tuple[Path, int, os.stat_result]:
+        try:
+            expanded_source = Path(source).expanduser()
+            resolved_source = expanded_source.resolve(strict=True)
+        except (OSError, RuntimeError, TypeError) as exc:
+            raise ValueError(f"Source file is unavailable: {source}") from exc
+
+        try:
+            source_fd = os.open(resolved_source, _SOURCE_OPEN_FLAGS)
+        except OSError as exc:
+            raise ValueError(f"Source file cannot be opened safely: {source}") from exc
+
+        try:
+            source_info = os.fstat(source_fd)
+        except OSError as exc:
+            os.close(source_fd)
+            raise ValueError(
+                f"Source file cannot be inspected safely: {source}"
+            ) from exc
+
+        if not stat.S_ISREG(source_info.st_mode):
+            os.close(source_fd)
+            raise ValueError(f"Source must be a regular file: {source}")
+
+        return resolved_source, source_fd, source_info
+
+    @contextmanager
+    def _managed_directory(
+        self,
+        configured: Path,
+        label: str,
+        *,
+        create: bool,
+    ) -> Iterator[tuple[Path, int]]:
+        root = self._project_root(create=create)
+        directory = self._confined_path(configured, label, root)
+        components = directory.relative_to(root).parts
+
+        try:
+            current_fd = os.open(root, _DIRECTORY_OPEN_FLAGS)
+        except OSError as exc:
+            raise ValueError(f"Project root cannot be opened safely: {root}") from exc
+
+        current_path = root
+        try:
+            for component in components:
+                if create:
+                    try:
+                        os.mkdir(component, dir_fd=current_fd)
+                    except FileExistsError:
+                        pass
+                    except OSError as exc:
+                        raise ValueError(
+                            f"Managed directory '{label}' cannot be created safely: "
+                            f"{current_path / component}"
+                        ) from exc
+
+                try:
+                    entry_info = os.stat(
+                        component,
+                        dir_fd=current_fd,
+                        follow_symlinks=False,
+                    )
+                except OSError as exc:
+                    raise ValueError(
+                        f"Managed directory '{label}' is unavailable: "
+                        f"{current_path / component}"
+                    ) from exc
+
+                if stat.S_ISLNK(entry_info.st_mode):
+                    raise ValueError(
+                        f"Managed directory '{label}' contains a symlink component: "
+                        f"{current_path / component}"
+                    )
+                if not stat.S_ISDIR(entry_info.st_mode):
+                    raise ValueError(
+                        f"Managed directory '{label}' contains a non-directory "
+                        f"component: {current_path / component}"
+                    )
+
+                try:
+                    next_fd = os.open(
+                        component,
+                        _DIRECTORY_OPEN_FLAGS,
+                        dir_fd=current_fd,
+                    )
+                except OSError as exc:
+                    raise ValueError(
+                        f"Managed directory '{label}' cannot be opened safely: "
+                        f"{current_path / component}"
+                    ) from exc
+
+                try:
+                    opened_info = os.fstat(next_fd)
+                except OSError as exc:
+                    os.close(next_fd)
+                    raise ValueError(
+                        f"Managed directory '{label}' cannot be inspected safely: "
+                        f"{current_path / component}"
+                    ) from exc
+                if not self._same_file(entry_info, opened_info):
+                    os.close(next_fd)
+                    raise ValueError(
+                        f"Managed directory '{label}' changed during validation: "
+                        f"{current_path / component}"
+                    )
+
+                previous_fd = current_fd
+                current_fd = next_fd
+                os.close(previous_fd)
+                current_path /= component
+
+            yield directory, current_fd
+        finally:
+            os.close(current_fd)
+
+    def _project_root(self, *, create: bool) -> Path:
+        try:
+            expanded_root = Path(self.paths.root).expanduser()
+            root = Path(os.path.abspath(os.fspath(expanded_root)))
+            unresolved_root = root.resolve(strict=False)
+        except (OSError, RuntimeError, TypeError) as exc:
+            raise ValueError(f"Project root path is invalid: {self.paths.root}") from exc
+
+        if unresolved_root != root:
+            raise ValueError(f"Project root contains a symlink component: {root}")
+
+        if create:
+            try:
+                root.mkdir(parents=True, exist_ok=True)
+            except OSError as exc:
+                raise ValueError(f"Project root cannot be created: {root}") from exc
+
+        try:
+            root_info = root.lstat()
+        except OSError as exc:
+            raise ValueError(f"Project root is unavailable: {root}") from exc
+
+        if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+            raise ValueError(f"Project root must be a real directory: {root}")
+
+        try:
+            resolved_root = root.resolve(strict=True)
+        except (OSError, RuntimeError) as exc:
+            raise ValueError(f"Project root cannot be resolved safely: {root}") from exc
+        if resolved_root != root:
+            raise ValueError(f"Project root contains a symlink component: {root}")
+
+        return root
 
     @staticmethod
-    def _available_path(path: Path) -> Path:
-        if not path.exists():
-            return path
+    def _confined_path(configured: Path, label: str, root: Path) -> Path:
+        try:
+            expanded = Path(configured).expanduser()
+            if not expanded.is_absolute():
+                expanded = root / expanded
+            directory = Path(os.path.abspath(os.fspath(expanded)))
+            directory.relative_to(root)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise ValueError(
+                f"Managed directory '{label}' is not confined beneath project root: "
+                f"{configured}"
+            ) from exc
+        return directory
 
+    @staticmethod
+    def _reserve_target(
+        directory_fd: int,
+        filename: str,
+        mode: int,
+    ) -> tuple[str, int, os.stat_result]:
+        for candidate_name in VaultManager._candidate_names(filename):
+            try:
+                target_fd = os.open(
+                    candidate_name,
+                    _RESERVE_OPEN_FLAGS,
+                    mode,
+                    dir_fd=directory_fd,
+                )
+            except FileExistsError:
+                continue
+            except OSError as exc:
+                if exc.errno == errno.EEXIST:
+                    continue
+                raise ValueError(
+                    f"Could not reserve a safe inbox filename for: {filename}"
+                ) from exc
+            try:
+                target_info = os.fstat(target_fd)
+            except OSError as exc:
+                try:
+                    os.close(target_fd)
+                except OSError:
+                    pass
+                try:
+                    os.unlink(candidate_name, dir_fd=directory_fd)
+                except OSError:
+                    pass
+                raise ValueError(
+                    f"Could not inspect reserved inbox target: {filename}"
+                ) from exc
+            return candidate_name, target_fd, target_info
+
+        raise AssertionError("candidate name generation is infinite")
+
+    @staticmethod
+    def _copy_to_reserved_target(
+        source_fd: int,
+        source_info: os.stat_result,
+        directory_fd: int,
+        target_name: str,
+        target_fd: int,
+        reserved_info: os.stat_result,
+        source: Path,
+    ) -> None:
+        completed = False
+        try:
+            with os.fdopen(os.dup(source_fd), "rb") as source_stream:
+                with os.fdopen(os.dup(target_fd), "wb") as target_stream:
+                    shutil.copyfileobj(source_stream, target_stream)
+                    target_stream.flush()
+
+            os.fchmod(target_fd, stat.S_IMODE(source_info.st_mode))
+            os.utime(
+                target_fd,
+                ns=(source_info.st_atime_ns, source_info.st_mtime_ns),
+            )
+            if not VaultManager._entry_matches(
+                directory_fd,
+                target_name,
+                reserved_info,
+            ):
+                raise ValueError(
+                    f"Reserved inbox target changed while staging: {target_name}"
+                )
+            completed = True
+        except ValueError:
+            raise
+        except Exception as exc:
+            raise ValueError(f"Could not safely stage source file: {source}") from exc
+        finally:
+            try:
+                os.close(target_fd)
+            finally:
+                if not completed:
+                    VaultManager._unlink_if_same(
+                        directory_fd,
+                        target_name,
+                        reserved_info,
+                    )
+
+    @staticmethod
+    def _direct_regular_entry(
+        staged: Path,
+        inbox: Path,
+        inbox_fd: int,
+    ) -> tuple[str, os.stat_result]:
+        try:
+            expanded = Path(staged).expanduser()
+            staged_path = Path(os.path.abspath(os.fspath(expanded)))
+        except (OSError, RuntimeError, TypeError) as exc:
+            raise ValueError(
+                f"Staged path must name a direct regular file in inbox: {staged}"
+            ) from exc
+
+        if staged_path.parent != inbox:
+            raise ValueError(
+                f"Staged path must name a direct regular file in inbox: {staged}"
+            )
+
+        try:
+            staged_info = os.stat(
+                staged_path.name,
+                dir_fd=inbox_fd,
+                follow_symlinks=False,
+            )
+        except OSError as exc:
+            raise ValueError(
+                f"Staged path must name a direct regular file in inbox: {staged}"
+            ) from exc
+
+        if not stat.S_ISREG(staged_info.st_mode):
+            raise ValueError(
+                f"Staged path must name a direct regular file in inbox: {staged}"
+            )
+
+        return staged_path.name, staged_info
+
+    @staticmethod
+    def _candidate_names(filename: str) -> Iterator[str]:
+        yield filename
+
+        path = Path(filename)
         index = 2
         while True:
-            candidate = path.with_name(f"{path.stem}-{index}{path.suffix}")
-            if not candidate.exists():
-                return candidate
+            yield f"{path.stem}-{index}{path.suffix}"
             index += 1
+
+    @staticmethod
+    def _same_file(first: os.stat_result, second: os.stat_result) -> bool:
+        return first.st_dev == second.st_dev and first.st_ino == second.st_ino
+
+    @staticmethod
+    def _entry_matches(
+        directory_fd: int,
+        name: str,
+        expected: os.stat_result,
+    ) -> bool:
+        try:
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
+        except OSError:
+            return False
+        return VaultManager._same_file(current, expected)
+
+    @staticmethod
+    def _unlink_if_same(
+        directory_fd: int,
+        name: str,
+        expected: os.stat_result,
+    ) -> None:
+        if not VaultManager._entry_matches(directory_fd, name, expected):
+            return
+        try:
+            os.unlink(name, dir_fd=directory_fd)
+        except OSError:
+            pass

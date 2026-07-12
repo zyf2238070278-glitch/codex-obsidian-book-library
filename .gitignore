@@ -13,7 +13,7 @@ coverage.xml
 htmlcov/
 
 # Local runtime data
-data/
+/data/
 
 # Managed Obsidian library contents
 vault/书库/00-待导入/*

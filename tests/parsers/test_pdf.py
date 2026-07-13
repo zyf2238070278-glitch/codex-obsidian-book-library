@@ -7,6 +7,43 @@ from book_agent.parsers.base import DocumentParseError, NeedsOcrError
 from book_agent.parsers.pdf import parse_pdf
 
 
+class _CloseFailingPage:
+    def __init__(self, text: str) -> None:
+        self.text = text
+
+    def get_text(self, mode: str) -> str:
+        assert mode == "text"
+        return self.text
+
+    def get_label(self) -> str:
+        return ""
+
+
+class _CloseFailingDocument:
+    needs_pass = False
+    metadata: dict[str, str] = {}
+
+    def __init__(self, text: str, close_error: RuntimeError) -> None:
+        self.page = _CloseFailingPage(text)
+        self.close_error = close_error
+        self.close_attempted = False
+
+    def __len__(self) -> int:
+        return 1
+
+    def __getitem__(self, index: int) -> _CloseFailingPage:
+        assert index == 0
+        return self.page
+
+    def get_toc(self, *, simple: bool) -> list[list[object]]:
+        assert simple is True
+        return []
+
+    def close(self) -> None:
+        self.close_attempted = True
+        raise self.close_error
+
+
 def _body(label: str) -> str:
     return (
         f"{label}: This synthetic PDF page contains enough extractable English "
@@ -204,3 +241,32 @@ def test_parse_pdf_wraps_open_errors_with_the_filename_and_cause(
         parse_pdf(path)
 
     assert error.value.__cause__ is not None
+
+
+def test_close_failure_does_not_replace_an_active_needs_ocr_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_error = RuntimeError("close failed")
+    document = _CloseFailingDocument("", close_error)
+    monkeypatch.setattr(fitz, "open", lambda path: document)
+
+    with pytest.raises(NeedsOcrError, match="(?i)OCR"):
+        parse_pdf(tmp_path / "blank-close-failure.pdf")
+
+    assert document.close_attempted is True
+
+
+def test_close_failure_after_success_is_wrapped_as_a_document_parse_error(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_error = RuntimeError("close failed")
+    document = _CloseFailingDocument(_body("Readable"), close_error)
+    monkeypatch.setattr(fitz, "open", lambda path: document)
+
+    with pytest.raises(
+        DocumentParseError, match="close-failure.pdf"
+    ) as error:
+        parse_pdf(tmp_path / "close-failure.pdf")
+
+    assert document.close_attempted is True
+    assert error.value.__cause__ is close_error

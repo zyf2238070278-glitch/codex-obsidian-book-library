@@ -1,4 +1,5 @@
 import math
+import sys
 from pathlib import Path
 from statistics import median
 from typing import Optional
@@ -155,4 +156,11 @@ def parse_pdf(
         ) from exc
     finally:
         if document is not None:
-            document.close()
+            active_exception = sys.exception()
+            try:
+                document.close()
+            except Exception as close_error:
+                if active_exception is None:
+                    raise DocumentParseError(
+                        f"Cannot parse '{path.name}': unable to close PDF document."
+                    ) from close_error

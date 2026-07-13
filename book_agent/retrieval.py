@@ -1,9 +1,10 @@
+import re
 from collections.abc import Sequence
 from dataclasses import replace
 
 import numpy as np
 
-from book_agent.config import MAX_PREVIEWS
+from book_agent.config import MAX_EVIDENCE_TOKENS, MAX_FULL_PASSAGES, MAX_PREVIEWS
 from book_agent.embeddings import decode_vector
 from book_agent.models import RetrievalMode, SearchHit
 from book_agent.storage import Database
@@ -13,6 +14,17 @@ _VALID_MODES = {"auto", "quote", "explain", "compare"}
 _CANDIDATE_LIMIT = 20
 _RRF_K = 60
 MIN_SEMANTIC_SCORE = 0.20
+
+
+def estimate_tokens(text: str) -> int:
+    ascii_chars = sum(ord(char) <= 0x7F for char in text)
+    bmp_non_ascii = sum(0x7F < ord(char) <= 0xFFFF for char in text)
+    astral_chars = len(text) - ascii_chars - bmp_non_ascii
+    return (ascii_chars + 3) // 4 + bmp_non_ascii + astral_chars * 2
+
+
+def _text_fingerprint(text: str) -> str:
+    return re.sub(r"\s+", "", text)
 
 
 class Retriever:
@@ -49,6 +61,134 @@ class Retriever:
             return semantic_hits[:safe_limit]
 
         return self._rrf(keyword_hits, semantic_hits)[:safe_limit]
+
+    def get_passages(
+        self,
+        passage_ids: Sequence[str],
+        neighbor_count: int = 1,
+    ) -> list[dict[str, object]]:
+        raw_ids = list(passage_ids)
+        if not 1 <= len(raw_ids) <= MAX_FULL_PASSAGES:
+            raise ValueError(f"passage_ids 必须包含 1 到 {MAX_FULL_PASSAGES} 个 ID。")
+        if type(neighbor_count) is not int or neighbor_count not in (0, 1):
+            raise ValueError("neighbor_count 必须是整数 0 或 1。")
+
+        requested = list(dict.fromkeys(raw_ids))
+        selected = self.database.get_passages(requested)
+        available_by_id = {hit.passage_id: hit for hit in selected}
+        missing = [passage_id for passage_id in requested if passage_id not in available_by_id]
+        if missing:
+            raise ValueError(
+                "未知或当前不可检索的 passage_id：" + ", ".join(missing)
+            )
+
+        selected_by_id: dict[str, SearchHit] = {}
+        selected_fingerprints: set[str] = set()
+        for hit in selected:
+            fingerprint = _text_fingerprint(hit.text)
+            if fingerprint in selected_fingerprints:
+                continue
+            selected_fingerprints.add(fingerprint)
+            selected_by_id[hit.passage_id] = hit
+
+        selected_tokens = {
+            passage_id: estimate_tokens(hit.text)
+            for passage_id, hit in selected_by_id.items()
+        }
+        oversized = [
+            passage_id
+            for passage_id, token_count in selected_tokens.items()
+            if token_count > MAX_EVIDENCE_TOKENS
+        ]
+        if oversized:
+            raise ValueError(
+                f"所选 passage {oversized[0]} 超过 {MAX_EVIDENCE_TOKENS} tokens；"
+                "请拆成多次调用。"
+            )
+        selected_total = sum(selected_tokens.values())
+        if selected_total > MAX_EVIDENCE_TOKENS:
+            raise ValueError(
+                f"所选 passage 总计超过 {MAX_EVIDENCE_TOKENS} tokens；"
+                "请拆成多次调用。"
+            )
+
+        candidates = []
+        seen_candidate_ids: set[str] = set()
+        for hit in selected:
+            ordinal = self.database.get_ordinal(hit.passage_id)
+            if ordinal is None:
+                raise ValueError(
+                    f"未知或当前不可检索的 passage_id：{hit.passage_id}"
+                )
+            neighbors = self.database.get_neighbors(
+                hit.book_id, ordinal, neighbor_count
+            )
+            if not any(
+                candidate.passage_id == hit.passage_id for candidate in neighbors
+            ):
+                raise ValueError(
+                    f"未知或当前不可检索的 passage_id：{hit.passage_id}"
+                )
+            for candidate in neighbors:
+                if candidate.passage_id in seen_candidate_ids:
+                    continue
+                seen_candidate_ids.add(candidate.passage_id)
+                candidates.append(candidate)
+
+        included_ids = set(selected_by_id)
+        included_fingerprints = set(selected_fingerprints)
+        total_tokens = selected_total
+        for candidate in candidates:
+            if candidate.passage_id in included_ids:
+                continue
+            fingerprint = _text_fingerprint(candidate.text)
+            if fingerprint in included_fingerprints:
+                continue
+            candidate_tokens = estimate_tokens(candidate.text)
+            if (
+                len(included_ids) >= MAX_FULL_PASSAGES
+                or total_tokens + candidate_tokens > MAX_EVIDENCE_TOKENS
+            ):
+                continue
+            included_ids.add(candidate.passage_id)
+            included_fingerprints.add(fingerprint)
+            total_tokens += candidate_tokens
+
+        return [
+            self._evidence_dict(candidate)
+            for candidate in candidates
+            if candidate.passage_id in included_ids
+        ]
+
+    @staticmethod
+    def _evidence_dict(hit: SearchHit) -> dict[str, object]:
+        location_parts: list[str] = []
+        if hit.section:
+            location_parts.append(hit.section)
+        first_page = hit.page_start
+        last_page = hit.page_end
+        if first_page is not None or last_page is not None:
+            first_page = first_page if first_page is not None else last_page
+            last_page = last_page if last_page is not None else first_page
+            if first_page == last_page:
+                location_parts.append(f"PDF 页 {first_page}")
+            else:
+                location_parts.append(f"PDF 页 {first_page}–{last_page}")
+
+        return {
+            "passage_id": hit.passage_id,
+            "book_id": hit.book_id,
+            "title": hit.title,
+            "text": hit.text,
+            "section": hit.section,
+            "page_start": hit.page_start,
+            "page_end": hit.page_end,
+            "page_label": hit.page_label,
+            "location": " · ".join(location_parts) or hit.passage_id,
+            "obsidian_link": f"[[{hit.markdown_path}#^{hit.anchor}]]",
+            "untrusted_content": True,
+            "estimated_tokens": estimate_tokens(hit.text),
+        }
 
     def _semantic_search(
         self,

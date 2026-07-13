@@ -497,6 +497,806 @@ def test_checksum_publish_failure_rolls_back_both_artifacts(
     assert not any(path.name.startswith(".macos-release-") for path in output.iterdir())
 
 
+def test_successful_overwrite_cleans_artifact_backups(tmp_path: Path) -> None:
+    project, snapshot, uv, metadata_path, _ = _make_release_inputs(tmp_path)
+    output = tmp_path / "dist"
+
+    for _ in range(2):
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=output,
+            metadata_path=metadata_path,
+        )
+
+    assert not any(path.name.startswith(".macos-release-") for path in output.iterdir())
+
+
+def test_backup_preparation_failure_cleans_prior_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, snapshot, uv, metadata_path, metadata = _make_release_inputs(tmp_path)
+    output = tmp_path / "dist"
+    output.mkdir()
+    archive_path = output / metadata["archive"]
+    checksums_path = output / "SHA256SUMS"
+    _write(archive_path, b"old archive")
+    _write(checksums_path, "old checksum\n")
+    real_create_artifact_backup = build_macos_release._create_artifact_backup
+    invalidated = False
+
+    def create_first_backup_then_invalidate_second_target(
+        target: Path,
+        backup_dir: Path,
+        label: str,
+    ) -> Path:
+        nonlocal invalidated
+        backup = real_create_artifact_backup(target, backup_dir, label)
+        if Path(target) == archive_path:
+            checksums_path.unlink()
+            checksums_path.mkdir()
+            invalidated = True
+        return backup
+
+    monkeypatch.setattr(
+        build_macos_release,
+        "_create_artifact_backup",
+        create_first_backup_then_invalidate_second_target,
+    )
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="regular"):
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=output,
+            metadata_path=metadata_path,
+        )
+
+    assert invalidated
+    assert archive_path.read_bytes() == b"old archive"
+    assert not any(
+        path.name.startswith(".macos-release-backup-")
+        for path in output.iterdir()
+    )
+
+
+@pytest.mark.parametrize("with_existing", [False, True], ids=["new", "overwrite"])
+@pytest.mark.parametrize(
+    "tamper_point",
+    ["after-archive-verification", "after-checksum-creation"],
+)
+def test_final_published_artifacts_reject_candidate_tamper_and_roll_back(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_existing: bool,
+    tamper_point: str,
+) -> None:
+    project, snapshot, uv, metadata_path, metadata = _make_release_inputs(tmp_path)
+    output = tmp_path / "dist"
+    output.mkdir()
+    archive_path = output / metadata["archive"]
+    checksums_path = output / "SHA256SUMS"
+    if with_existing:
+        _write(archive_path, b"old archive")
+        _write(checksums_path, "old checksum\n")
+    tampered = False
+
+    if tamper_point == "after-archive-verification":
+        real_verify_archive = build_macos_release._verify_archive
+
+        def verify_then_tamper(*args, **kwargs) -> None:
+            nonlocal tampered
+            real_verify_archive(*args, **kwargs)
+            if not tampered:
+                candidate_archive = Path(args[0])
+                candidate_archive.write_bytes(b"tampered after verification")
+                candidate_archive.chmod(0o644)
+                tampered = True
+
+        monkeypatch.setattr(
+            build_macos_release,
+            "_verify_archive",
+            verify_then_tamper,
+        )
+    else:
+        real_publish_release_artifacts = (
+            build_macos_release._publish_release_artifacts
+        )
+
+        def tamper_after_checksum_then_publish(**kwargs) -> None:
+            nonlocal tampered
+            candidate_archive = Path(kwargs["candidate_archive"])
+            candidate_archive.write_bytes(b"tampered after checksum")
+            candidate_archive.chmod(0o644)
+            tampered = True
+            real_publish_release_artifacts(**kwargs)
+
+        monkeypatch.setattr(
+            build_macos_release,
+            "_publish_release_artifacts",
+            tamper_after_checksum_then_publish,
+        )
+
+    with pytest.raises(
+        build_macos_release.ReleaseBuildError,
+        match="publication|ZIP|archive|checksum",
+    ):
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=output,
+            metadata_path=metadata_path,
+        )
+
+    assert tampered
+    if with_existing:
+        assert archive_path.read_bytes() == b"old archive"
+        assert checksums_path.read_text(encoding="utf-8") == "old checksum\n"
+    else:
+        assert not archive_path.exists()
+        assert not checksums_path.exists()
+    assert not any(
+        path.name.startswith(".macos-release-backup-")
+        for path in output.iterdir()
+    )
+
+
+def test_final_validation_rejects_matching_archive_and_checksum_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, snapshot, uv, metadata_path, metadata = _make_release_inputs(tmp_path)
+    output = tmp_path / "dist"
+    output.mkdir()
+    archive_path = output / metadata["archive"]
+    checksums_path = output / "SHA256SUMS"
+    _write(archive_path, b"old archive")
+    _write(checksums_path, "old checksum\n")
+    real_verify_archive = build_macos_release._verify_archive
+    verification_count = 0
+    swapped = False
+
+    def swap_after_final_archive_verification(*args, **kwargs) -> None:
+        nonlocal verification_count, swapped
+        real_verify_archive(*args, **kwargs)
+        verification_count += 1
+        if verification_count == 2:
+            malicious_archive = b"matching malicious archive and checksum"
+            archive_path.write_bytes(malicious_archive)
+            checksums_path.write_text(
+                f"{_sha256(malicious_archive)}  {archive_path.name}\n",
+                encoding="utf-8",
+            )
+            swapped = True
+
+    monkeypatch.setattr(
+        build_macos_release,
+        "_verify_archive",
+        swap_after_final_archive_verification,
+    )
+
+    with pytest.raises(
+        build_macos_release.ReleaseBuildError,
+        match="publication|changed|archive|checksum",
+    ):
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=output,
+            metadata_path=metadata_path,
+        )
+
+    assert swapped
+    assert archive_path.read_bytes() == b"old archive"
+    assert checksums_path.read_text(encoding="utf-8") == "old checksum\n"
+    assert not any(
+        path.name.startswith(".macos-release-backup-")
+        for path in output.iterdir()
+    )
+
+
+def test_unexpected_final_validator_error_rolls_back_existing_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, snapshot, uv, metadata_path, metadata = _make_release_inputs(tmp_path)
+    output = tmp_path / "dist"
+    output.mkdir()
+    archive_path = output / metadata["archive"]
+    checksums_path = output / "SHA256SUMS"
+    _write(archive_path, b"old archive")
+    _write(checksums_path, "old checksum\n")
+    real_verify_archive = build_macos_release._verify_archive
+    verification_count = 0
+
+    def fail_final_archive_verification(*args, **kwargs) -> None:
+        nonlocal verification_count
+        verification_count += 1
+        if verification_count == 2:
+            raise zipfile.BadZipFile("simulated final ZIP race")
+        real_verify_archive(*args, **kwargs)
+
+    monkeypatch.setattr(
+        build_macos_release,
+        "_verify_archive",
+        fail_final_archive_verification,
+    )
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="publication"):
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=output,
+            metadata_path=metadata_path,
+        )
+
+    assert verification_count == 2
+    assert archive_path.read_bytes() == b"old archive"
+    assert checksums_path.read_text(encoding="utf-8") == "old checksum\n"
+    assert not any(
+        path.name.startswith(".macos-release-backup-")
+        for path in output.iterdir()
+    )
+
+
+def test_final_validation_is_bound_to_published_file_descriptors(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, snapshot, uv, metadata_path, metadata = _make_release_inputs(tmp_path)
+    output = tmp_path / "dist"
+    output.mkdir()
+    archive_path = output / metadata["archive"]
+    checksums_path = output / "SHA256SUMS"
+    _write(archive_path, b"old archive")
+    _write(checksums_path, "old checksum\n")
+    real_verify_archive = build_macos_release._verify_archive
+    real_publish_release_artifacts = build_macos_release._publish_release_artifacts
+    trusted_archive = b""
+    verification_count = 0
+    decoy_used = False
+
+    def verify_with_temporary_decoy(*args, **kwargs) -> None:
+        nonlocal verification_count, decoy_used
+        verification_count += 1
+        if verification_count != 2:
+            real_verify_archive(*args, **kwargs)
+            return
+
+        real_output = tmp_path / "real-dist-during-validation"
+        output.rename(real_output)
+        output.mkdir()
+        _write(archive_path, trusted_archive)
+        _write(
+            checksums_path,
+            f"{_sha256(trusted_archive)}  {archive_path.name}\n",
+        )
+        decoy_used = True
+        try:
+            real_verify_archive(*args, **kwargs)
+        finally:
+            archive_path.unlink()
+            checksums_path.unlink()
+            output.rmdir()
+            real_output.rename(output)
+
+    def publish_matching_malicious_candidates(**kwargs) -> None:
+        nonlocal trusted_archive
+        candidate_archive = Path(kwargs["candidate_archive"])
+        candidate_checksums = Path(kwargs["candidate_checksums"])
+        trusted_archive = candidate_archive.read_bytes()
+        malicious_archive = b"matching malicious non-ZIP payload"
+        candidate_archive.write_bytes(malicious_archive)
+        candidate_archive.chmod(0o644)
+        candidate_checksums.write_text(
+            f"{_sha256(malicious_archive)}  {archive_path.name}\n",
+            encoding="utf-8",
+        )
+        candidate_checksums.chmod(0o644)
+        real_publish_release_artifacts(**kwargs)
+
+    monkeypatch.setattr(
+        build_macos_release,
+        "_verify_archive",
+        verify_with_temporary_decoy,
+    )
+    monkeypatch.setattr(
+        build_macos_release,
+        "_publish_release_artifacts",
+        publish_matching_malicious_candidates,
+    )
+
+    with pytest.raises(
+        build_macos_release.ReleaseBuildError,
+        match="publication|ZIP|archive|checksum",
+    ):
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=output,
+            metadata_path=metadata_path,
+        )
+
+    assert verification_count == 2
+    assert decoy_used
+    assert archive_path.read_bytes() == b"old archive"
+    assert checksums_path.read_text(encoding="utf-8") == "old checksum\n"
+    assert not any(
+        path.name.startswith(".macos-release-backup-")
+        for path in output.iterdir()
+    )
+
+
+def test_rollback_failure_retains_old_archive_recovery_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, snapshot, uv, metadata_path, metadata = _make_release_inputs(tmp_path)
+    output = tmp_path / "dist"
+    output.mkdir()
+    archive_path = output / metadata["archive"]
+    checksums_path = output / "SHA256SUMS"
+    _write(archive_path, b"old archive")
+    _write(checksums_path, "old checksum\n")
+
+    real_replace = os.replace
+    publication_failed = False
+    rollback_failed = False
+
+    def fail_publication_and_rollback(
+        source: Path | str,
+        destination: Path | str,
+    ) -> None:
+        nonlocal publication_failed, rollback_failed
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if destination_path == checksums_path and not publication_failed:
+            publication_failed = True
+            raise OSError("simulated checksum publication failure")
+        if (
+            destination_path == archive_path
+            and source_path.name != metadata["archive"]
+            and not rollback_failed
+        ):
+            rollback_failed = True
+            raise OSError("simulated archive rollback failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(
+        build_macos_release.os,
+        "replace",
+        fail_publication_and_rollback,
+    )
+
+    with pytest.raises(
+        build_macos_release.ReleaseBuildError,
+        match="rollback failed",
+    ) as caught:
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=output,
+            metadata_path=metadata_path,
+        )
+
+    assert publication_failed
+    assert rollback_failed
+    recovery_files = [
+        path
+        for path in output.iterdir()
+        if path.name.startswith(".macos-release-backup-")
+    ]
+    assert len(recovery_files) == 1
+    recovery = recovery_files[0]
+    assert stat.S_ISREG(recovery.lstat().st_mode)
+    assert not recovery.is_symlink()
+    assert recovery.read_bytes() == b"old archive"
+    assert str(recovery) in str(caught.value)
+    assert checksums_path.read_text(encoding="utf-8") == "old checksum\n"
+
+
+def test_post_restore_validation_failure_retains_old_archive_recovery_file(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, snapshot, uv, metadata_path, metadata = _make_release_inputs(tmp_path)
+    output = tmp_path / "dist"
+    output.mkdir()
+    archive_path = output / metadata["archive"]
+    checksums_path = output / "SHA256SUMS"
+    _write(archive_path, b"old archive")
+    _write(checksums_path, "old checksum\n")
+
+    real_replace = os.replace
+    real_validate_output_target = build_macos_release._validate_output_target
+    publication_failed = False
+    restore_replaced = False
+    validation_failed = False
+
+    def fail_checksum_publication(
+        source: Path | str,
+        destination: Path | str,
+    ) -> None:
+        nonlocal publication_failed, restore_replaced
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if destination_path == checksums_path and not publication_failed:
+            publication_failed = True
+            raise OSError("simulated checksum publication failure")
+        real_replace(source, destination)
+        if (
+            destination_path == archive_path
+            and source_path.name != metadata["archive"]
+        ):
+            restore_replaced = True
+
+    def fail_restored_archive_validation(path: Path, label: str) -> bool:
+        nonlocal validation_failed
+        if Path(path) == archive_path and restore_replaced and not validation_failed:
+            validation_failed = True
+            raise build_macos_release.ReleaseBuildError(
+                "simulated restored archive validation failure"
+            )
+        return real_validate_output_target(path, label)
+
+    monkeypatch.setattr(
+        build_macos_release.os,
+        "replace",
+        fail_checksum_publication,
+    )
+    monkeypatch.setattr(
+        build_macos_release,
+        "_validate_output_target",
+        fail_restored_archive_validation,
+    )
+
+    with pytest.raises(
+        build_macos_release.ReleaseBuildError,
+        match="rollback failed",
+    ) as caught:
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=output,
+            metadata_path=metadata_path,
+        )
+
+    assert publication_failed
+    assert restore_replaced
+    assert validation_failed
+    recovery_files = [
+        path
+        for path in output.iterdir()
+        if path.name.startswith(".macos-release-backup-")
+    ]
+    assert len(recovery_files) == 1
+    recovery = recovery_files[0]
+    assert stat.S_ISREG(recovery.lstat().st_mode)
+    assert not recovery.is_symlink()
+    assert recovery.read_bytes() == b"old archive"
+    assert archive_path.read_bytes() == b"old archive"
+    assert str(recovery) in str(caught.value)
+    assert checksums_path.read_text(encoding="utf-8") == "old checksum\n"
+
+
+def test_rollback_rejects_regular_file_swap_and_retains_old_archive_backup(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, snapshot, uv, metadata_path, metadata = _make_release_inputs(tmp_path)
+    output = tmp_path / "dist"
+    output.mkdir()
+    archive_path = output / metadata["archive"]
+    checksums_path = output / "SHA256SUMS"
+    attacker_archive = tmp_path / "attacker-archive"
+    _write(archive_path, b"old archive")
+    _write(checksums_path, "old checksum\n")
+    _write(attacker_archive, b"attacker archive")
+    real_replace = os.replace
+    publication_failed = False
+    rollback_swapped = False
+
+    def fail_publication_and_swap_restored_archive(
+        source: Path | str,
+        destination: Path | str,
+    ) -> None:
+        nonlocal publication_failed, rollback_swapped
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if destination_path == checksums_path and not publication_failed:
+            publication_failed = True
+            raise OSError("simulated checksum publication failure")
+        real_replace(source, destination)
+        if (
+            destination_path == archive_path
+            and source_path.name.startswith(".macos-release-backup-")
+            and not rollback_swapped
+        ):
+            real_replace(attacker_archive, archive_path)
+            rollback_swapped = True
+
+    monkeypatch.setattr(
+        build_macos_release.os,
+        "replace",
+        fail_publication_and_swap_restored_archive,
+    )
+
+    with pytest.raises(build_macos_release.ReleaseBuildError) as caught:
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=output,
+            metadata_path=metadata_path,
+        )
+
+    assert publication_failed
+    assert rollback_swapped
+    assert "rollback failed" in str(caught.value)
+    recovery_files = [
+        path
+        for path in output.iterdir()
+        if path.name.startswith(".macos-release-backup-")
+    ]
+    assert len(recovery_files) == 1
+    recovery = recovery_files[0]
+    assert recovery.read_bytes() == b"old archive"
+    assert str(recovery) in str(caught.value)
+    assert archive_path.read_bytes() == b"attacker archive"
+    assert checksums_path.read_text(encoding="utf-8") == "old checksum\n"
+
+
+def test_rollback_uses_bound_old_bytes_when_backup_path_is_replaced(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, snapshot, uv, metadata_path, metadata = _make_release_inputs(tmp_path)
+    output = tmp_path / "dist"
+    output.mkdir()
+    archive_path = output / metadata["archive"]
+    checksums_path = output / "SHA256SUMS"
+    _write(archive_path, b"old archive")
+    _write(checksums_path, "old checksum\n")
+    real_create_artifact_backup = build_macos_release._create_artifact_backup
+    real_replace = os.replace
+    backup_replaced = False
+    publication_failed = False
+
+    def create_then_replace_archive_backup(
+        target: Path,
+        backup_dir: Path,
+        label: str,
+    ):
+        nonlocal backup_replaced
+        backup = real_create_artifact_backup(target, backup_dir, label)
+        if Path(target) == archive_path:
+            backup_path = Path(getattr(backup, "path", backup))
+            attacker_backup = tmp_path / "attacker-backup"
+            _write(attacker_backup, b"attacker archive")
+            real_replace(attacker_backup, backup_path)
+            backup_replaced = True
+        return backup
+
+    def fail_checksum_publication(
+        source: Path | str,
+        destination: Path | str,
+    ) -> None:
+        nonlocal publication_failed
+        if Path(destination) == checksums_path and not publication_failed:
+            publication_failed = True
+            raise OSError("simulated checksum publication failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(
+        build_macos_release,
+        "_create_artifact_backup",
+        create_then_replace_archive_backup,
+    )
+    monkeypatch.setattr(
+        build_macos_release.os,
+        "replace",
+        fail_checksum_publication,
+    )
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="publication"):
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=output,
+            metadata_path=metadata_path,
+        )
+
+    assert backup_replaced
+    assert publication_failed
+    assert archive_path.read_bytes() == b"old archive"
+    assert checksums_path.read_text(encoding="utf-8") == "old checksum\n"
+    assert not any(
+        path.name.startswith(".macos-release-backup-")
+        for path in output.iterdir()
+    )
+
+
+def test_rollback_failure_rematerializes_replaced_backup_from_bound_bytes(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, snapshot, uv, metadata_path, metadata = _make_release_inputs(tmp_path)
+    output = tmp_path / "dist"
+    output.mkdir()
+    archive_path = output / metadata["archive"]
+    checksums_path = output / "SHA256SUMS"
+    _write(archive_path, b"old archive")
+    _write(checksums_path, "old checksum\n")
+    real_create_artifact_backup = build_macos_release._create_artifact_backup
+    real_replace = os.replace
+    backup_replaced = False
+    publication_failed = False
+    rollback_failed = False
+
+    def create_then_replace_archive_backup(
+        target: Path,
+        backup_dir: Path,
+        label: str,
+    ):
+        nonlocal backup_replaced
+        backup = real_create_artifact_backup(target, backup_dir, label)
+        if Path(target) == archive_path:
+            attacker_backup = tmp_path / "attacker-backup"
+            _write(attacker_backup, b"attacker archive")
+            real_replace(attacker_backup, backup.path)
+            backup_replaced = True
+        return backup
+
+    def fail_publication_and_archive_rollback(
+        source: Path | str,
+        destination: Path | str,
+    ) -> None:
+        nonlocal publication_failed, rollback_failed
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if destination_path == checksums_path and not publication_failed:
+            publication_failed = True
+            raise OSError("simulated checksum publication failure")
+        if (
+            destination_path == archive_path
+            and source_path.name.startswith(".macos-release-backup-")
+            and not rollback_failed
+        ):
+            rollback_failed = True
+            raise OSError("simulated archive rollback failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(
+        build_macos_release,
+        "_create_artifact_backup",
+        create_then_replace_archive_backup,
+    )
+    monkeypatch.setattr(
+        build_macos_release.os,
+        "replace",
+        fail_publication_and_archive_rollback,
+    )
+
+    with pytest.raises(
+        build_macos_release.ReleaseBuildError,
+        match="rollback failed",
+    ) as caught:
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=output,
+            metadata_path=metadata_path,
+        )
+
+    assert backup_replaced
+    assert publication_failed
+    assert rollback_failed
+    recovery_files = [
+        path
+        for path in output.iterdir()
+        if path.name.startswith(".macos-release-backup-")
+    ]
+    assert len(recovery_files) == 1
+    recovery = recovery_files[0]
+    assert recovery.read_bytes() == b"old archive"
+    assert str(recovery) in str(caught.value)
+    assert archive_path.read_bytes() != b"attacker archive"
+    assert checksums_path.read_text(encoding="utf-8") == "old checksum\n"
+
+
+def test_rollback_cleanup_failure_does_not_mask_recovery_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project, snapshot, uv, metadata_path, metadata = _make_release_inputs(tmp_path)
+    output = tmp_path / "dist"
+    output.mkdir()
+    archive_path = output / metadata["archive"]
+    checksums_path = output / "SHA256SUMS"
+    _write(archive_path, b"old archive")
+    _write(checksums_path, "old checksum\n")
+    real_replace = os.replace
+    real_unlink = Path.unlink
+    publication_failed = False
+    rollback_failed = False
+    cleanup_failed = False
+
+    def fail_publication_and_rollback(
+        source: Path | str,
+        destination: Path | str,
+    ) -> None:
+        nonlocal publication_failed, rollback_failed
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if destination_path == checksums_path and not publication_failed:
+            publication_failed = True
+            raise OSError("simulated checksum publication failure")
+        if (
+            destination_path == archive_path
+            and source_path.name.startswith(".macos-release-backup-")
+            and not rollback_failed
+        ):
+            rollback_failed = True
+            raise OSError("simulated archive rollback failure")
+        real_replace(source, destination)
+
+    def fail_unused_checksum_backup_cleanup(
+        path: Path,
+        missing_ok: bool = False,
+    ) -> None:
+        nonlocal cleanup_failed
+        if (
+            path.name.startswith(".macos-release-backup-")
+            and path.exists()
+            and path.read_bytes() == b"old checksum\n"
+        ):
+            cleanup_failed = True
+            raise OSError("simulated checksum backup cleanup failure")
+        real_unlink(path, missing_ok=missing_ok)
+
+    monkeypatch.setattr(
+        build_macos_release.os,
+        "replace",
+        fail_publication_and_rollback,
+    )
+    monkeypatch.setattr(Path, "unlink", fail_unused_checksum_backup_cleanup)
+
+    with pytest.raises(build_macos_release.ReleaseBuildError) as caught:
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=output,
+            metadata_path=metadata_path,
+        )
+
+    message = str(caught.value)
+    assert publication_failed
+    assert rollback_failed
+    assert cleanup_failed
+    assert "rollback failed" in message
+    assert "backup cleanup failed" in message
+    archive_backups = [
+        path
+        for path in output.iterdir()
+        if path.name.startswith(".macos-release-backup-")
+        and path.read_bytes() == b"old archive"
+    ]
+    assert len(archive_backups) == 1
+    assert str(archive_backups[0]) in message
+
+
 def test_unzip_preserves_two_executables_and_normalizes_other_modes(
     tmp_path: Path,
 ) -> None:
@@ -603,6 +1403,119 @@ def test_uv_hash_mismatch_is_rejected(tmp_path: Path) -> None:
             output_dir=tmp_path / "dist",
             metadata_path=metadata_path,
         )
+
+
+@pytest.mark.parametrize("payload", [*MODEL_FILES, "uv"])
+@pytest.mark.parametrize(
+    "tamper_point",
+    ["source-before-copy", "staging-after-copy"],
+)
+def test_trusted_payload_copy_rejects_same_size_race_and_staging_tamper(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: str,
+    tamper_point: str,
+) -> None:
+    project, snapshot, uv, metadata_path, _ = _make_release_inputs(tmp_path)
+    real_copy_file = build_macos_release._copy_file
+    tampered = False
+
+    def tampering_copy(source: Path, destination: Path, mode: int) -> None:
+        nonlocal tampered
+        destination_path = Path(destination)
+        is_target = (
+            payload != "uv"
+            and destination_path.as_posix().endswith(f"data/models/{payload}")
+        ) or (
+            payload == "uv"
+            and destination_path.as_posix().endswith("bin/uv")
+        )
+        if not is_target:
+            real_copy_file(source, destination, mode)
+            return
+
+        if tamper_point == "source-before-copy":
+            original = Path(source).read_bytes()
+            Path(source).write_bytes(b"x" + original[1:])
+            assert Path(source).stat().st_size == len(original)
+            real_copy_file(source, destination, mode)
+        else:
+            real_copy_file(source, destination, mode)
+            original = destination_path.read_bytes()
+            destination_path.write_bytes(b"x" + original[1:])
+            assert destination_path.stat().st_size == len(original)
+        tampered = True
+
+    monkeypatch.setattr(build_macos_release, "_copy_file", tampering_copy)
+
+    with pytest.raises(
+        build_macos_release.ReleaseBuildError,
+        match="model|uv|SHA-256|size",
+    ):
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=tmp_path / "dist",
+            metadata_path=metadata_path,
+        )
+
+    assert tampered
+
+
+@pytest.mark.parametrize("payload", [*MODEL_FILES, "uv"])
+def test_archive_rejects_trusted_staging_tamper_after_immediate_verification(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    payload: str,
+) -> None:
+    project, snapshot, uv, metadata_path, _ = _make_release_inputs(tmp_path)
+    real_verify_staged_file = build_macos_release._verify_staged_file
+    tampered = False
+
+    def verify_then_tamper(
+        path: Path,
+        *,
+        expected_size: int,
+        expected_sha256: str,
+        label: str,
+    ) -> None:
+        nonlocal tampered
+        real_verify_staged_file(
+            path,
+            expected_size=expected_size,
+            expected_sha256=expected_sha256,
+            label=label,
+        )
+        path_hint = Path(path).as_posix()
+        is_target = (
+            payload != "uv" and path_hint.endswith(f"data/models/{payload}")
+        ) or (payload == "uv" and path_hint.endswith("bin/uv"))
+        if is_target:
+            original = Path(path).read_bytes()
+            Path(path).write_bytes(b"x" + original[1:])
+            assert Path(path).stat().st_size == len(original)
+            tampered = True
+
+    monkeypatch.setattr(
+        build_macos_release,
+        "_verify_staged_file",
+        verify_then_tamper,
+    )
+
+    with pytest.raises(
+        build_macos_release.ReleaseBuildError,
+        match="trusted|model|uv|SHA-256|size",
+    ):
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=tmp_path / "dist",
+            metadata_path=metadata_path,
+        )
+
+    assert tampered
 
 
 @pytest.mark.parametrize("as_symlink", [False, True], ids=["not-executable", "symlink"])
@@ -775,7 +1688,22 @@ def test_staging_scan_rejects_invalid_utf8_in_allowlisted_text(tmp_path: Path) -
 
 @pytest.mark.parametrize(
     "private_path",
-    ["C:/Users/alice/private", r"c:\users\alice\private"],
+    [
+        "C:/Users/alice/private",
+        r"c:\users\alice\private",
+        r"C:\\Users\\alice\\private",
+        r"C:\\\\Users\\\\alice\\\\private",
+        "/users/alice/private",
+        "/HOME/alice/private",
+    ],
+    ids=[
+        "windows-forward",
+        "windows-backslash",
+        "windows-json-escaped",
+        "windows-multiply-escaped",
+        "lowercase-users",
+        "uppercase-home",
+    ],
 )
 def test_staging_scan_rejects_windows_private_path_variants(
     tmp_path: Path,
@@ -793,7 +1721,10 @@ def test_staging_scan_allows_only_the_three_binary_payload_paths(
 ) -> None:
     staging = tmp_path / "staging"
     binary_payloads = {
-        "release/bin/uv": b"\xcf\xfa\xed\xfe\x00/Users/runner/build\x00",
+        "release/bin/uv": (
+            b"\xcf\xfa\xed\xfe\x00/Users/runner/build\x00"
+            b"C:\\\\Users\\\\runner\\\\build\x00/HOME/runner/build\x00"
+        ),
         "release/data/models/model.safetensors": b"\xff\x00safetensors",
         "release/data/models/sentencepiece.bpe.model": b"\x80\x00sentencepiece",
     }
@@ -801,6 +1732,22 @@ def test_staging_scan_allows_only_the_three_binary_payload_paths(
         _write(staging / relative, data)
 
     build_macos_release.scan_staging(staging)
+
+
+@pytest.mark.parametrize(
+    "relative",
+    ["release/bin/uv.bak", "release/nested/bin/uv", r"release\bin\uv"],
+    ids=["suffix", "nested", "posix-backslash-filename"],
+)
+def test_staging_binary_allowlist_rejects_near_miss_paths(
+    tmp_path: Path,
+    relative: str,
+) -> None:
+    staging = tmp_path / "staging"
+    _write(staging / relative, b"\xffnot allowlisted binary")
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="UTF-8"):
+        build_macos_release.scan_staging(staging)
 
 
 def test_staging_scan_rejects_sqlite_header_with_allowlisted_extension(
@@ -977,7 +1924,22 @@ def test_zip_scan_rejects_invalid_utf8_in_allowlisted_text(tmp_path: Path) -> No
 
 @pytest.mark.parametrize(
     "private_path",
-    ["C:/Users/alice/private", r"c:\users\alice\private"],
+    [
+        "C:/Users/alice/private",
+        r"c:\users\alice\private",
+        r"C:\\Users\\alice\\private",
+        r"C:\\\\Users\\\\alice\\\\private",
+        "/users/alice/private",
+        "/HOME/alice/private",
+    ],
+    ids=[
+        "windows-forward",
+        "windows-backslash",
+        "windows-json-escaped",
+        "windows-multiply-escaped",
+        "lowercase-users",
+        "uppercase-home",
+    ],
 )
 def test_zip_scan_rejects_windows_private_path_variants(
     tmp_path: Path,
@@ -1006,7 +1968,10 @@ def test_zip_scan_allows_only_the_three_binary_payload_paths(tmp_path: Path) -> 
         [
             (
                 "release/bin/uv",
-                b"\xcf\xfa\xed\xfe\x00/Users/runner/build\x00",
+                (
+                    b"\xcf\xfa\xed\xfe\x00/Users/runner/build\x00"
+                    b"C:\\\\Users\\\\runner\\\\build\x00/HOME/runner/build\x00"
+                ),
                 stat.S_IFREG | 0o755,
             ),
             (
@@ -1023,6 +1988,25 @@ def test_zip_scan_allows_only_the_three_binary_payload_paths(tmp_path: Path) -> 
     )
 
     build_macos_release.scan_zip(archive_path)
+
+
+@pytest.mark.parametrize(
+    "member_name",
+    ["release/bin/uv.bak", "release/nested/bin/uv"],
+    ids=["suffix", "nested"],
+)
+def test_zip_binary_allowlist_rejects_near_miss_paths(
+    tmp_path: Path,
+    member_name: str,
+) -> None:
+    archive_path = tmp_path / "near-miss-binary.zip"
+    _write_zip_entries(
+        archive_path,
+        [(member_name, b"\xffnot allowlisted binary", stat.S_IFREG | 0o644)],
+    )
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="UTF-8"):
+        build_macos_release.scan_zip(archive_path)
 
 
 def test_large_payload_paths_are_copied_hashed_and_verified_streamingly(

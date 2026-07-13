@@ -1,5 +1,4 @@
 import math
-import sys
 from pathlib import Path
 from statistics import median
 from typing import Optional
@@ -89,6 +88,7 @@ def parse_pdf(
 ) -> ParsedBook:
     path = Path(path)
     document = None
+    parse_failed = False
     try:
         document = fitz.open(path)
         if document.needs_pass and not document.authenticate(""):
@@ -147,20 +147,25 @@ def parse_pdf(
             units=tuple(units),
         )
     except NeedsOcrError:
+        parse_failed = True
         raise
     except DocumentParseError:
+        parse_failed = True
         raise
     except Exception as exc:
+        parse_failed = True
         raise DocumentParseError(
             f"Cannot parse '{path.name}': unable to read PDF document."
         ) from exc
+    except BaseException:
+        parse_failed = True
+        raise
     finally:
         if document is not None:
-            active_exception = sys.exception()
             try:
                 document.close()
             except Exception as close_error:
-                if active_exception is None:
+                if not parse_failed:
                     raise DocumentParseError(
                         f"Cannot parse '{path.name}': unable to close PDF document."
                     ) from close_error

@@ -270,3 +270,22 @@ def test_close_failure_after_success_is_wrapped_as_a_document_parse_error(
 
     assert document.close_attempted is True
     assert error.value.__cause__ is close_error
+
+
+def test_outer_except_does_not_hide_a_close_failure_after_success(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    close_error = RuntimeError("close failed")
+    document = _CloseFailingDocument(_body("Readable"), close_error)
+    monkeypatch.setattr(fitz, "open", lambda path: document)
+
+    try:
+        {}["missing"]
+    except LookupError:
+        with pytest.raises(
+            DocumentParseError, match="outer-except-close-failure.pdf"
+        ) as error:
+            parse_pdf(tmp_path / "outer-except-close-failure.pdf")
+
+    assert document.close_attempted is True
+    assert error.value.__cause__ is close_error

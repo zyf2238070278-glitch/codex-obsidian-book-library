@@ -65,6 +65,7 @@ REQUIRED_METADATA_KEYS = frozenset(
 FIXED_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
 COPY_CHUNK_SIZE = 1024 * 1024
 SCAN_OVERLAP = 4096
+SQLITE_FILE_HEADER = b"SQLite format 3\x00"
 FORBIDDEN_DIRECTORY_NAMES = frozenset(
     {
         ".codex",
@@ -157,8 +158,13 @@ def _stream_size_and_sha256(source: Any) -> tuple[int, str]:
 
 def _privacy_markers(private_paths: Iterable[Path | str]) -> tuple[bytes, ...]:
     markers: list[bytes] = []
+    home = os.path.abspath(os.fspath(Path.home()))
+    home_account = Path(home).name.casefold()
+    generic_home = home_account in GENERIC_ACCOUNT_NAMES
     for path in private_paths:
         value = os.path.abspath(os.fspath(path))
+        if generic_home and value == home:
+            continue
         encoded = value.encode("utf-8")
         if encoded and encoded not in markers:
             markers.append(encoded)
@@ -221,6 +227,8 @@ def _scan_stream(
     private_markers: tuple[bytes, ...],
 ) -> None:
     first = source.read(COPY_CHUNK_SIZE)
+    if first.startswith(SQLITE_FILE_HEADER):
+        raise ReleaseBuildError(f"SQLite database content detected in {path_hint}")
     binary = _looks_binary(path_hint, first)
     previous = b""
     current = first

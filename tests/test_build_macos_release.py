@@ -495,6 +495,19 @@ def test_staging_scan_rejects_private_path_and_secret_content(tmp_path: Path) ->
         build_macos_release.scan_staging(staging, private_paths=[private_path])
 
 
+def test_staging_scan_rejects_sqlite_header_with_allowlisted_extension(
+    tmp_path: Path,
+) -> None:
+    staging = tmp_path / "staging"
+    _write(
+        staging / "release" / "README.md",
+        b"SQLite format 3\x00" + b"renamed database payload",
+    )
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="SQLite"):
+        build_macos_release.scan_staging(staging)
+
+
 @pytest.mark.parametrize(
     "member_name",
     [
@@ -528,6 +541,25 @@ def test_zip_scan_rejects_duplicate_normalized_members(tmp_path: Path) -> None:
     )
 
     with pytest.raises(build_macos_release.ReleaseBuildError, match="duplicate"):
+        build_macos_release.scan_zip(archive_path)
+
+
+def test_zip_scan_rejects_sqlite_header_with_allowlisted_extension(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "renamed-database.zip"
+    _write_zip_entries(
+        archive_path,
+        [
+            (
+                "release/README.md",
+                b"SQLite format 3\x00" + b"renamed database payload",
+                stat.S_IFREG | 0o644,
+            )
+        ],
+    )
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="SQLite"):
         build_macos_release.scan_zip(archive_path)
 
 
@@ -602,3 +634,33 @@ def test_large_payload_paths_are_copied_hashed_and_verified_streamingly(
         output_dir=tmp_path / "dist",
         metadata_path=metadata_path,
     )
+
+
+def test_generic_runner_home_is_not_a_binary_private_marker(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    runner_home = Path("/Users/runner")
+    explicit_private_path = tmp_path / "real-private-model-source"
+    monkeypatch.setattr(Path, "home", lambda: runner_home)
+    staging = tmp_path / "staging"
+    uv = staging / "release" / "bin" / "uv"
+    _write(
+        uv,
+        b"\xcf\xfa\xed\xfe\x00/Users/runner/work/uv-build\x00",
+    )
+
+    build_macos_release.scan_staging(
+        staging,
+        private_paths=[runner_home, explicit_private_path],
+    )
+
+    _write(
+        uv,
+        b"\xcf\xfa\xed\xfe\x00" + str(explicit_private_path).encode() + b"\x00",
+    )
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="private"):
+        build_macos_release.scan_staging(
+            staging,
+            private_paths=[runner_home, explicit_private_path],
+        )

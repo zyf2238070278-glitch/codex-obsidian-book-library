@@ -1,0 +1,325 @@
+import hashlib
+import json
+from dataclasses import FrozenInstanceError
+from pathlib import Path
+
+import fitz
+import numpy as np
+import pytest
+
+import book_agent.importer as importer_module
+from book_agent.config import AppPaths
+from book_agent.embeddings import NullEmbeddingProvider, decode_vector, encode_vector
+from book_agent.importer import ImportResult, ImportService, sha256_file
+from book_agent.storage import Database
+
+
+class _ReadyEmbeddingProvider:
+    available = True
+
+    def __init__(self) -> None:
+        self.received: list[str] = []
+
+    def embed_query(self, text: str) -> np.ndarray:
+        return np.array([1.0, 2.0, 3.0], dtype=np.float32)
+
+    def embed_passages(self, texts: list[str]) -> np.ndarray:
+        self.received = list(texts)
+        return np.array(
+            [[ordinal, ordinal + 0.5, ordinal + 1.0] for ordinal, _ in enumerate(texts)],
+            dtype=np.float64,
+        )
+
+
+class _WrongCountEmbeddingProvider(_ReadyEmbeddingProvider):
+    def embed_passages(self, texts: list[str]) -> np.ndarray:
+        self.received = list(texts)
+        return np.empty((0, 3), dtype=np.float32)
+
+
+class _FailingEmbeddingProvider(_ReadyEmbeddingProvider):
+    def embed_passages(self, texts: list[str]) -> np.ndarray:
+        self.received = list(texts)
+        raise RuntimeError("模型暂时不可用")
+
+
+@pytest.fixture
+def app(tmp_path: Path) -> tuple[AppPaths, Database]:
+    paths = AppPaths.from_root(tmp_path / "app")
+    database = Database(paths.database)
+    database.initialize()
+    return paths, database
+
+
+def _write_txt(path: Path, marker: str = "库存周期") -> Path:
+    path.write_text(
+        f"第一段讨论{marker}与产业需求。\n\n第二段记录风险与机会。",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_textless_pdf(path: Path) -> Path:
+    document = fitz.open()
+    try:
+        document.new_page()
+        document.new_page()
+        document.save(path)
+    finally:
+        document.close()
+    return path
+
+
+def test_vector_codec_forces_contiguous_float32_and_returns_an_owned_copy() -> None:
+    source = np.arange(20, dtype=np.float64).reshape(4, 5)[:, ::2]
+    assert not source.flags.c_contiguous
+
+    payload = encode_vector(source)
+    decoded = decode_vector(payload)
+
+    assert isinstance(payload, bytes)
+    assert decoded.dtype == np.float32
+    assert decoded.flags.c_contiguous
+    assert decoded.flags.owndata
+    assert decoded.flags.writeable
+    np.testing.assert_array_equal(decoded, source.astype(np.float32).ravel())
+
+
+def test_null_embedding_provider_is_explicitly_unavailable() -> None:
+    provider = NullEmbeddingProvider()
+
+    assert provider.available is False
+    with pytest.raises(RuntimeError, match="语义|模型"):
+        provider.embed_query("查询")
+    with pytest.raises(RuntimeError, match="语义|模型"):
+        provider.embed_passages(["段落"])
+
+
+def test_import_result_is_frozen_and_json_compatible() -> None:
+    result = ImportResult(
+        book_id="abc123",
+        status="keyword_only",
+        source_format="txt",
+        original_path="/vault/original.txt",
+        parsed_path=None,
+        passage_count=2,
+        message="仅关键词检索",
+    )
+
+    serialized = result.to_dict()
+
+    assert type(serialized) is dict
+    assert json.loads(json.dumps(serialized, ensure_ascii=False)) == serialized
+    with pytest.raises(FrozenInstanceError):
+        result.status = "ready"  # type: ignore[misc]
+
+
+def test_sha256_file_is_stable_for_streamed_content(tmp_path: Path) -> None:
+    path = tmp_path / "large.txt"
+    content = b"abc123" * 300_000
+    path.write_bytes(content)
+
+    expected = hashlib.sha256(content).hexdigest()
+
+    assert sha256_file(path) == expected
+    assert sha256_file(path) == expected
+
+
+def test_txt_import_is_keyword_searchable_and_a_second_import_is_duplicate(
+    app: tuple[AppPaths, Database], tmp_path: Path
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / "市场笔记.TXT")
+    service = ImportService(paths, database, NullEmbeddingProvider())
+
+    first = service.import_book(source, author="研究员")
+
+    assert first.status == "keyword_only"
+    assert first.source_format == "txt"
+    assert first.book_id == sha256_file(source)[:24]
+    assert first.passage_count > 0
+    assert Path(first.original_path).is_absolute()
+    assert Path(first.original_path).is_file()
+    assert first.parsed_path is not None
+    assert Path(first.parsed_path).is_file()
+    book = database.get_book(first.book_id)
+    assert book is not None
+    assert book["status"] == "keyword_only"
+    assert book["original_path"] == first.original_path
+    assert book["parsed_path"] == first.parsed_path
+    hits = database.keyword_search("库存周期", 5)
+    assert hits
+    assert hits[0].markdown_path == f"书库/20-解析文本/{first.book_id}/正文.md"
+    parsed_content = Path(first.parsed_path).read_text(encoding="utf-8")
+    assert f"^{hits[0].anchor}" in parsed_content
+    original_count = len(list(paths.originals.iterdir()))
+
+    duplicate = service.import_book(source)
+
+    assert duplicate.status == "duplicate"
+    assert duplicate.book_id == first.book_id
+    assert duplicate.original_path == first.original_path
+    assert duplicate.parsed_path == first.parsed_path
+    assert duplicate.passage_count == first.passage_count
+    assert len(list(paths.originals.iterdir())) == original_count
+    assert len(database.list_books()) == 1
+
+
+def test_available_provider_marks_ready_and_persists_every_embedding(
+    app: tuple[AppPaths, Database], tmp_path: Path
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / "ready.txt")
+    provider = _ReadyEmbeddingProvider()
+
+    result = ImportService(paths, database, provider).import_book(source)
+
+    assert result.status == "ready"
+    assert database.get_book(result.book_id)["status"] == "ready"
+    embedded = list(database.iter_embeddings([result.book_id]))
+    assert len(embedded) == result.passage_count == len(provider.received)
+    for ordinal, (hit, payload) in enumerate(embedded):
+        assert hit.text == provider.received[ordinal]
+        np.testing.assert_array_equal(
+            decode_vector(payload),
+            np.array([ordinal, ordinal + 0.5, ordinal + 1.0], dtype=np.float32),
+        )
+
+
+@pytest.mark.parametrize(
+    ("provider", "detail"),
+    [
+        (_WrongCountEmbeddingProvider(), "数量"),
+        (_FailingEmbeddingProvider(), "模型暂时不可用"),
+    ],
+)
+def test_embedding_failures_degrade_to_keyword_only_with_recovery_guidance(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    provider: _ReadyEmbeddingProvider,
+    detail: str,
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / f"fallback-{detail}.txt", marker="语义降级")
+
+    result = ImportService(paths, database, provider).import_book(source)
+
+    assert result.status == "keyword_only"
+    assert "稍后" in result.message
+    assert detail in result.message
+    book = database.get_book(result.book_id)
+    assert book["status"] == "keyword_only"
+    assert detail in book["error"]
+    assert database.keyword_search("语义降级", 5)
+    assert list(database.iter_embeddings([result.book_id])) == []
+
+
+def test_textless_pdf_is_preserved_with_needs_ocr_status(
+    app: tuple[AppPaths, Database], tmp_path: Path
+) -> None:
+    paths, database = app
+    source = _write_textless_pdf(tmp_path / "scan.pdf")
+
+    result = ImportService(paths, database, NullEmbeddingProvider()).import_book(source)
+
+    assert result.status == "needs_ocr"
+    assert result.source_format == "pdf"
+    assert result.passage_count == 0
+    assert result.parsed_path is None
+    assert Path(result.original_path).is_file()
+    book = database.get_book(result.book_id)
+    assert book["status"] == "needs_ocr"
+    assert "OCR" in book["error"]
+    assert book["parsed_path"] is None
+    assert database.count_passages(result.book_id) == 0
+
+
+def test_invalid_utf8_is_failed_but_the_original_is_preserved(
+    app: tuple[AppPaths, Database], tmp_path: Path
+) -> None:
+    paths, database = app
+    source = tmp_path / "broken.txt"
+    source.write_bytes(b"valid prefix\xff")
+
+    result = ImportService(paths, database, NullEmbeddingProvider()).import_book(source)
+
+    assert result.status == "failed"
+    assert result.passage_count == 0
+    assert Path(result.original_path).read_bytes() == source.read_bytes()
+    book = database.get_book(result.book_id)
+    assert book["status"] == "failed"
+    assert "UTF-8" in book["error"]
+    assert database.count_passages(result.book_id) == 0
+
+
+@pytest.mark.parametrize("case", ["unsupported", "missing", "directory", "symlink"])
+def test_invalid_sources_are_rejected_before_vault_or_database_writes(
+    app: tuple[AppPaths, Database], tmp_path: Path, case: str
+) -> None:
+    paths, database = app
+    if case == "unsupported":
+        source = tmp_path / "book.docx"
+        source.write_text("content", encoding="utf-8")
+    elif case == "missing":
+        source = tmp_path / "missing.txt"
+    elif case == "directory":
+        source = tmp_path / "folder.txt"
+        source.mkdir()
+    else:
+        target = _write_txt(tmp_path / "target.txt")
+        source = tmp_path / "link.txt"
+        source.symlink_to(target)
+
+    with pytest.raises(ValueError):
+        ImportService(paths, database, NullEmbeddingProvider()).import_book(source)
+
+    assert database.list_books() == []
+    assert not paths.originals.exists()
+
+
+@pytest.mark.parametrize("failure_point", ["render", "replace"])
+def test_main_pipeline_failures_leave_no_partial_passages(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / f"{failure_point}.txt")
+
+    def fail(*args, **kwargs) -> None:
+        raise OSError(f"{failure_point} injected failure")
+
+    if failure_point == "render":
+        monkeypatch.setattr(importer_module, "render_parsed_book", fail)
+    else:
+        monkeypatch.setattr(database, "replace_passages", fail)
+
+    result = ImportService(paths, database, NullEmbeddingProvider()).import_book(source)
+
+    assert result.status == "failed"
+    assert failure_point in result.message
+    assert Path(result.original_path).is_file()
+    assert database.get_book(result.book_id)["status"] == "failed"
+    assert database.count_passages(result.book_id) == 0
+
+
+def test_unexpected_parser_exception_is_reported_as_failed(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / "third-party.txt")
+
+    def explode(*args, **kwargs):
+        raise KeyError("third-party exploded")
+
+    monkeypatch.setattr(importer_module, "parse_document", explode)
+
+    result = ImportService(paths, database, NullEmbeddingProvider()).import_book(source)
+
+    assert result.status == "failed"
+    assert "third-party exploded" in result.message
+    assert database.get_book(result.book_id)["status"] == "failed"
+    assert database.count_passages(result.book_id) == 0

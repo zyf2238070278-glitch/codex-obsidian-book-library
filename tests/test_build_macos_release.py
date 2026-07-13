@@ -1543,10 +1543,14 @@ def test_uv_must_be_regular_and_executable(tmp_path: Path, as_symlink: bool) -> 
     [
         ("README.md", "/Users/alice/private/library"),
         ("AGENTS.md", f"username={Path.home().name}"),
-        ("docs/使用说明.md", "OPENAI_API_KEY=sk-proj-abcdefghijklmnopqrstuvwxyz123456"),
+        (
+            "docs/使用说明.md",
+            "OPENAI_API_KEY=" + "sk-proj-" + "abcdefghijklmnopqrstuvwxyz123456",
+        ),
         (
             "docs/常见问题.md",
-            "webhook=https://open.feishu.cn/open-apis/bot/v2/hook/12345678-abcd-1234-abcd-1234567890ab",
+            "webhook=https://open.feishu.cn/open-apis/bot/v2/"
+            + "hook/12345678-abcd-1234-abcd-1234567890ab",
         ),
         ("installer/install_macos.py", "Authorization: Bearer abcdefghijklmnopqrstuvwxyz123456"),
     ],

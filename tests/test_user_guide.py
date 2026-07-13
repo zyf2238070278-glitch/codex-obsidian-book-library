@@ -98,17 +98,31 @@ def test_user_guide_has_forced_offline_semantic_verification() -> None:
 def test_user_guide_keyword_only_recovery_order_matches_startup_behavior() -> None:
     guide = _guide()
     keyword_only_section = guide.split("`keyword_only`：", 1)[1].split("\n- `", 1)[0]
-    recovery = (
-        "恢复顺序：下载模型 → 重新加载 Codex/MCP → 重新导入同一文件；"
-        "完成后会补建语义向量。"
+    subbranches = [
+        line.strip()
+        for line in keyword_only_section.splitlines()
+        if line.startswith("  - ")
+    ]
+    model_unavailable = next(
+        line
+        for line in subbranches
+        if "语义模型未启用" in line and "缓存缺失" in line
+    )
+    index_failure = next(
+        line for line in subbranches if "语义索引失败" in line
     )
 
-    download = keyword_only_section.index("下载模型")
-    reload_process = keyword_only_section.index("重新加载 Codex/MCP")
-    reimport = keyword_only_section.index("重新导入同一文件")
+    assert "关键词检索仍可用" in keyword_only_section
+    download = model_unavailable.index("下载模型")
+    reload_process = model_unavailable.index("重新加载 Codex/MCP")
+    reimport = model_unavailable.index("重新导入")
+    inspect_error = index_failure.index("error")
+    repair = index_failure.index("修复")
+    retry = index_failure.index("重新导入")
 
-    assert recovery in keyword_only_section
     assert download < reload_process < reimport
+    assert inspect_error < repair < retry
+    assert "下载模型" not in index_failure
 
 
 def test_user_guide_explains_status_recovery_and_source_locations() -> None:

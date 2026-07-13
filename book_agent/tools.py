@@ -29,13 +29,10 @@ _BOOK_FIELDS = (
 )
 _ISSUE_ACTIONS = {
     "processing": "等待导入完成；若长期停留，请检查源文件后重新导入。",
-    "keyword_only": (
-        "恢复顺序：下载模型 → 重新加载 Codex/MCP → 重新导入同一文件；"
-        "完成后会补建语义向量。"
-    ),
     "needs_ocr": "请先对原文件执行 OCR，再重新导入。",
     "failed": "请根据 error 修复源文件或本地依赖后重新导入。",
 }
+_ISSUE_STATUSES = {*_ISSUE_ACTIONS, "keyword_only"}
 
 
 def _error_payload(error: Exception) -> dict[str, object]:
@@ -49,6 +46,32 @@ def _error_payload(error: Exception) -> dict[str, object]:
 
 def _book_metadata(book: dict[str, Any]) -> dict[str, object]:
     return {field: book.get(field) for field in _BOOK_FIELDS}
+
+
+def _keyword_only_action(error: object) -> str:
+    detail = error.strip() if isinstance(error, str) else ""
+    availability = "关键词检索仍可用。"
+    if "语义模型未启用" in detail or "缓存缺失" in detail:
+        return (
+            f"{availability}恢复顺序：下载模型 → 重新加载 Codex/MCP → "
+            "重新导入同一文件；完成后会补建语义向量。"
+        )
+    if "语义索引失败" in detail:
+        return (
+            f"{availability}请先查看 error，按 error 修复向量生成、模型运行或"
+            "数据库问题，再重新导入同一文件。"
+        )
+    return (
+        f"{availability}请先检查 error 与模型状态，确认具体原因后再按状态建议"
+        "修复和重新导入。"
+    )
+
+
+def _issue_action(status: object, error: object) -> str:
+    normalized_status = str(status)
+    if normalized_status == "keyword_only":
+        return _keyword_only_action(error)
+    return _ISSUE_ACTIONS[normalized_status]
 
 
 def _validated_ids(
@@ -156,10 +179,10 @@ class LibraryTools:
                     "title": book.get("title"),
                     "status": book.get("status"),
                     "error": book.get("error"),
-                    "action": _ISSUE_ACTIONS[str(book["status"])],
+                    "action": _issue_action(book.get("status"), book.get("error")),
                 }
                 for book in raw_books
-                if book.get("status") in _ISSUE_ACTIONS
+                if book.get("status") in _ISSUE_STATUSES
             ]
             response: dict[str, Any] = {
                 "ok": True,

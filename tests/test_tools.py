@@ -167,10 +167,96 @@ def test_library_status_reports_actionable_issues_without_book_text(
     keyword_issue = next(
         issue for issue in report["issues"] if issue["status"] == "keyword_only"
     )
-    assert keyword_issue["action"] == (
-        "恢复顺序：下载模型 → 重新加载 Codex/MCP → 重新导入同一文件；"
-        "完成后会补建语义向量。"
+    assert "关键词检索" in keyword_issue["action"]
+    assert "error" in keyword_issue["action"]
+    assert "模型状态" in keyword_issue["action"]
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "导入完成；语义模型未启用，当前可使用关键词检索。",
+        "语义模型缓存缺失，当前可使用关键词检索。",
+    ],
+)
+def test_keyword_only_model_unavailable_action_orders_model_recovery_steps(
+    library: LibraryTools,
+    error: str,
+) -> None:
+    library.database.create_book(
+        book_id="book-model-unavailable",
+        title="模型未就绪",
+        author=None,
+        source_format="txt",
+        content_sha256="hash-model-unavailable",
+        original_path="/books/model-unavailable.txt",
+        status="keyword_only",
+        error=error,
     )
+
+    action = library.library_status("book-model-unavailable")["issues"][0]["action"]
+
+    assert "关键词检索" in action
+    download = action.index("下载模型")
+    reload_process = action.index("重新加载 Codex/MCP")
+    reimport = action.index("重新导入")
+    assert download < reload_process < reimport
+
+
+@pytest.mark.parametrize(
+    "error",
+    [
+        "语义索引失败，可稍后恢复：语义向量数量不匹配。",
+        "语义索引失败，可稍后恢复：模型运行时暂时不可用。",
+        "语义索引失败，可稍后恢复：数据库写入失败。",
+    ],
+)
+def test_keyword_only_index_failure_action_uses_recorded_error_not_download(
+    library: LibraryTools,
+    error: str,
+) -> None:
+    library.database.create_book(
+        book_id="book-index-failure",
+        title="索引失败",
+        author=None,
+        source_format="txt",
+        content_sha256="hash-index-failure",
+        original_path="/books/index-failure.txt",
+        status="keyword_only",
+        error=error,
+    )
+
+    action = library.library_status("book-index-failure")["issues"][0]["action"]
+
+    assert "关键词检索" in action
+    inspect_error = action.index("查看 error")
+    repair = action.index("修复")
+    reimport = action.index("重新导入")
+    assert inspect_error < repair < reimport
+    assert "下载模型" not in action
+
+
+def test_keyword_only_legacy_record_without_error_gets_conservative_action(
+    library: LibraryTools,
+) -> None:
+    library.database.create_book(
+        book_id="book-legacy-keyword-only",
+        title="旧记录",
+        author=None,
+        source_format="txt",
+        content_sha256="hash-legacy-keyword-only",
+        original_path="/books/legacy.txt",
+        status="keyword_only",
+        error=None,
+    )
+
+    action = library.library_status("book-legacy-keyword-only")["issues"][0][
+        "action"
+    ]
+
+    assert "关键词检索" in action
+    assert action.index("检查 error") < action.index("模型状态")
+    assert "下载模型" not in action
 
 
 def test_search_caps_results_and_normalizes_non_finite_scores(

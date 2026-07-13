@@ -318,6 +318,7 @@ class VaultManager:
         cleanup_fd: int | None = None
         published_name: str | None = None
         published_info: os.stat_result | None = None
+        temp_info_for_cleanup: os.stat_result | None = None
         imported: ImportedOriginal | None = None
         try:
             try:
@@ -333,6 +334,7 @@ class VaultManager:
                     ) as (originals, originals_fd):
                         cleanup_fd = os.dup(originals_fd)
                         temp_name, temp_fd, temp_info = self._reserve_temp(inbox_fd)
+                        temp_info_for_cleanup = temp_info
                         try:
                             self._copy_complete(
                                 source_fd,
@@ -357,25 +359,27 @@ class VaultManager:
                                 copied_hash = self._hash_descriptor(hash_fd)
                             finally:
                                 os.close(hash_fd)
+                            published_info = temp_info
                             published_name = self._link_final(
                                 inbox_fd,
                                 temp_name,
                                 originals_fd,
                                 source_path.name,
                             )
-                            published_info = os.stat(
+                            linked_info = os.stat(
                                 published_name,
                                 dir_fd=originals_fd,
                                 follow_symlinks=False,
                             )
                             if (
-                                published_info.st_dev,
-                                published_info.st_ino,
+                                linked_info.st_dev,
+                                linked_info.st_ino,
                             ) != (temp_info.st_dev, temp_info.st_ino):
                                 raise ValueError(
                                     "Published original identity differs from "
                                     "import temp"
                                 )
+                            published_info = linked_info
                             imported = ImportedOriginal(
                                 path=originals / published_name,
                                 content_sha256=copied_hash,
@@ -390,16 +394,18 @@ class VaultManager:
                             finally:
                                 self._unlink_if_same(inbox_fd, temp_name, temp_info)
             except BaseException:
-                if (
-                    cleanup_fd is not None
-                    and published_name is not None
-                    and published_info is not None
-                ):
-                    self._unlink_if_same(
-                        cleanup_fd,
-                        published_name,
-                        published_info,
-                    )
+                if cleanup_fd is not None:
+                    if published_name is not None and published_info is not None:
+                        self._unlink_if_same(
+                            cleanup_fd,
+                            published_name,
+                            published_info,
+                        )
+                    elif temp_info_for_cleanup is not None:
+                        self._unlink_all_if_same(
+                            cleanup_fd,
+                            temp_info_for_cleanup,
+                        )
                 raise
         finally:
             try:
@@ -738,3 +744,15 @@ class VaultManager:
             os.unlink(name, dir_fd=directory_fd)
         except OSError:
             pass
+
+    @staticmethod
+    def _unlink_all_if_same(
+        directory_fd: int,
+        expected: os.stat_result,
+    ) -> None:
+        try:
+            names = os.listdir(directory_fd)
+        except OSError:
+            return
+        for name in names:
+            VaultManager._unlink_if_same(directory_fd, name, expected)

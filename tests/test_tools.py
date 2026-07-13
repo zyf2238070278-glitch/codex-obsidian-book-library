@@ -1,6 +1,7 @@
 import inspect
 import json
 import math
+import os
 from pathlib import Path
 from typing import Any
 
@@ -442,6 +443,83 @@ def test_note_directory_swap_after_link_never_returns_a_stale_path(
     assert sentinel.read_text(encoding="utf-8") == "replacement sentinel"
     assert list(notes_directory.iterdir()) == [sentinel]
     assert list(displaced_notes.iterdir()) == []
+
+
+def test_note_post_link_interruption_removes_unreturned_note(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    tools = build_tools(
+        project,
+        NullEmbeddingProvider(),
+    )
+    source = _write_chinese_book(tmp_path / "笔记发布后中断.txt")
+    imported = tools.import_book(str(source))
+    assert imported["ok"] is True
+    searched = tools.search_books("库存周期", mode="quote")
+    passage_id = searched["results"][0]["passage_id"]
+    real_link = notes_module.os.link
+
+    def link_then_interrupt(*args: object, **kwargs: object) -> None:
+        real_link(*args, **kwargs)
+        raise KeyboardInterrupt("interrupted after note link")
+
+    monkeypatch.setattr(notes_module.os, "link", link_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt, match="after note link"):
+        tools.notes.save(
+            "笔记发布后中断",
+            "这条笔记不得残留。",
+            [passage_id],
+        )
+
+    assert list(tools.paths.notes.iterdir()) == []
+
+
+def test_note_post_link_stat_failure_removes_unreturned_note(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    tools = build_tools(
+        project,
+        NullEmbeddingProvider(),
+    )
+    source = _write_chinese_book(tmp_path / "笔记发布后检查失败.txt")
+    imported = tools.import_book(str(source))
+    assert imported["ok"] is True
+    searched = tools.search_books("库存周期", mode="quote")
+    passage_id = searched["results"][0]["passage_id"]
+    real_stat = notes_module.os.stat
+    failed = False
+
+    def fail_published_stat_once(
+        path: object,
+        *args: object,
+        **kwargs: object,
+    ) -> os.stat_result:
+        nonlocal failed
+        if (
+            not failed
+            and isinstance(path, str)
+            and path.endswith(".md")
+            and kwargs.get("dir_fd") is not None
+        ):
+            failed = True
+            raise OSError("published note stat unavailable")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(notes_module.os, "stat", fail_published_stat_once)
+
+    with pytest.raises(OSError, match="note stat unavailable"):
+        tools.notes.save(
+            "笔记发布后检查失败",
+            "这条笔记不得残留。",
+            [passage_id],
+        )
+
+    assert list(tools.paths.notes.iterdir()) == []
 
 
 @pytest.mark.parametrize("replacement_kind", ["directory", "symlink"])

@@ -223,12 +223,16 @@ class NoteService:
                 raise RuntimeError(
                     "The notes filesystem reported an invalid filename limit"
                 )
+            if temp_info is None:
+                raise AssertionError("temporary note identity was not captured")
 
             for candidate in self._candidate_names(
                 safe_title,
                 timestamp,
                 name_max,
             ):
+                published_name = candidate
+                published_info = temp_info
                 try:
                     os.link(
                         temp_name,
@@ -239,24 +243,31 @@ class NoteService:
                     )
                 except OSError as exc:
                     if exc.errno == errno.EEXIST:
+                        VaultManager._unlink_if_same(
+                            directory_fd,
+                            candidate,
+                            temp_info,
+                        )
+                        published_name = None
+                        published_info = None
                         continue
                     raise RuntimeError(
                         "Atomic hard-link publication failed; the notes filesystem "
                         "may not support hard links or cross-filesystem linking"
                     ) from exc
-                published_name = candidate
-                published_info = os.stat(
+                linked_info = os.stat(
                     candidate,
                     dir_fd=directory_fd,
                     follow_symlinks=False,
                 )
-                if temp_info is None or (
-                    published_info.st_dev,
-                    published_info.st_ino,
+                if (
+                    linked_info.st_dev,
+                    linked_info.st_ino,
                 ) != (temp_info.st_dev, temp_info.st_ino):
                     raise RuntimeError(
                         "Published note identity differs from temporary note"
                     )
+                published_info = linked_info
                 break
             if published_name is None or published_info is None:
                 raise RuntimeError("Unable to choose a unique note filename")

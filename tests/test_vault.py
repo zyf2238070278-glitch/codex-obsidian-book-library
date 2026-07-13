@@ -8,6 +8,7 @@ from threading import Barrier
 
 import pytest
 
+import book_agent.vault as vault_module
 from book_agent.config import AppPaths
 from book_agent.vault import VaultManager
 
@@ -169,6 +170,70 @@ def test_import_original_preserves_metadata_and_sequential_collisions(
     first_info = first.stat()
     assert stat.S_IMODE(first_info.st_mode) == 0o640
     assert first_info.st_mtime_ns == 2_500_000_000
+    assert list(paths.inbox.iterdir()) == []
+
+
+def test_import_post_link_interruption_removes_unregistered_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = AppPaths.from_root(tmp_path / "project")
+    manager = VaultManager(paths)
+    manager.ensure_layout()
+    source = _source(tmp_path, "source", "book.txt", "interrupted import")
+    real_link_final = manager._link_final
+
+    def link_then_interrupt(
+        inbox_fd: int,
+        temp_name: str,
+        originals_fd: int,
+        source_name: str,
+    ) -> str:
+        real_link_final(
+            inbox_fd,
+            temp_name,
+            originals_fd,
+            source_name,
+        )
+        raise KeyboardInterrupt("interrupted after original link")
+
+    monkeypatch.setattr(manager, "_link_final", link_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt, match="after original link"):
+        manager.import_original(source)
+
+    assert list(paths.originals.iterdir()) == []
+    assert list(paths.inbox.iterdir()) == []
+
+
+def test_import_post_link_stat_failure_removes_unregistered_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = AppPaths.from_root(tmp_path / "project")
+    manager = VaultManager(paths)
+    manager.ensure_layout()
+    source = _source(tmp_path, "source", "book.txt", "stat failure import")
+    real_stat = vault_module.os.stat
+    failed = False
+
+    def fail_published_stat_once(
+        path: object,
+        *args: object,
+        **kwargs: object,
+    ) -> os.stat_result:
+        nonlocal failed
+        if not failed and path == "book.txt" and kwargs.get("dir_fd") is not None:
+            failed = True
+            raise OSError("published original stat unavailable")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(vault_module.os, "stat", fail_published_stat_once)
+
+    with pytest.raises(OSError, match="original stat unavailable"):
+        manager.import_original(source)
+
+    assert list(paths.originals.iterdir()) == []
     assert list(paths.inbox.iterdir()) == []
 
 

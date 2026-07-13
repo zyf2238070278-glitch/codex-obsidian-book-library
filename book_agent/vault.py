@@ -170,6 +170,8 @@ def _managed_directory_beneath(
     *,
     create: bool,
     root_label: str = "project root",
+    create_root: bool | None = None,
+    expected_root_identity: tuple[int, int] | None = None,
 ) -> Iterator[tuple[Path, int]]:
     root = _absolute_path(root_path, root_label)
     directory = _confined_path(
@@ -178,7 +180,23 @@ def _managed_directory_beneath(
         root,
         root_label=root_label,
     )
-    root_fd = _open_absolute_directory(root, root_label, create=create)
+    root_fd = _open_absolute_directory(
+        root,
+        root_label,
+        create=create if create_root is None else create_root,
+    )
+    if expected_root_identity is not None:
+        try:
+            root_info = os.fstat(root_fd)
+        except OSError as exc:
+            os.close(root_fd)
+            raise ValueError(
+                f"Managed {root_label} cannot be inspected safely: {root}"
+            ) from exc
+        actual_root_identity = (root_info.st_dev, root_info.st_ino)
+        if actual_root_identity != expected_root_identity:
+            os.close(root_fd)
+            raise ValueError(f"Managed {root_label} identity changed: {root}")
     current_fd = root_fd
     current_path = root
     try:
@@ -200,8 +218,13 @@ def _managed_directory_beneath(
 
 
 class VaultManager:
-    def __init__(self, paths: AppPaths) -> None:
+    def __init__(
+        self,
+        paths: AppPaths,
+        vault_root_identity: tuple[int, int] | None = None,
+    ) -> None:
         self.paths = paths
+        self.vault_root_identity = vault_root_identity
 
     def ensure_layout(self) -> None:
         vault_directories = (
@@ -294,6 +317,8 @@ class VaultManager:
             label,
             create=create,
             root_label="vault root",
+            create_root=False if self.vault_root_identity is not None else None,
+            expected_root_identity=self.vault_root_identity,
         ) as managed:
             yield managed
 

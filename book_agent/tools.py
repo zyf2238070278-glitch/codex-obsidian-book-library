@@ -296,6 +296,7 @@ def build_tools(
     """Initialize the managed local library without downloading a model."""
 
     explicit_vault: Path | None = None
+    explicit_vault_identity: tuple[int, int] | None = None
     if vault_root is not None:
         try:
             explicit_vault = Path(
@@ -323,12 +324,16 @@ def build_tools(
             raise ValueError(
                 f"Explicit Obsidian vault must be a directory: {explicit_vault}"
             )
+        explicit_vault_identity = (vault_info.st_dev, vault_info.st_ino)
 
     paths = AppPaths.from_root(
         Path(project_root).expanduser(),
         vault_root=explicit_vault,
     )
-    VaultManager(paths).ensure_layout()
+    VaultManager(
+        paths,
+        vault_root_identity=explicit_vault_identity,
+    ).ensure_layout()
     database = Database(paths.database, root=paths.root)
     database.initialize()
 
@@ -337,9 +342,18 @@ def build_tools(
         local_e5 = E5EmbeddingProvider(paths.models)
         provider = local_e5 if local_e5.available else NullEmbeddingProvider()
 
-    importer = ImportService(paths, database, provider)
+    importer = ImportService(
+        paths,
+        database,
+        provider,
+        vault_root_identity=explicit_vault_identity,
+    )
     retriever = Retriever(database, provider)
-    notes = NoteService(paths, database)
+    notes = NoteService(
+        paths,
+        database,
+        vault_root_identity=explicit_vault_identity,
+    )
     return LibraryTools(
         paths=paths,
         database=database,

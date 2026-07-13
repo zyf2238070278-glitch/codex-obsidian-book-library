@@ -90,11 +90,17 @@ class ImportService:
         paths: AppPaths,
         database: Database,
         embedding_provider: Any,
+        *,
+        vault_root_identity: tuple[int, int] | None = None,
     ) -> None:
         self.paths = paths
         self.database = database
         self.embedding_provider = embedding_provider
-        self.vault = VaultManager(paths)
+        self.vault_root_identity = vault_root_identity
+        self.vault = VaultManager(
+            paths,
+            vault_root_identity=vault_root_identity,
+        )
 
     def import_book(
         self,
@@ -294,6 +300,7 @@ class ImportService:
                 original,
                 passages,
                 managed_root=self.paths.vault,
+                expected_root_identity=self.vault_root_identity,
             )
             parsed_path = str(destination.absolute())
             self.database.replace_passages(book_id, passages)

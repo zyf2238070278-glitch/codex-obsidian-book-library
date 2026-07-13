@@ -1,4 +1,5 @@
 import json
+import os
 from pathlib import Path
 
 import pytest
@@ -189,6 +190,50 @@ def test_render_atomically_replaces_an_existing_destination(tmp_path: Path) -> N
     assert content != "旧文件内容"
     assert "完整的新文件。" in content
     assert not list(tmp_path.glob(f".{destination.name}.*.tmp"))
+
+
+def test_render_does_not_recreate_a_missing_managed_root(tmp_path: Path) -> None:
+    managed_root = tmp_path / "managed-root"
+    managed_root.mkdir()
+    destination = managed_root / "nested" / "book.md"
+    managed_root.rmdir()
+
+    with pytest.raises(ValueError, match="managed root"):
+        rendering.render_parsed_book(
+            destination,
+            "book-1",
+            _parsed(),
+            "source.pdf",
+            [_passage(0, "不得写入。")],
+            managed_root=managed_root,
+        )
+
+    assert not managed_root.exists()
+
+
+def test_render_rejects_replaced_managed_root_identity(tmp_path: Path) -> None:
+    managed_root = tmp_path / "managed-root"
+    managed_root.mkdir()
+    root_info = os.lstat(managed_root)
+    expected_identity = (root_info.st_dev, root_info.st_ino)
+    displaced_root = tmp_path / "displaced-root"
+    managed_root.rename(displaced_root)
+    managed_root.mkdir()
+    destination = managed_root / "nested" / "book.md"
+
+    with pytest.raises(ValueError, match=r"managed root.*identity"):
+        rendering.render_parsed_book(
+            destination,
+            "book-1",
+            _parsed(),
+            "source.pdf",
+            [_passage(0, "不得写入。")],
+            managed_root=managed_root,
+            expected_root_identity=expected_identity,
+        )
+
+    assert list(managed_root.iterdir()) == []
+    assert list(displaced_root.iterdir()) == []
 
 
 def test_replace_failure_preserves_old_file_and_cleans_unique_temp(

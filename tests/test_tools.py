@@ -10,6 +10,7 @@ from book_agent.config import MAX_PREVIEWS
 from book_agent.embeddings import NullEmbeddingProvider
 from book_agent.models import SearchHit
 from book_agent.tools import LibraryTools, build_tools
+from book_agent.vault import VaultManager
 
 
 def _json_round_trip(value: Any) -> Any:
@@ -90,6 +91,46 @@ def test_build_tools_rejects_invalid_explicit_vault_without_writing(
         assert list(target.iterdir()) == []
 
 
+@pytest.mark.parametrize("race", ["deleted", "replaced"])
+def test_build_tools_rejects_explicit_vault_identity_race_without_writing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    race: str,
+) -> None:
+    project = tmp_path / "project"
+    obsidian_vault = tmp_path / "Obsidian_workspace"
+    obsidian_vault.mkdir()
+    displaced_vault = tmp_path / "displaced-vault"
+    original_ensure_layout = VaultManager.ensure_layout
+
+    def race_then_ensure_layout(manager: VaultManager) -> None:
+        if race == "deleted":
+            obsidian_vault.rmdir()
+        else:
+            obsidian_vault.rename(displaced_vault)
+            obsidian_vault.mkdir()
+        original_ensure_layout(manager)
+
+    monkeypatch.setattr(VaultManager, "ensure_layout", race_then_ensure_layout)
+
+    with pytest.raises(ValueError, match=r"vault root|Obsidian vault"):
+        build_tools(
+            project,
+            NullEmbeddingProvider(),
+            vault_root=obsidian_vault,
+        )
+
+    assert not (project / "data").exists()
+    assert not (project / "vault").exists()
+    assert not (obsidian_vault / "书库").exists()
+    assert not (displaced_vault / "书库").exists()
+    if race == "deleted":
+        assert not obsidian_vault.exists()
+    else:
+        assert list(obsidian_vault.iterdir()) == []
+        assert list(displaced_vault.iterdir()) == []
+
+
 def test_external_vault_txt_workflow_routes_every_managed_file(
     tmp_path: Path,
 ) -> None:
@@ -135,6 +176,64 @@ def test_external_vault_txt_workflow_routes_every_managed_file(
     assert tools.paths.models == project / "data" / "models"
     assert tools.paths.models.is_dir()
     assert not (project / "vault").exists()
+
+
+def test_import_rejects_replaced_explicit_vault_root(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    obsidian_vault = tmp_path / "Obsidian_workspace"
+    obsidian_vault.mkdir()
+    tools = build_tools(
+        project,
+        NullEmbeddingProvider(),
+        vault_root=obsidian_vault,
+    )
+    displaced_vault = tmp_path / "displaced-vault"
+    obsidian_vault.rename(displaced_vault)
+    obsidian_vault.mkdir()
+    source = _write_chinese_book(tmp_path / "身份变化导入.txt")
+
+    imported = tools.import_book(str(source))
+
+    assert imported["ok"] is False
+    assert "vault root" in imported["error"]
+    assert list(obsidian_vault.iterdir()) == []
+    assert list((displaced_vault / "书库" / "10-原始书籍").iterdir()) == []
+    assert list((displaced_vault / "书库" / "20-解析文本").iterdir()) == []
+
+
+def test_note_save_rejects_replaced_explicit_vault_root(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    obsidian_vault = tmp_path / "Obsidian_workspace"
+    obsidian_vault.mkdir()
+    tools = build_tools(
+        project,
+        NullEmbeddingProvider(),
+        vault_root=obsidian_vault,
+    )
+    source = _write_chinese_book(tmp_path / "身份变化笔记.txt")
+    imported = tools.import_book(str(source))
+    assert imported["ok"] is True
+    searched = tools.search_books("库存周期", mode="quote")
+    assert searched["count"] >= 1
+    passage_id = searched["results"][0]["passage_id"]
+    displaced_vault = tmp_path / "displaced-vault"
+    obsidian_vault.rename(displaced_vault)
+    obsidian_vault.mkdir()
+
+    saved = tools.save_reading_note(
+        "身份变化笔记",
+        "不得写入替换后的仓库。",
+        [passage_id],
+    )
+
+    assert saved["ok"] is False
+    assert "vault root" in saved["error"]
+    assert list(obsidian_vault.iterdir()) == []
+    assert list((displaced_vault / "书库" / "30-AI读书笔记").iterdir()) == []
 
 
 def test_real_txt_workflow_is_json_safe_and_preserves_content_boundaries(

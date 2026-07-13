@@ -52,10 +52,13 @@ class NoteService:
         paths: AppPaths,
         database: Database,
         clock: Callable[[], datetime] = datetime.now,
+        *,
+        vault_root_identity: tuple[int, int] | None = None,
     ) -> None:
         self.paths = paths
         self.database = database
         self.clock = clock
+        self.vault_root_identity = vault_root_identity
 
     def save(
         self,
@@ -128,7 +131,10 @@ class NoteService:
         )
 
         timestamp = self.clock().strftime("%Y%m%d-%H%M%S")
-        manager = VaultManager(self.paths)
+        manager = VaultManager(
+            self.paths,
+            vault_root_identity=self.vault_root_identity,
+        )
         manager.ensure_layout()
         directory_fd: int | None = None
         notes_directory = self.paths.notes

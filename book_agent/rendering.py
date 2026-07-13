@@ -105,6 +105,7 @@ def render_parsed_book(
     passages: Iterable[Passage],
     *,
     managed_root: str | Path | None = None,
+    expected_root_identity: tuple[int, int] | None = None,
 ) -> Path:
     destination = Path(os.path.abspath(os.fspath(Path(destination).expanduser())))
     root = Path(destination.anchor) if managed_root is None else Path(managed_root)
@@ -116,6 +117,8 @@ def render_parsed_book(
         "parsed book",
         create=True,
         root_label="managed root",
+        create_root=False,
+        expected_root_identity=expected_root_identity,
     ) as (_, directory_fd):
         try:
             destination_info = os.stat(

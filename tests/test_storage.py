@@ -75,6 +75,7 @@ def test_replace_rejects_a_passage_for_another_book_without_writing(db: Database
 def test_replace_rolls_back_passages_and_fts_when_a_later_insert_fails(db: Database) -> None:
     _book(db)
     db.replace_passages("book-1", [_passage(text="原有内容讨论芯片行业。")])
+    db.update_book_status("book-1", "keyword_only")
     duplicate_id = _passage("duplicate", ordinal=1, text="新内容第一段。")
     conflicting = _passage("duplicate", ordinal=2, text="新内容第二段。")
 
@@ -89,6 +90,7 @@ def test_replace_rolls_back_passages_and_fts_when_a_later_insert_fails(db: Datab
 def test_fts_trigram_finds_a_three_plus_character_chinese_substring(db: Database) -> None:
     _book(db)
     db.replace_passages("book-1", [_passage(text="周期中的芯片行业经常出现波动。")])
+    db.update_book_status("book-1", "keyword_only")
 
     hits = db.keyword_search("芯片行业", 5)
 
@@ -112,6 +114,7 @@ def test_short_like_queries_treat_wildcards_and_escape_as_literals(
             _passage("plain", ordinal=3, text="这里没有特殊符号"),
         ],
     )
+    db.update_book_status("book-1", "keyword_only")
 
     assert [hit.passage_id for hit in db.keyword_search(query, 20)] == [expected]
 
@@ -124,6 +127,8 @@ def test_keyword_search_filters_book_ids_for_like_and_fts(db: Database) -> None:
         "book-2",
         [_passage("passage-2", book_id="book-2", text="芯片行业乙")],
     )
+    db.update_book_status("book-1", "keyword_only")
+    db.update_book_status("book-2", "keyword_only")
 
     assert [h.book_id for h in db.keyword_search("芯片", 5, ["book-2"])] == ["book-2"]
     assert [h.book_id for h in db.keyword_search("芯片行业", 5, ["book-1"])] == ["book-1"]
@@ -140,6 +145,7 @@ def test_get_passages_preserves_requested_order(db: Database) -> None:
             _passage("passage-3", ordinal=2, text="丙段"),
         ],
     )
+    db.update_book_status("book-1", "keyword_only")
 
     hits = db.get_passages(["passage-3", "missing", "passage-1"])
 
@@ -157,6 +163,7 @@ def test_embedding_roundtrip_neighbors_and_book_helpers(db: Database) -> None:
         ],
     )
     db.set_embeddings({"passage-1": b"one", "passage-3": b"three"})
+    db.update_book_status("book-1", "ready")
 
     embedded = list(db.iter_embeddings(["book-1"]))
 
@@ -172,7 +179,25 @@ def test_embedding_roundtrip_neighbors_and_book_helpers(db: Database) -> None:
     assert db.get_ordinal("passage-2") == 1
     assert db.get_ordinal("missing") is None
     assert db.find_book_by_hash("hash-1")["book_id"] == "book-1"
-    assert db.status_counts() == {"processing": 1}
+    assert db.status_counts() == {"ready": 1}
+
+
+@pytest.mark.parametrize("status", ["processing", "failed", "needs_ocr"])
+def test_nonsearchable_book_statuses_hide_even_existing_passages_and_embeddings(
+    db: Database, status: str
+) -> None:
+    _book(db)
+    db.replace_passages("book-1", [_passage(embedding=b"unsafe-vector")])
+    if status != "processing":
+        db.update_book_status("book-1", status)
+
+    assert db.count_passages("book-1") == 1
+    assert db.keyword_search("芯片", 5) == []
+    assert db.keyword_search("芯片行业", 5) == []
+    assert list(db.iter_embeddings()) == []
+    assert db.get_passages(["passage-1"]) == []
+    assert db.get_neighbors("book-1", 0, 1) == []
+    assert db.get_ordinal("passage-1") is None
 
 
 def test_book_updates_listing_and_connection_configuration(db: Database) -> None:

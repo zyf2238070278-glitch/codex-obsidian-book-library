@@ -55,7 +55,7 @@ def sha256_file(path: str | Path) -> str:
     return digest.hexdigest()
 
 
-def _error_detail(error: Exception) -> str:
+def _error_detail(error: BaseException) -> str:
     return str(error).strip() or error.__class__.__name__
 
 
@@ -87,30 +87,39 @@ class ImportService:
 
         duplicate = self.database.find_book_by_hash(content_hash)
         if duplicate is not None:
-            duplicate_id = str(duplicate["book_id"])
-            return ImportResult(
-                book_id=duplicate_id,
-                status="duplicate",
-                source_format=str(duplicate["source_format"]),
-                original_path=str(duplicate["original_path"]),
-                parsed_path=duplicate["parsed_path"],
-                passage_count=self.database.count_passages(duplicate_id),
-                message="这本书已经导入，无需重复复制。",
-            )
+            return self._duplicate_result(duplicate)
 
         self.vault.ensure_layout()
         original = self.vault.import_original(source_path)
         original_path = str(original.absolute())
+        copied_hash = sha256_file(original)
+        if copied_hash != content_hash:
+            content_hash = copied_hash
+            book_id = content_hash[:24]
+            duplicate = self.database.find_book_by_hash(content_hash)
+            if duplicate is not None:
+                self._remove_imported_original(original)
+                return self._duplicate_result(duplicate)
         initial_title = source_path.stem if title is None else title
-        self.database.create_book(
-            book_id=book_id,
-            title=initial_title,
-            author=author,
-            source_format=source_format,
-            content_sha256=content_hash,
-            original_path=original_path,
-            status="processing",
-        )
+        try:
+            self.database.create_book(
+                book_id=book_id,
+                title=initial_title,
+                author=author,
+                source_format=source_format,
+                content_sha256=content_hash,
+                original_path=original_path,
+                status="processing",
+            )
+        except BaseException as create_error:
+            try:
+                self._remove_imported_original(original)
+            except BaseException as cleanup_error:
+                create_error.add_note(
+                    "创建书籍记录失败后无法清理刚复制的原书："
+                    + _error_detail(cleanup_error)
+                )
+            raise
 
         parsed_path: str | None = None
         passage_count = 0
@@ -162,6 +171,20 @@ class ImportService:
                 error=f"导入失败：{detail}",
                 message=f"导入失败：{detail}",
             )
+        except BaseException as interruption:
+            detail = _error_detail(interruption)
+            try:
+                self.database.update_book_status(
+                    book_id,
+                    "failed",
+                    error=f"导入被中断：{detail}",
+                    parsed_path=parsed_path,
+                )
+            except BaseException as status_error:
+                interruption.add_note(
+                    "记录导入中断状态时失败：" + _error_detail(status_error)
+                )
+            raise
 
     @staticmethod
     def _validate_source(source: str | Path) -> tuple[Path, str]:
@@ -185,6 +208,30 @@ class ImportService:
             raise ValueError(f"不支持的书籍格式：{displayed}")
         return source_path, suffix
 
+    def _duplicate_result(self, duplicate: dict[str, Any]) -> ImportResult:
+        duplicate_id = str(duplicate["book_id"])
+        return ImportResult(
+            book_id=duplicate_id,
+            status="duplicate",
+            source_format=str(duplicate["source_format"]),
+            original_path=str(duplicate["original_path"]),
+            parsed_path=duplicate["parsed_path"],
+            passage_count=self.database.count_passages(duplicate_id),
+            message="这本书已经导入，无需重复复制。",
+        )
+
+    def _remove_imported_original(self, original: Path) -> None:
+        original = original.absolute()
+        originals = self.paths.originals.absolute()
+        if original.parent != originals:
+            raise RuntimeError(f"拒绝删除书库目录外的文件：{original}")
+        original_info = original.lstat()
+        if stat.S_ISLNK(original_info.st_mode) or not stat.S_ISREG(
+            original_info.st_mode
+        ):
+            raise RuntimeError(f"拒绝删除非普通原书文件：{original}")
+        original.unlink()
+
     def _build_semantic_index(
         self, passages: list[Any]
     ) -> tuple[str, str | None, str]:
@@ -206,9 +253,12 @@ class ImportService:
                     "语义向量数量不匹配："
                     f"应有 {len(passages)} 个，实际得到 {len(vectors)} 个。"
                 )
+            normalized_vectors = self._validated_vectors(vectors)
             encoded = {
-                passage.passage_id: encode_vector(np.asarray(vector))
-                for passage, vector in zip(passages, vectors, strict=True)
+                passage.passage_id: encode_vector(vector)
+                for passage, vector in zip(
+                    passages, normalized_vectors, strict=True
+                )
             }
             self.database.set_embeddings(encoded)
         except Exception as error:
@@ -217,6 +267,33 @@ class ImportService:
             return "keyword_only", message, message
 
         return "ready", None, "导入完成，关键词与语义索引均已就绪。"
+
+    @staticmethod
+    def _validated_vectors(vectors: list[Any]) -> list[np.ndarray]:
+        normalized_vectors: list[np.ndarray] = []
+        expected_dimension: int | None = None
+        for ordinal, vector in enumerate(vectors, start=1):
+            try:
+                normalized = np.asarray(vector, dtype=np.float32)
+            except (TypeError, ValueError, OverflowError) as error:
+                raise ValueError(
+                    f"第 {ordinal} 个语义向量无法转换为 float32。"
+                ) from error
+            if normalized.ndim != 1:
+                raise ValueError(f"第 {ordinal} 个语义向量必须是一维数组。")
+            if normalized.size == 0:
+                raise ValueError(f"第 {ordinal} 个语义向量不能为空。")
+            if not np.all(np.isfinite(normalized)):
+                raise ValueError(f"第 {ordinal} 个语义向量必须全部是有限数值。")
+            if expected_dimension is None:
+                expected_dimension = int(normalized.size)
+            elif normalized.size != expected_dimension:
+                raise ValueError(
+                    "所有语义向量必须维度一致："
+                    f"期望 {expected_dimension}，第 {ordinal} 个为 {normalized.size}。"
+                )
+            normalized_vectors.append(np.ascontiguousarray(normalized))
+        return normalized_vectors
 
     def _finalize(
         self,
@@ -252,6 +329,15 @@ class ImportService:
                 )
             except Exception as retry_error:
                 result_message += f"；失败状态也无法写入：{_error_detail(retry_error)}"
+                try:
+                    persisted = self.database.get_book(book_id)
+                except Exception as read_error:
+                    result_message += (
+                        f"；也无法读取实际状态：{_error_detail(read_error)}"
+                    )
+                else:
+                    if persisted is not None:
+                        result_status = str(persisted["status"])
 
         return ImportResult(
             book_id=book_id,

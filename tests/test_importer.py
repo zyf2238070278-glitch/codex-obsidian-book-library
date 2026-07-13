@@ -43,6 +43,40 @@ class _FailingEmbeddingProvider(_ReadyEmbeddingProvider):
         raise RuntimeError("模型暂时不可用")
 
 
+class _InvalidVectorEmbeddingProvider(_ReadyEmbeddingProvider):
+    def __init__(self, case: str) -> None:
+        super().__init__()
+        self.case = case
+
+    def embed_passages(self, texts: list[str]):
+        self.received = list(texts)
+        count = len(texts)
+        if self.case == "empty":
+            return np.empty((count, 0), dtype=np.float32)
+        if self.case == "nan":
+            vectors = np.ones((count, 3), dtype=np.float32)
+            vectors[0, 0] = np.nan
+            return vectors
+        if self.case == "inf":
+            vectors = np.ones((count, 3), dtype=np.float32)
+            vectors[0, 0] = np.inf
+            return vectors
+        if self.case == "two-dimensional-row":
+            return [np.ones((1, 3), dtype=np.float32) for _ in texts]
+        if self.case == "inconsistent":
+            return [
+                np.ones(2 + ordinal, dtype=np.float32)
+                for ordinal, _ in enumerate(texts)
+            ]
+        raise AssertionError(f"unknown vector case: {self.case}")
+
+
+class _InterruptingEmbeddingProvider(_ReadyEmbeddingProvider):
+    def embed_passages(self, texts: list[str]) -> np.ndarray:
+        self.received = list(texts)
+        raise KeyboardInterrupt("operator cancelled embedding")
+
+
 @pytest.fixture
 def app(tmp_path: Path) -> tuple[AppPaths, Database]:
     paths = AppPaths.from_root(tmp_path / "app")
@@ -54,6 +88,14 @@ def app(tmp_path: Path) -> tuple[AppPaths, Database]:
 def _write_txt(path: Path, marker: str = "库存周期") -> Path:
     path.write_text(
         f"第一段讨论{marker}与产业需求。\n\n第二段记录风险与机会。",
+        encoding="utf-8",
+    )
+    return path
+
+
+def _write_multi_passage_txt(path: Path) -> Path:
+    path.write_text(
+        "第一段" + "甲" * 1600 + "\n\n" + "第二段" + "乙" * 1600,
         encoding="utf-8",
     )
     return path
@@ -165,6 +207,67 @@ def test_txt_import_is_keyword_searchable_and_a_second_import_is_duplicate(
     assert len(database.list_books()) == 1
 
 
+def test_copied_bytes_are_authoritative_when_source_changes_after_preflight_hash(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / "changing.txt", marker="旧内容标记")
+    service = ImportService(paths, database, NullEmbeddingProvider())
+    real_import_original = service.vault.import_original
+
+    def replace_then_copy(source_path: Path) -> Path:
+        _write_txt(source, marker="副本权威内容")
+        return real_import_original(source_path)
+
+    monkeypatch.setattr(service.vault, "import_original", replace_then_copy)
+
+    result = service.import_book(source)
+
+    original = Path(result.original_path)
+    authoritative_hash = hashlib.sha256(original.read_bytes()).hexdigest()
+    book = database.get_book(result.book_id)
+    assert result.book_id == authoritative_hash[:24]
+    assert book["content_sha256"] == authoritative_hash
+    assert Path(book["original_path"]) == original
+    assert "副本权威内容" in Path(result.parsed_path).read_text(encoding="utf-8")
+    assert database.keyword_search("副本权威内容", 5)
+    assert database.keyword_search("旧内容标记", 5) == []
+
+
+def test_hash_drift_to_an_existing_book_removes_the_new_copy_as_duplicate(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database = app
+    existing_source = _write_txt(tmp_path / "existing.txt", marker="权威重复内容")
+    service = ImportService(paths, database, NullEmbeddingProvider())
+    existing = service.import_book(existing_source)
+    original_count = len(list(paths.originals.iterdir()))
+    changing_source = _write_txt(tmp_path / "changing.txt", marker="预检旧内容")
+    real_import_original = service.vault.import_original
+
+    def replace_with_existing_then_copy(source_path: Path) -> Path:
+        changing_source.write_bytes(existing_source.read_bytes())
+        return real_import_original(source_path)
+
+    monkeypatch.setattr(
+        service.vault, "import_original", replace_with_existing_then_copy
+    )
+
+    duplicate = service.import_book(changing_source)
+
+    assert duplicate.status == "duplicate"
+    assert duplicate.book_id == existing.book_id
+    assert duplicate.original_path == existing.original_path
+    assert duplicate.parsed_path == existing.parsed_path
+    assert duplicate.passage_count == existing.passage_count
+    assert len(list(paths.originals.iterdir())) == original_count
+    assert len(database.list_books()) == 1
+
+
 def test_available_provider_marks_ready_and_persists_every_embedding(
     app: tuple[AppPaths, Database], tmp_path: Path
 ) -> None:
@@ -211,6 +314,36 @@ def test_embedding_failures_degrade_to_keyword_only_with_recovery_guidance(
     assert book["status"] == "keyword_only"
     assert detail in book["error"]
     assert database.keyword_search("语义降级", 5)
+    assert list(database.iter_embeddings([result.book_id])) == []
+
+
+@pytest.mark.parametrize(
+    ("case", "detail"),
+    [
+        ("empty", "不能为空"),
+        ("nan", "有限"),
+        ("inf", "有限"),
+        ("two-dimensional-row", "一维"),
+        ("inconsistent", "维度一致"),
+    ],
+)
+def test_invalid_vectors_degrade_before_any_embedding_is_written(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    case: str,
+    detail: str,
+) -> None:
+    paths, database = app
+    source = _write_multi_passage_txt(tmp_path / f"invalid-vector-{case}.txt")
+    provider = _InvalidVectorEmbeddingProvider(case)
+
+    result = ImportService(paths, database, provider).import_book(source)
+
+    assert result.passage_count >= 2
+    assert result.status == "keyword_only"
+    assert "稍后" in result.message
+    assert detail in result.message
+    assert database.get_book(result.book_id)["status"] == "keyword_only"
     assert list(database.iter_embeddings([result.book_id])) == []
 
 
@@ -323,3 +456,107 @@ def test_unexpected_parser_exception_is_reported_as_failed(
     assert "third-party exploded" in result.message
     assert database.get_book(result.book_id)["status"] == "failed"
     assert database.count_passages(result.book_id) == 0
+
+
+def test_final_status_failure_falls_back_to_failed_without_deleting_passages(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / "status-retry.txt", marker="不可泄露证据")
+    real_update = database.update_book_status
+    attempts = 0
+
+    def fail_once(*args, **kwargs) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("first status write failed")
+        real_update(*args, **kwargs)
+
+    monkeypatch.setattr(database, "update_book_status", fail_once)
+
+    result = ImportService(paths, database, NullEmbeddingProvider()).import_book(source)
+
+    assert attempts == 2
+    assert result.status == "failed"
+    assert "状态写入失败" in result.message
+    assert database.get_book(result.book_id)["status"] == "failed"
+    assert database.count_passages(result.book_id) == result.passage_count > 0
+    assert database.keyword_search("不可泄露证据", 5) == []
+    assert database.get_neighbors(result.book_id, 0, 10) == []
+
+
+def test_double_status_failure_reports_actual_processing_state_and_hides_passages(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / "status-stuck.txt", marker="处理中证据")
+    attempts = 0
+
+    def always_fail(*args, **kwargs) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise OSError("status database unavailable")
+
+    monkeypatch.setattr(database, "update_book_status", always_fail)
+
+    result = ImportService(paths, database, NullEmbeddingProvider()).import_book(source)
+
+    assert attempts == 2
+    assert database.get_book(result.book_id)["status"] == "processing"
+    assert result.status == "processing"
+    assert "状态写入失败" in result.message
+    assert "无法写入" in result.message
+    assert database.count_passages(result.book_id) == result.passage_count > 0
+    assert database.keyword_search("处理中证据", 5) == []
+    assert list(database.iter_embeddings([result.book_id])) == []
+
+
+def test_keyboard_interrupt_marks_failed_hides_committed_passages_and_reraises(
+    app: tuple[AppPaths, Database], tmp_path: Path
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / "interrupted.txt", marker="中断前已提交")
+    book_id = sha256_file(source)[:24]
+
+    with pytest.raises(KeyboardInterrupt, match="operator cancelled"):
+        ImportService(paths, database, _InterruptingEmbeddingProvider()).import_book(
+            source
+        )
+
+    book = database.get_book(book_id)
+    assert book["status"] == "failed"
+    assert "中断" in book["error"]
+    assert database.count_passages(book_id) > 0
+    assert database.keyword_search("中断前已提交", 5) == []
+    assert database.get_neighbors(book_id, 0, 10) == []
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [RuntimeError, KeyboardInterrupt],
+)
+def test_create_book_failure_removes_the_just_copied_original_and_reraises(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    error_type: type[BaseException],
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / "orphan.txt")
+
+    def fail_create(*args, **kwargs) -> None:
+        raise error_type("create book injected failure")
+
+    monkeypatch.setattr(database, "create_book", fail_create)
+
+    with pytest.raises(error_type, match="create book injected failure"):
+        ImportService(paths, database, NullEmbeddingProvider()).import_book(source)
+
+    assert database.list_books() == []
+    assert paths.originals.is_dir()
+    assert list(paths.originals.iterdir()) == []

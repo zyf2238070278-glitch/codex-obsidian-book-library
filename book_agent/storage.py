@@ -62,6 +62,8 @@ _HIT_COLUMNS = """
     p.anchor
 """
 
+_SEARCHABLE_STATUSES_SQL = "('ready', 'keyword_only')"
+
 
 class Database:
     def __init__(self, path: str | Path) -> None:
@@ -279,7 +281,8 @@ class Database:
                 SELECT {_HIT_COLUMNS}
                 FROM passages AS p
                 JOIN books AS b ON b.book_id = p.book_id
-                WHERE p.text LIKE ? ESCAPE '\\'
+                WHERE b.status IN {_SEARCHABLE_STATUSES_SQL}
+                  AND p.text LIKE ? ESCAPE '\\'
             """
             parameters: list[Any] = [f"%{escaped}%"]
             if book_ids is not None:
@@ -298,7 +301,8 @@ class Database:
             FROM passages_fts
             JOIN passages AS p ON p.passage_id = passages_fts.passage_id
             JOIN books AS b ON b.book_id = p.book_id
-            WHERE passages_fts MATCH ?
+            WHERE b.status IN {_SEARCHABLE_STATUSES_SQL}
+              AND passages_fts MATCH ?
         """
         parameters = [phrase]
         if book_ids is not None:
@@ -320,7 +324,8 @@ class Database:
             SELECT {_HIT_COLUMNS}
             FROM passages AS p
             JOIN books AS b ON b.book_id = p.book_id
-            WHERE p.passage_id IN ({placeholders})
+            WHERE b.status IN {_SEARCHABLE_STATUSES_SQL}
+              AND p.passage_id IN ({placeholders})
         """
         with self._connection() as connection:
             rows = connection.execute(sql, requested).fetchall()
@@ -335,7 +340,8 @@ class Database:
                 SELECT {_HIT_COLUMNS}
                 FROM passages AS p
                 JOIN books AS b ON b.book_id = p.book_id
-                WHERE p.book_id = ? AND p.ordinal BETWEEN ? AND ?
+                WHERE b.status IN {_SEARCHABLE_STATUSES_SQL}
+                  AND p.book_id = ? AND p.ordinal BETWEEN ? AND ?
                 ORDER BY p.ordinal
                 """,
                 (book_id, ordinal - safe_distance, ordinal + safe_distance),
@@ -345,7 +351,14 @@ class Database:
     def get_ordinal(self, passage_id: str) -> int | None:
         with self._connection() as connection:
             row = connection.execute(
-                "SELECT ordinal FROM passages WHERE passage_id = ?", (passage_id,)
+                f"""
+                SELECT p.ordinal
+                FROM passages AS p
+                JOIN books AS b ON b.book_id = p.book_id
+                WHERE b.status IN {_SEARCHABLE_STATUSES_SQL}
+                  AND p.passage_id = ?
+                """,
+                (passage_id,),
             ).fetchone()
         return None if row is None else int(row["ordinal"])
 
@@ -358,7 +371,8 @@ class Database:
             SELECT {_HIT_COLUMNS}, p.embedding
             FROM passages AS p
             JOIN books AS b ON b.book_id = p.book_id
-            WHERE p.embedding IS NOT NULL AND length(p.embedding) > 0
+            WHERE b.status IN {_SEARCHABLE_STATUSES_SQL}
+              AND p.embedding IS NOT NULL AND length(p.embedding) > 0
         """
         parameters: list[str] = []
         if book_ids is not None:

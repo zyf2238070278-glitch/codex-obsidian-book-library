@@ -1,4 +1,5 @@
 import sqlite3
+from pathlib import Path
 
 import pytest
 
@@ -48,6 +49,37 @@ def db(tmp_path) -> Database:
     database = Database(tmp_path / "state" / "books.sqlite3")
     database.initialize()
     return database
+
+
+def test_initialize_rejects_database_leaf_symlink_without_external_write(
+    tmp_path: Path,
+) -> None:
+    database_directory = tmp_path / "project" / "data"
+    database_directory.mkdir(parents=True)
+    external_database = tmp_path / "outside.sqlite3"
+    database_path = database_directory / "library.sqlite3"
+    database_path.symlink_to(external_database)
+
+    with pytest.raises(ValueError, match="symlink|symbolic|安全"):
+        Database(database_path).initialize()
+
+    assert database_path.is_symlink()
+    assert not external_database.exists()
+
+
+def test_initialize_rejects_symlinked_database_parent_without_external_write(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    external_directory = tmp_path / "outside-data"
+    external_directory.mkdir()
+    (project / "data").symlink_to(external_directory, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink|symbolic|安全"):
+        Database(project / "data" / "library.sqlite3").initialize()
+
+    assert list(external_directory.iterdir()) == []
 
 
 def test_keyword_search_falls_back_to_substring_for_two_chinese_characters(db: Database) -> None:

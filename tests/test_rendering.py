@@ -4,6 +4,7 @@ from pathlib import Path
 import pytest
 
 import book_agent.rendering as rendering
+from book_agent.markdown import markdown_literal
 from book_agent.models import ParsedBook, Passage
 
 
@@ -60,7 +61,8 @@ def test_render_writes_safe_frontmatter_source_and_unescaped_chinese(
     assert f"book_id: {json.dumps('book-1', ensure_ascii=False)}" in content
     assert f"title: {json.dumps(_parsed().title, ensure_ascii=False)}" in content
     assert 'source_format: "pdf"' in content
-    assert f"source_file: {json.dumps(str(source_file), ensure_ascii=False)}" in content
+    escaped_source = markdown_literal(str(source_file), single_line=True)
+    assert f"source_file: {json.dumps(escaped_source, ensure_ascii=False)}" in content
     assert "source_type: original" in content
     assert f"# {_parsed().title}" in content
     assert "中文原文。" in content
@@ -113,12 +115,62 @@ def test_render_collapses_title_line_breaks_in_the_h1_only(tmp_path: Path) -> No
     )
 
     content = destination.read_text(encoding="utf-8")
-    assert f"title: {json.dumps(parsed.title, ensure_ascii=False)}" in content
-    assert "# 标题 ## 伪章节\n" in content
+    escaped_title = markdown_literal(parsed.title)
+    assert f"title: {json.dumps(escaped_title, ensure_ascii=False)}" in content
+    assert r"# 标题 \#\# 伪章节" in content
     assert "\n## 伪章节\n" not in content
     assert [line for line in content.splitlines() if line.startswith("# ")] == [
-        "# 标题 ## 伪章节"
+        r"# 标题 \#\# 伪章节"
     ]
+
+
+def test_render_neutralizes_untrusted_markdown_and_bidi_but_keeps_text_readable(
+    tmp_path: Path,
+) -> None:
+    dangerous = (
+        "可读内容 ![远程图](https://evil.example/image.png) "
+        "[远程链接](https://evil.example) ![[恶意嵌入]] [[恶意页面]] "
+        "<img src='https://evil.example/tracker'> \u202e结束"
+    )
+    parsed = ParsedBook(
+        title=dangerous,
+        author=dangerous,
+        source_format="md",
+        units=(),
+    )
+    destination = tmp_path / "book.md"
+
+    rendering.render_parsed_book(
+        destination,
+        "book-1",
+        parsed,
+        "source.md",
+        [_passage(0, dangerous, section=dangerous)],
+    )
+
+    content = destination.read_text(encoding="utf-8")
+    assert "可读内容" in content
+    assert "结束" in content
+    assert "author:" in content
+    assert "\\!\\[远程图\\]\\(" in content
+    assert "\\[远程链接\\]\\(" in content
+    assert "\\!\\[\\[恶意嵌入\\]\\]" in content
+    assert "\\[\\[恶意页面\\]\\]" in content
+    assert "\\<img" in content
+    assert "https\\:\\/\\/evil\\.example" in content
+    assert r"⟦U\+202E⟧" in content
+    assert "\u202e" not in content
+    assert "![远程图](" not in content
+    assert "[[恶意页面]]" not in content
+
+    frontmatter_lines = content.split("---\n", 2)[1].splitlines()
+    encoded_values = {
+        key: value.strip()
+        for key, _, value in (line.partition(":") for line in frontmatter_lines)
+        if key in {"book_id", "title", "author", "source_format", "source_file"}
+    }
+    for encoded in encoded_values.values():
+        assert isinstance(json.loads(encoded), str)
 
 
 def test_render_atomically_replaces_an_existing_destination(tmp_path: Path) -> None:
@@ -145,7 +197,11 @@ def test_replace_failure_preserves_old_file_and_cleans_unique_temp(
     destination = tmp_path / "book.md"
     destination.write_text("不可破坏的旧文件", encoding="utf-8")
 
-    def fail_replace(source: str | Path, target: str | Path) -> None:
+    def fail_replace(
+        source: str | Path,
+        target: str | Path,
+        **kwargs: object,
+    ) -> None:
         raise OSError("publish failed")
 
     monkeypatch.setattr(rendering.os, "replace", fail_replace)

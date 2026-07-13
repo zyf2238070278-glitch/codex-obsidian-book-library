@@ -9,8 +9,9 @@ import secrets
 from typing import Callable
 
 from book_agent.config import AppPaths
+from book_agent.markdown import markdown_literal, visible_text
 from book_agent.storage import Database
-from book_agent.vault import VaultManager
+from book_agent.vault import VaultManager, _secure_create_open_flags
 
 
 @dataclass(frozen=True)
@@ -19,23 +20,30 @@ class SavedNote:
     wiki_link: str
 
 
-_UNSAFE_FILENAME = re.compile(r'[<>:"/\\|?*\x00-\x1f\x7f]')
-_TEMP_OPEN_FLAGS = (
-    os.O_CREAT
-    | os.O_EXCL
-    | os.O_WRONLY
-    | getattr(os, "O_CLOEXEC", 0)
-    | getattr(os, "O_NOFOLLOW", 0)
-)
+_UNSAFE_FILENAME = re.compile(r'[<>:"/\\|?*\[\]#^\x00-\x1f\x7f]')
+_SAFE_CITATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _TEMP_PREFIX = ".note-"
 
 
 def _safe_title(title: str) -> str:
-    return _UNSAFE_FILENAME.sub("-", title).strip(" .-")
+    cleaned = _UNSAFE_FILENAME.sub("-", title)
+    return visible_text(cleaned, single_line=True).strip(" .-")
 
 
-def _single_line(value: object) -> str:
-    return " ".join(str(value).splitlines()).strip()
+def _verified_citation_link(hit: object) -> str:
+    book_id = str(getattr(hit, "book_id"))
+    passage_id = str(getattr(hit, "passage_id"))
+    markdown_path = str(getattr(hit, "markdown_path"))
+    anchor = str(getattr(hit, "anchor"))
+    expected_path = f"书库/20-解析文本/{book_id}/正文.md"
+    if (
+        _SAFE_CITATION_ID.fullmatch(book_id) is None
+        or _SAFE_CITATION_ID.fullmatch(passage_id) is None
+        or markdown_path != expected_path
+        or anchor != passage_id
+    ):
+        raise ValueError("Unverified internal citation target")
+    return f"[[{expected_path}#^{passage_id}]]"
 
 
 class NoteService:
@@ -91,15 +99,20 @@ class NoteService:
         hits = [by_id[passage_id] for passage_id in requested]
         citations: list[str] = []
         for hit in hits:
-            location = _single_line(hit.section or hit.passage_id)
+            internal_link = _verified_citation_link(hit)
+            location = (
+                markdown_literal(hit.section, single_line=True)
+                if hit.section
+                else hit.passage_id
+            )
             if hit.page_start is not None:
                 page = str(hit.page_start)
                 if hit.page_end is not None and hit.page_end != hit.page_start:
                     page += f"–{hit.page_end}"
                 location += f"，PDF 页 {page}"
             citations.append(
-                f"- 《{_single_line(hit.title)}》：{location} "
-                f"[[{_single_line(hit.markdown_path)}#^{_single_line(hit.anchor)}]]"
+                f"- 《{markdown_literal(hit.title, single_line=True)}》：{location} "
+                f"{internal_link}"
             )
         rendered_citations = "\n".join(citations)
         content = (
@@ -108,7 +121,7 @@ class NoteService:
             "index_for_evidence: false\n"
             "created_by: codex-book-agent\n"
             "---\n\n"
-            f"# {_single_line(normalized_title)}\n\n"
+            f"# {markdown_literal(normalized_title, single_line=True)}\n\n"
             f"{normalized_markdown}\n\n"
             "## 原文依据\n\n"
             f"{rendered_citations}\n"
@@ -235,7 +248,7 @@ class NoteService:
             try:
                 return name, os.open(
                     name,
-                    _TEMP_OPEN_FLAGS,
+                    _secure_create_open_flags(),
                     0o600,
                     dir_fd=directory_fd,
                 )

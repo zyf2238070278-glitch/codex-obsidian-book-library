@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import json
 import os
-import tempfile
+import secrets
+import stat
 from collections.abc import Iterable
 from pathlib import Path
 
+from book_agent.markdown import markdown_literal
 from book_agent.models import ParsedBook, Passage
+from book_agent.vault import _managed_directory_beneath, _secure_create_open_flags
 
 
 def _json_string(value: str) -> str:
@@ -16,7 +19,7 @@ def _json_string(value: str) -> str:
 def _location_heading(passage: Passage) -> str:
     parts: list[str] = []
     if passage.section:
-        parts.append(passage.section)
+        parts.append(markdown_literal(passage.section, single_line=True))
 
     first_page = passage.page_start
     last_page = passage.page_end
@@ -39,13 +42,22 @@ def _render(
     source_file: str | Path,
     passages: Iterable[Passage],
 ) -> str:
-    display_title = " ".join(parsed.title.splitlines()).strip()
+    display_title = markdown_literal(parsed.title, single_line=True)
+    rendered_title = markdown_literal(parsed.title)
+    rendered_author = (
+        None if parsed.author is None else markdown_literal(parsed.author)
+    )
     lines = [
         "---",
         f"book_id: {_json_string(book_id)}",
-        f"title: {_json_string(parsed.title)}",
+        f"title: {_json_string(rendered_title)}",
+        (
+            "author: null"
+            if rendered_author is None
+            else f"author: {_json_string(rendered_author)}"
+        ),
         f"source_format: {_json_string(parsed.source_format)}",
-        f"source_file: {_json_string(str(source_file))}",
+        f"source_file: {_json_string(markdown_literal(source_file, single_line=True))}",
         "source_type: original",
         "---",
         "",
@@ -57,7 +69,7 @@ def _render(
             [
                 f"## {_location_heading(passage)}",
                 "",
-                passage.text,
+                markdown_literal(passage.text),
                 "",
                 f"^{passage.anchor}",
                 "",
@@ -66,13 +78,23 @@ def _render(
     return "\n".join(lines)
 
 
-def _remove_temp(path: Path | None) -> None:
-    if path is None:
+def _remove_temp(directory_fd: int, name: str | None) -> None:
+    if name is None:
         return
     try:
-        path.unlink(missing_ok=True)
-    except OSError:
+        os.unlink(name, dir_fd=directory_fd)
+    except FileNotFoundError:
         pass
+
+
+def _write_complete(file_descriptor: int, payload: bytes) -> None:
+    offset = 0
+    while offset < len(payload):
+        written = os.write(file_descriptor, payload[offset:])
+        if written <= 0:
+            raise OSError("Incomplete parsed Markdown write")
+        offset += written
+    os.fsync(file_descriptor)
 
 
 def render_parsed_book(
@@ -81,28 +103,55 @@ def render_parsed_book(
     parsed: ParsedBook,
     source_file: str | Path,
     passages: Iterable[Passage],
+    *,
+    project_root: str | Path | None = None,
 ) -> Path:
-    destination = Path(destination)
-    destination.parent.mkdir(parents=True, exist_ok=True)
+    destination = Path(os.path.abspath(os.fspath(Path(destination).expanduser())))
+    root = Path(destination.anchor) if project_root is None else Path(project_root)
     content = _render(book_id, parsed, source_file, passages)
 
-    temp_path: Path | None = None
-    try:
-        with tempfile.NamedTemporaryFile(
-            mode="w",
-            encoding="utf-8",
-            newline="\n",
-            dir=destination.parent,
-            prefix=f".{destination.name}.",
-            suffix=".tmp",
-            delete=False,
-        ) as temporary:
-            temp_path = Path(temporary.name)
-            temporary.write(content)
-            temporary.flush()
-            os.fsync(temporary.fileno())
-        os.replace(temp_path, destination)
-    except BaseException:
-        _remove_temp(temp_path)
-        raise
+    with _managed_directory_beneath(
+        root,
+        destination.parent,
+        "parsed book",
+        create=True,
+    ) as (_, directory_fd):
+        try:
+            destination_info = os.stat(
+                destination.name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            pass
+        else:
+            if stat.S_ISLNK(destination_info.st_mode):
+                raise ValueError("Parsed Markdown destination must not be a symlink")
+
+        temp_name = f".render-{secrets.token_hex(12)}"
+        temp_fd = os.open(
+            temp_name,
+            _secure_create_open_flags(),
+            0o600,
+            dir_fd=directory_fd,
+        )
+        try:
+            try:
+                _write_complete(temp_fd, content.encode("utf-8"))
+            finally:
+                os.close(temp_fd)
+            try:
+                os.replace(
+                    temp_name,
+                    destination.name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                )
+            except (TypeError, NotImplementedError) as exc:
+                raise RuntimeError(
+                    "This platform cannot atomically publish parsed Markdown by directory FD"
+                ) from exc
+            temp_name = None
+        finally:
+            _remove_temp(directory_fd, temp_name)
     return destination

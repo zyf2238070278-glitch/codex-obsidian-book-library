@@ -287,7 +287,14 @@ class ImportService:
             passages = chunk_book(book_id, parsed, markdown_path)
             if not passages:
                 raise ValueError("解析完成，但没有生成可检索段落。")
-            render_parsed_book(destination, book_id, parsed, original, passages)
+            render_parsed_book(
+                destination,
+                book_id,
+                parsed,
+                original,
+                passages,
+                project_root=self.paths.root,
+            )
             parsed_path = str(destination.absolute())
             self.database.replace_passages(book_id, passages)
             passage_count = len(passages)

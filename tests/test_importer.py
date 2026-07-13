@@ -117,6 +117,32 @@ def _write_textless_pdf(path: Path) -> Path:
     return path
 
 
+def test_import_rejects_symlinked_parsed_book_directory_without_external_write(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / "symlinked-render.txt")
+    book_id = sha256_file(source)[:24]
+    external_directory = tmp_path / "outside-render"
+    external_directory.mkdir()
+    paths.parsed.mkdir(parents=True)
+    (paths.parsed / book_id).symlink_to(
+        external_directory,
+        target_is_directory=True,
+    )
+
+    result = ImportService(
+        paths,
+        database,
+        NullEmbeddingProvider(),
+    ).import_book(source)
+
+    assert result.status == "failed"
+    assert "symlink" in result.message.lower() or "符号链接" in result.message
+    assert not (external_directory / "正文.md").exists()
+
+
 def test_vector_codec_forces_contiguous_float32_and_returns_an_owned_copy() -> None:
     source = np.arange(20, dtype=np.float64).reshape(4, 5)[:, ::2]
     assert not source.flags.c_contiguous

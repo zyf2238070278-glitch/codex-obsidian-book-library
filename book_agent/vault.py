@@ -11,24 +11,180 @@ from pathlib import Path
 from book_agent.config import AppPaths
 
 
-_DIRECTORY_OPEN_FLAGS = (
-    os.O_RDONLY
-    | getattr(os, "O_CLOEXEC", 0)
-    | getattr(os, "O_DIRECTORY", 0)
-    | getattr(os, "O_NOFOLLOW", 0)
-)
-_SOURCE_OPEN_FLAGS = (
-    os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-)
-_TEMP_OPEN_FLAGS = (
-    os.O_CREAT
-    | os.O_EXCL
-    | os.O_WRONLY
-    | getattr(os, "O_CLOEXEC", 0)
-    | getattr(os, "O_NOFOLLOW", 0)
-)
 _TEMP_PREFIX = ".import-"
 _TEMP_RANDOM_BYTES = 12
+
+
+def _required_open_flag(name: str) -> int:
+    flag = getattr(os, name, None)
+    if not isinstance(flag, int) or flag == 0:
+        raise RuntimeError(
+            f"This platform lacks the secure filesystem flag required for {name}"
+        )
+    return flag
+
+
+def _secure_directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_DIRECTORY")
+        | _required_open_flag("O_NOFOLLOW")
+    )
+
+
+def _secure_source_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_NOFOLLOW")
+    )
+
+
+def _secure_create_open_flags() -> int:
+    return (
+        os.O_CREAT
+        | os.O_EXCL
+        | os.O_WRONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_NOFOLLOW")
+    )
+
+
+def _absolute_path(path: Path, label: str) -> Path:
+    try:
+        return Path(os.path.abspath(os.fspath(path.expanduser())))
+    except (OSError, RuntimeError, TypeError) as exc:
+        raise ValueError(f"Managed path '{label}' is invalid: {path}") from exc
+
+
+def _confined_path(configured: Path, label: str, root: Path) -> Path:
+    try:
+        expanded = configured.expanduser()
+        if not expanded.is_absolute():
+            expanded = root / expanded
+        directory = Path(os.path.abspath(os.fspath(expanded)))
+        directory.relative_to(root)
+    except (OSError, RuntimeError, TypeError, ValueError) as exc:
+        raise ValueError(
+            f"Managed directory '{label}' is not beneath project root: {configured}"
+        ) from exc
+    return directory
+
+
+def _open_directory_component(
+    current_fd: int,
+    current_path: Path,
+    component: str,
+    label: str,
+    *,
+    create: bool,
+) -> int:
+    if create:
+        try:
+            os.mkdir(component, mode=0o700, dir_fd=current_fd)
+        except FileExistsError:
+            pass
+        except OSError as exc:
+            raise ValueError(
+                f"Managed directory '{label}' cannot be created safely: "
+                f"{current_path / component}"
+            ) from exc
+
+    try:
+        entry_info = os.stat(
+            component,
+            dir_fd=current_fd,
+            follow_symlinks=False,
+        )
+    except OSError as exc:
+        raise ValueError(
+            f"Managed directory '{label}' is unavailable: {current_path / component}"
+        ) from exc
+    if stat.S_ISLNK(entry_info.st_mode):
+        raise ValueError(
+            f"Managed directory '{label}' contains a symlink: "
+            f"{current_path / component}"
+        )
+    if not stat.S_ISDIR(entry_info.st_mode):
+        raise ValueError(
+            f"Managed directory '{label}' contains a non-directory: "
+            f"{current_path / component}"
+        )
+
+    try:
+        return os.open(
+            component,
+            _secure_directory_open_flags(),
+            dir_fd=current_fd,
+        )
+    except OSError as exc:
+        raise ValueError(
+            f"Managed directory '{label}' cannot be opened safely without "
+            f"following symlinks: {current_path / component}"
+        ) from exc
+
+
+def _open_absolute_directory(directory: Path, label: str, *, create: bool) -> int:
+    anchor = Path(directory.anchor)
+    if not anchor.is_absolute():
+        raise ValueError(f"Managed directory '{label}' must be absolute: {directory}")
+    try:
+        current_fd = os.open(anchor, _secure_directory_open_flags())
+    except OSError as exc:
+        raise ValueError(
+            f"Filesystem root cannot be opened safely for '{label}': {anchor}"
+        ) from exc
+
+    current_path = anchor
+    try:
+        for component in directory.relative_to(anchor).parts:
+            next_fd = _open_directory_component(
+                current_fd,
+                current_path,
+                component,
+                label,
+                create=create,
+            )
+            previous_fd = current_fd
+            current_fd = next_fd
+            os.close(previous_fd)
+            current_path /= component
+        return current_fd
+    except BaseException:
+        os.close(current_fd)
+        raise
+
+
+@contextmanager
+def _managed_directory_beneath(
+    root_path: Path,
+    configured: Path,
+    label: str,
+    *,
+    create: bool,
+) -> Iterator[tuple[Path, int]]:
+    root = _absolute_path(root_path, "project root")
+    directory = _confined_path(configured, label, root)
+    root_fd = _open_absolute_directory(root, "project root", create=create)
+    current_fd = root_fd
+    current_path = root
+    try:
+        for component in directory.relative_to(root).parts:
+            next_fd = _open_directory_component(
+                current_fd,
+                current_path,
+                component,
+                label,
+                create=create,
+            )
+            previous_fd = current_fd
+            current_fd = next_fd
+            os.close(previous_fd)
+            current_path /= component
+        yield directory, current_fd
+    finally:
+        os.close(current_fd)
 
 
 class VaultManager:
@@ -92,7 +248,7 @@ class VaultManager:
             raise ValueError(f"Source file is unavailable: {source}") from exc
 
         try:
-            source_fd = os.open(source_path, _SOURCE_OPEN_FLAGS)
+            source_fd = os.open(source_path, _secure_source_open_flags())
         except OSError as exc:
             raise ValueError(f"Source file cannot be opened safely: {source}") from exc
 
@@ -115,106 +271,13 @@ class VaultManager:
         *,
         create: bool,
     ) -> Iterator[tuple[Path, int]]:
-        root = self._project_root(create=create)
-        directory = self._confined_path(configured, label, root)
-        try:
-            current_fd = os.open(root, _DIRECTORY_OPEN_FLAGS)
-        except OSError as exc:
-            raise ValueError(f"Project root cannot be opened safely: {root}") from exc
-
-        current_path = root
-        try:
-            for component in directory.relative_to(root).parts:
-                if create:
-                    try:
-                        os.mkdir(component, dir_fd=current_fd)
-                    except FileExistsError:
-                        pass
-                    except OSError as exc:
-                        raise ValueError(
-                            f"Managed directory '{label}' cannot be created safely: "
-                            f"{current_path / component}"
-                        ) from exc
-
-                try:
-                    entry_info = os.stat(
-                        component,
-                        dir_fd=current_fd,
-                        follow_symlinks=False,
-                    )
-                except OSError as exc:
-                    raise ValueError(
-                        f"Managed directory '{label}' is unavailable: "
-                        f"{current_path / component}"
-                    ) from exc
-                if stat.S_ISLNK(entry_info.st_mode):
-                    raise ValueError(
-                        f"Managed directory '{label}' contains a symlink: "
-                        f"{current_path / component}"
-                    )
-                if not stat.S_ISDIR(entry_info.st_mode):
-                    raise ValueError(
-                        f"Managed directory '{label}' contains a non-directory: "
-                        f"{current_path / component}"
-                    )
-
-                try:
-                    next_fd = os.open(
-                        component,
-                        _DIRECTORY_OPEN_FLAGS,
-                        dir_fd=current_fd,
-                    )
-                except OSError as exc:
-                    raise ValueError(
-                        f"Managed directory '{label}' cannot be opened safely: "
-                        f"{current_path / component}"
-                    ) from exc
-                previous_fd = current_fd
-                current_fd = next_fd
-                os.close(previous_fd)
-                current_path /= component
-
-            yield directory, current_fd
-        finally:
-            os.close(current_fd)
-
-    def _project_root(self, *, create: bool) -> Path:
-        try:
-            root = Path(os.path.abspath(os.fspath(self.paths.root.expanduser())))
-            unresolved_root = root.resolve(strict=False)
-        except (OSError, RuntimeError, TypeError) as exc:
-            raise ValueError(f"Project root path is invalid: {self.paths.root}") from exc
-        if unresolved_root != root:
-            raise ValueError(f"Project root contains a symlink: {root}")
-
-        if create:
-            try:
-                root.mkdir(parents=True, exist_ok=True)
-            except OSError as exc:
-                raise ValueError(f"Project root cannot be created: {root}") from exc
-        try:
-            root_info = root.lstat()
-        except OSError as exc:
-            raise ValueError(f"Project root is unavailable: {root}") from exc
-        if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
-            raise ValueError(f"Project root must be a real directory: {root}")
-
-        return root
-
-    @staticmethod
-    def _confined_path(configured: Path, label: str, root: Path) -> Path:
-        try:
-            expanded = configured.expanduser()
-            if not expanded.is_absolute():
-                expanded = root / expanded
-            directory = Path(os.path.abspath(os.fspath(expanded)))
-            directory.relative_to(root)
-        except (OSError, RuntimeError, TypeError, ValueError) as exc:
-            raise ValueError(
-                f"Managed directory '{label}' is not beneath project root: "
-                f"{configured}"
-            ) from exc
-        return directory
+        with _managed_directory_beneath(
+            self.paths.root,
+            configured,
+            label,
+            create=create,
+        ) as managed:
+            yield managed
 
     @staticmethod
     def _reserve_temp(directory_fd: int) -> tuple[str, int, os.stat_result]:
@@ -223,7 +286,7 @@ class VaultManager:
             try:
                 temp_fd = os.open(
                     temp_name,
-                    _TEMP_OPEN_FLAGS,
+                    _secure_create_open_flags(),
                     0o600,
                     dir_fd=directory_fd,
                 )

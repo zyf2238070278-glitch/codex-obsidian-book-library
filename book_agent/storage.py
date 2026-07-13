@@ -1,12 +1,15 @@
 from __future__ import annotations
 
 import sqlite3
+import os
+import stat
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
 from book_agent.models import Passage, SearchHit
+from book_agent.vault import _managed_directory_beneath
 
 
 _SCHEMA = """
@@ -66,14 +69,58 @@ _SEARCHABLE_STATUSES_SQL = "('ready', 'keyword_only')"
 
 
 class Database:
-    def __init__(self, path: str | Path) -> None:
-        self.path = Path(path)
+    def __init__(self, path: str | Path, *, root: str | Path | None = None) -> None:
+        try:
+            self.path = Path(os.path.abspath(os.fspath(Path(path).expanduser())))
+            self.root = (
+                Path(self.path.anchor)
+                if root is None
+                else Path(os.path.abspath(os.fspath(Path(root).expanduser())))
+            )
+            self.path.relative_to(self.root)
+        except (OSError, RuntimeError, TypeError, ValueError) as exc:
+            raise ValueError("Database path must be beneath its configured root") from exc
 
     def connect(self) -> sqlite3.Connection:
-        connection = sqlite3.connect(self.path)
+        with self._safe_parent(create=False) as directory_fd:
+            self._reject_unsafe_leaf(directory_fd, allow_missing=True)
+            connection = sqlite3.connect(self.path)
+            try:
+                self._reject_unsafe_leaf(directory_fd, allow_missing=False)
+            except BaseException:
+                connection.close()
+                raise
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys=ON")
         return connection
+
+    @contextmanager
+    def _safe_parent(self, *, create: bool) -> Iterator[int]:
+        with _managed_directory_beneath(
+            self.root,
+            self.path.parent,
+            "database parent",
+            create=create,
+        ) as (_, directory_fd):
+            yield directory_fd
+
+    def _reject_unsafe_leaf(self, directory_fd: int, *, allow_missing: bool) -> None:
+        try:
+            leaf_info = os.stat(
+                self.path.name,
+                dir_fd=directory_fd,
+                follow_symlinks=False,
+            )
+        except FileNotFoundError:
+            if allow_missing:
+                return
+            raise ValueError("Database file was not created safely") from None
+        except OSError as exc:
+            raise ValueError("Database file cannot be inspected safely") from exc
+        if stat.S_ISLNK(leaf_info.st_mode):
+            raise ValueError("Database file must not be a symlink")
+        if not stat.S_ISREG(leaf_info.st_mode):
+            raise ValueError("Database path must be a regular file")
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -85,7 +132,8 @@ class Database:
             connection.close()
 
     def initialize(self) -> None:
-        self.path.parent.mkdir(parents=True, exist_ok=True)
+        with self._safe_parent(create=True) as directory_fd:
+            self._reject_unsafe_leaf(directory_fd, allow_missing=True)
         try:
             with self._connection() as connection:
                 connection.executescript(_SCHEMA)

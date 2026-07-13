@@ -395,8 +395,6 @@ def test_title_and_citation_metadata_newlines_cannot_inject_blocks(
             _passage(
                 "passage-1",
                 section="真实章节\n- 伪列表",
-                markdown_path="书库/20-解析文本/真实路径\n# 伪路径.md",
-                anchor="真实锚点\n- 伪锚点",
             )
         ],
     )
@@ -409,17 +407,86 @@ def test_title_and_citation_metadata_newlines_cannot_inject_blocks(
 
     destination = Path(saved.path)
     lines = destination.read_text(encoding="utf-8").splitlines()
-    assert destination.name == "主标题-## 伪造标题.md"
+    assert destination.name == "主标题--- 伪造标题.md"
     assert [line for line in lines if line.startswith("# ")] == [
-        "# 主标题 ## 伪造标题"
+        r"# 主标题 \#\# 伪造标题"
     ]
     assert [line for line in lines if line.startswith("- ")] == [
-        "- 《真实书名 # 伪标题》：真实章节 - 伪列表，PDF 页 12–14 "
-        "[[书库/20-解析文本/真实路径 # 伪路径.md#^真实锚点 - 伪锚点]]"
+        r"- 《真实书名 \# 伪标题》：真实章节 \- 伪列表，PDF 页 12–14 "
+        "[[书库/20-解析文本/book-1/正文.md#^passage-1]]"
     ]
     assert "## 伪造标题" not in lines
     assert "# 伪标题" not in lines
     assert "- 伪列表" not in lines
+
+
+def test_note_title_and_citation_metadata_are_literal_while_internal_link_works(
+    tmp_path: Path,
+) -> None:
+    paths = AppPaths.from_root(tmp_path / "project")
+    database = _database(paths)
+    dangerous = (
+        "可读 ![远程图](https://evil.example/image.png) "
+        "[链接](https://evil.example) ![[嵌入]] [[页面]] "
+        "<iframe src='https://evil.example'> \u202e结束"
+    )
+    _add_book(database, "book-1", title=dangerous)
+    database.replace_passages(
+        "book-1",
+        [_passage("passage-1", text=dangerous, section=dangerous)],
+    )
+    intentional_body = "正文可保留 [用户要求的链接](https://allowed.example)。"
+
+    saved = NoteService(paths, database, clock=lambda: FIXED_NOW).save(
+        dangerous,
+        intentional_body,
+        ["passage-1"],
+    )
+
+    content = Path(saved.path).read_text(encoding="utf-8")
+    assert intentional_body in content
+    assert "可读" in content
+    assert "结束" in content
+    assert "\\!\\[远程图\\]\\(" in content
+    assert "\\[链接\\]\\(" in content
+    assert "\\!\\[\\[嵌入\\]\\]" in content
+    assert "\\[\\[页面\\]\\]" in content
+    assert "\\<iframe" in content
+    assert "https\\:\\/\\/evil\\.example" in content
+    assert r"⟦U\+202E⟧" in content
+    assert "\u202e" not in content
+    assert content.count("[[书库/20-解析文本/book-1/正文.md#^passage-1]]") == 1
+    assert "![远程图](" not in content
+    assert "[[页面]]" not in content
+    assert "\u202e" not in Path(saved.path).name
+    assert database.get_passages(["passage-1"])[0].text == dangerous
+
+
+def test_note_rejects_unverified_internal_citation_target(
+    tmp_path: Path,
+) -> None:
+    paths = AppPaths.from_root(tmp_path / "project")
+    database = _database(paths)
+    _add_book(database, "book-1", title="书名")
+    database.replace_passages(
+        "book-1",
+        [
+            _passage(
+                "passage-1",
+                markdown_path="https://evil.example/steal.md",
+                anchor="坏锚点]] ![[远程嵌入",
+            )
+        ],
+    )
+
+    with pytest.raises(ValueError, match="citation|引用|link|链接|target|目标"):
+        NoteService(paths, database, clock=lambda: FIXED_NOW).save(
+            "不能保存",
+            "正文",
+            ["passage-1"],
+        )
+
+    assert not paths.notes.exists()
 
 
 @pytest.mark.parametrize("symlink_level", ["vault", "notes"])

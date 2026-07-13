@@ -293,7 +293,7 @@ def build_tools(
 
     paths = AppPaths.from_root(Path(project_root).expanduser())
     VaultManager(paths).ensure_layout()
-    database = Database(paths.database)
+    database = Database(paths.database, root=paths.root)
     database.initialize()
 
     provider = embedding_provider

@@ -205,6 +205,7 @@ def render_parsed_book(
                         "Parsed Markdown destination must be a regular file"
                     )
                 backup_name = f".render-backup-{secrets.token_hex(12)}"
+                backup_info = destination_info
                 os.link(
                     destination.name,
                     backup_name,
@@ -212,14 +213,14 @@ def render_parsed_book(
                     dst_dir_fd=directory_fd,
                     follow_symlinks=False,
                 )
-                backup_info = os.stat(
+                linked_backup_info = os.stat(
                     backup_name,
                     dir_fd=directory_fd,
                     follow_symlinks=False,
                 )
                 if (
-                    backup_info.st_dev,
-                    backup_info.st_ino,
+                    linked_backup_info.st_dev,
+                    linked_backup_info.st_ino,
                 ) != (destination_info.st_dev, destination_info.st_ino):
                     raise ValueError(
                         "Parsed Markdown backup identity differs from destination"
@@ -239,6 +240,7 @@ def render_parsed_book(
                 finally:
                     os.close(temp_fd)
                 try:
+                    published_info = temp_info
                     os.replace(
                         temp_name,
                         destination.name,
@@ -251,15 +253,14 @@ def render_parsed_book(
                         "by directory FD"
                     ) from exc
                 temp_name = None
-                published_info = temp_info
-                published_info = os.stat(
+                linked_published_info = os.stat(
                     destination.name,
                     dir_fd=directory_fd,
                     follow_symlinks=False,
                 )
                 if (
-                    published_info.st_dev,
-                    published_info.st_ino,
+                    linked_published_info.st_dev,
+                    linked_published_info.st_ino,
                 ) != (temp_info.st_dev, temp_info.st_ino):
                     raise ValueError(
                         "Published Markdown identity differs from render temp"

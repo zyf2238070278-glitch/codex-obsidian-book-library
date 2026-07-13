@@ -370,6 +370,40 @@ def test_render_root_swap_restores_a_preexisting_destination(
     assert not list((displaced_root / "nested").glob(".render-backup-*"))
 
 
+@pytest.mark.parametrize("preexisting", [False, True])
+def test_replace_post_syscall_interruption_rolls_back_publication(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    preexisting: bool,
+) -> None:
+    destination = tmp_path / "book.md"
+    if preexisting:
+        destination.write_text("中断后必须恢复的旧内容", encoding="utf-8")
+    real_replace = rendering.os.replace
+
+    def replace_then_interrupt(*args: object, **kwargs: object) -> None:
+        real_replace(*args, **kwargs)
+        raise KeyboardInterrupt("interrupted after replacement")
+
+    monkeypatch.setattr(rendering.os, "replace", replace_then_interrupt)
+
+    with pytest.raises(KeyboardInterrupt, match="after replacement"):
+        rendering.render_parsed_book(
+            destination,
+            "book-1",
+            _parsed(),
+            "source.pdf",
+            [_passage(0, "不得残留的新内容。")],
+        )
+
+    if preexisting:
+        assert destination.read_text(encoding="utf-8") == "中断后必须恢复的旧内容"
+    else:
+        assert not destination.exists()
+    assert not list(tmp_path.glob(".render-backup-*"))
+    assert not list(tmp_path.glob(".render-*"))
+
+
 def test_replace_failure_preserves_old_file_and_cleans_unique_temp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

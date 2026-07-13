@@ -91,16 +91,25 @@ class ImportService:
 
         self.vault.ensure_layout()
         original = self.vault.import_original(source_path)
-        original_path = str(original.absolute())
-        copied_hash = sha256_file(original)
-        if copied_hash != content_hash:
-            content_hash = copied_hash
-            book_id = content_hash[:24]
-            duplicate = self.database.find_book_by_hash(content_hash)
-            if duplicate is not None:
-                self._remove_imported_original(original)
-                return self._duplicate_result(duplicate)
-        initial_title = source_path.stem if title is None else title
+        try:
+            original_path = str(original.absolute())
+            copied_hash = sha256_file(original)
+            if copied_hash != content_hash:
+                content_hash = copied_hash
+                book_id = content_hash[:24]
+                duplicate = self.database.find_book_by_hash(content_hash)
+                if duplicate is not None:
+                    duplicate_result = self._duplicate_result(duplicate)
+                    self._remove_imported_original(original)
+                    return duplicate_result
+            initial_title = source_path.stem if title is None else title
+        except BaseException as ownership_error:
+            self._cleanup_unregistered_original(
+                original,
+                ownership_error,
+                "注册书籍前失败后无法清理刚复制的原书",
+            )
+            raise
         try:
             self.database.create_book(
                 book_id=book_id,
@@ -112,13 +121,11 @@ class ImportService:
                 status="processing",
             )
         except BaseException as create_error:
-            try:
-                self._remove_imported_original(original)
-            except BaseException as cleanup_error:
-                create_error.add_note(
-                    "创建书籍记录失败后无法清理刚复制的原书："
-                    + _error_detail(cleanup_error)
-                )
+            self._cleanup_unregistered_original(
+                original,
+                create_error,
+                "创建书籍记录失败后无法清理刚复制的原书",
+            )
             raise
 
         parsed_path: str | None = None
@@ -231,6 +238,17 @@ class ImportService:
         ):
             raise RuntimeError(f"拒绝删除非普通原书文件：{original}")
         original.unlink()
+
+    def _cleanup_unregistered_original(
+        self,
+        original: Path,
+        failure: BaseException,
+        context: str,
+    ) -> None:
+        try:
+            self._remove_imported_original(original)
+        except BaseException as cleanup_error:
+            failure.add_note(f"{context}：{_error_detail(cleanup_error)}")
 
     def _build_semantic_index(
         self, passages: list[Any]

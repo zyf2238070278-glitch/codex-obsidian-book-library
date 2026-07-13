@@ -268,6 +268,73 @@ def test_hash_drift_to_an_existing_book_removes_the_new_copy_as_duplicate(
     assert len(database.list_books()) == 1
 
 
+def test_post_copy_hash_failure_reraises_and_removes_the_unregistered_original(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / "rehash-failure.txt")
+    real_sha256_file = importer_module.sha256_file
+    injected_error = OSError("post-copy rehash unavailable")
+    calls = 0
+
+    def fail_second_hash(path: str | Path) -> str:
+        nonlocal calls
+        calls += 1
+        if calls == 2:
+            raise injected_error
+        return real_sha256_file(path)
+
+    monkeypatch.setattr(importer_module, "sha256_file", fail_second_hash)
+
+    with pytest.raises(OSError) as caught:
+        ImportService(paths, database, NullEmbeddingProvider()).import_book(source)
+
+    assert caught.value is injected_error
+    assert calls == 2
+    assert database.list_books() == []
+    assert paths.originals.is_dir()
+    assert list(paths.originals.iterdir()) == []
+
+
+def test_second_duplicate_lookup_failure_cleans_drifted_unregistered_original(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / "lookup-failure.txt", marker="预检内容")
+    service = ImportService(paths, database, NullEmbeddingProvider())
+    real_import_original = service.vault.import_original
+    real_find = database.find_book_by_hash
+    injected_error = OSError("second duplicate lookup unavailable")
+    find_calls = 0
+
+    def replace_then_copy(source_path: Path) -> Path:
+        _write_txt(source, marker="漂移后内容")
+        return real_import_original(source_path)
+
+    def fail_second_find(content_hash: str):
+        nonlocal find_calls
+        find_calls += 1
+        if find_calls == 2:
+            raise injected_error
+        return real_find(content_hash)
+
+    monkeypatch.setattr(service.vault, "import_original", replace_then_copy)
+    monkeypatch.setattr(database, "find_book_by_hash", fail_second_find)
+
+    with pytest.raises(OSError) as caught:
+        service.import_book(source)
+
+    assert caught.value is injected_error
+    assert find_calls == 2
+    assert database.list_books() == []
+    assert paths.originals.is_dir()
+    assert list(paths.originals.iterdir()) == []
+
+
 def test_available_provider_marks_ready_and_persists_every_embedding(
     app: tuple[AppPaths, Database], tmp_path: Path
 ) -> None:

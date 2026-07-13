@@ -316,6 +316,10 @@ class VaultManager:
     def _import_original_verified(self, source: Path) -> ImportedOriginal:
         source_path, source_fd, source_info = self._open_source(source)
         cleanup_fd: int | None = None
+        inbox_cleanup_fd: int | None = None
+        temp_name: str | None = None
+        temp_fd: int | None = None
+        temp_info: os.stat_result | None = None
         published_name: str | None = None
         published_info: os.stat_result | None = None
         imported: ImportedOriginal | None = None
@@ -332,100 +336,87 @@ class VaultManager:
                         create=False,
                     ) as (originals, originals_fd):
                         cleanup_fd = os.dup(originals_fd)
+                        inbox_cleanup_fd = os.dup(inbox_fd)
                         temp_name, temp_fd, temp_info = self._reserve_temp(inbox_fd)
                         try:
+                            self._copy_complete(
+                                source_fd,
+                                source_info,
+                                temp_fd,
+                                source,
+                            )
+                            hash_fd = os.open(
+                                temp_name,
+                                _secure_source_open_flags(),
+                                dir_fd=inbox_fd,
+                            )
                             try:
-                                self._copy_complete(
-                                    source_fd,
-                                    source_info,
-                                    temp_fd,
-                                    source,
-                                )
-                                hash_fd = os.open(
-                                    temp_name,
-                                    _secure_source_open_flags(),
-                                    dir_fd=inbox_fd,
-                                )
-                                try:
-                                    hash_info = os.fstat(hash_fd)
-                                    if (
-                                        hash_info.st_dev,
-                                        hash_info.st_ino,
-                                    ) != (temp_info.st_dev, temp_info.st_ino):
-                                        raise ValueError(
-                                            "Import temp identity changed before hashing"
-                                        )
-                                    copied_hash = self._hash_descriptor(hash_fd)
-                                finally:
-                                    os.close(hash_fd)
-                                published_info = temp_info
-                                published_name = self._link_final(
-                                    inbox_fd,
-                                    temp_name,
-                                    originals_fd,
-                                    source_path.name,
-                                )
-                                linked_info = os.stat(
-                                    published_name,
-                                    dir_fd=originals_fd,
-                                    follow_symlinks=False,
-                                )
+                                hash_info = os.fstat(hash_fd)
                                 if (
-                                    linked_info.st_dev,
-                                    linked_info.st_ino,
+                                    hash_info.st_dev,
+                                    hash_info.st_ino,
                                 ) != (temp_info.st_dev, temp_info.st_ino):
                                     raise ValueError(
-                                        "Published original identity differs from "
-                                        "import temp"
+                                        "Import temp identity changed before hashing"
                                     )
-                                published_info = linked_info
-                                imported = ImportedOriginal(
-                                    path=originals / published_name,
-                                    content_sha256=copied_hash,
-                                    identity=(
-                                        published_info.st_dev,
-                                        published_info.st_ino,
-                                    ),
-                                )
-                            except BaseException:
-                                if (
-                                    published_name is not None
-                                    and published_info is not None
-                                ):
-                                    rollback_name = published_name
-                                    rollback_info = published_info
-                                    published_name = None
-                                    published_info = None
-                                    self._unlink_if_same(
-                                        cleanup_fd,
-                                        rollback_name,
-                                        rollback_info,
-                                    )
-                                else:
-                                    self._unlink_all_if_same(cleanup_fd, temp_info)
-                                raise
-                        finally:
-                            try:
-                                os.close(temp_fd)
+                                copied_hash = self._hash_descriptor(hash_fd)
                             finally:
-                                self._unlink_if_same(inbox_fd, temp_name, temp_info)
+                                os.close(hash_fd)
+                            published_info = temp_info
+                            published_name = self._link_final(
+                                inbox_fd,
+                                temp_name,
+                                originals_fd,
+                                source_path.name,
+                            )
+                            linked_info = os.stat(
+                                published_name,
+                                dir_fd=originals_fd,
+                                follow_symlinks=False,
+                            )
+                            if (
+                                linked_info.st_dev,
+                                linked_info.st_ino,
+                            ) != (temp_info.st_dev, temp_info.st_ino):
+                                raise ValueError(
+                                    "Published original identity differs from "
+                                    "import temp"
+                                )
+                            published_info = linked_info
+                            imported = ImportedOriginal(
+                                path=originals / published_name,
+                                content_sha256=copied_hash,
+                                identity=(
+                                    published_info.st_dev,
+                                    published_info.st_ino,
+                                ),
+                            )
+                        except BaseException:
+                            self._unlink_all_if_same(cleanup_fd, temp_info)
+                            raise
             except BaseException:
-                if (
-                    cleanup_fd is not None
-                    and published_name is not None
-                    and published_info is not None
-                ):
-                    self._unlink_if_same(
-                        cleanup_fd,
-                        published_name,
-                        published_info,
-                    )
+                if cleanup_fd is not None and temp_info is not None:
+                    self._unlink_all_if_same(cleanup_fd, temp_info)
                 raise
         finally:
             try:
+                if (
+                    inbox_cleanup_fd is not None
+                    and temp_name is not None
+                    and temp_info is not None
+                ):
+                    self._unlink_if_same(
+                        inbox_cleanup_fd,
+                        temp_name,
+                        temp_info,
+                    )
+            finally:
+                if temp_fd is not None:
+                    _close_quietly(temp_fd)
+                if inbox_cleanup_fd is not None:
+                    _close_quietly(inbox_cleanup_fd)
                 if cleanup_fd is not None:
                     _close_quietly(cleanup_fd)
-            finally:
                 _close_quietly(source_fd)
         if imported is None:
             raise AssertionError("verified original import did not publish a file")

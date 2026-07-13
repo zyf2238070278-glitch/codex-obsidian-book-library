@@ -258,7 +258,11 @@ def test_import_post_link_stat_failure_removes_unregistered_original(
         real_unlink_if_same(directory_fd, name, expected)
 
     monkeypatch.setattr(vault_module.os, "stat", fail_published_stat_once)
-    monkeypatch.setattr(manager, "_unlink_if_same", count_published_cleanup)
+    monkeypatch.setattr(
+        VaultManager,
+        "_unlink_if_same",
+        staticmethod(count_published_cleanup),
+    )
 
     with pytest.raises(OSError, match="original stat unavailable"):
         manager.import_original(source)
@@ -266,6 +270,97 @@ def test_import_post_link_stat_failure_removes_unregistered_original(
     assert list(paths.originals.iterdir()) == []
     assert list(paths.inbox.iterdir()) == []
     assert published_cleanup_calls == 1
+
+
+def test_import_post_link_stat_failure_removes_renamed_original(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = AppPaths.from_root(tmp_path / "project")
+    manager = VaultManager(paths)
+    manager.ensure_layout()
+    source = _source(tmp_path, "source", "book.txt", "renamed import")
+    real_stat = vault_module.os.stat
+    renamed = False
+
+    def rename_then_fail_published_stat(
+        path: object,
+        *args: object,
+        **kwargs: object,
+    ) -> os.stat_result:
+        nonlocal renamed
+        directory_fd = kwargs.get("dir_fd")
+        if not renamed and path == "book.txt" and isinstance(directory_fd, int):
+            renamed = True
+            os.rename(
+                "book.txt",
+                "moved.txt",
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            raise OSError("published original stat unavailable after rename")
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        vault_module.os,
+        "stat",
+        rename_then_fail_published_stat,
+    )
+
+    with pytest.raises(OSError, match="unavailable after rename"):
+        manager.import_original(source)
+
+    assert renamed is True
+    assert list(paths.originals.iterdir()) == []
+    assert list(paths.inbox.iterdir()) == []
+
+
+def test_import_exit_validation_removes_renamed_original_while_temp_is_live(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = AppPaths.from_root(tmp_path / "project")
+    manager = VaultManager(paths)
+    manager.ensure_layout()
+    source = _source(tmp_path, "source", "book.txt", "exit validation import")
+    displaced_originals = tmp_path / "displaced-originals"
+    real_stat = vault_module.os.stat
+    swapped = False
+
+    def rename_then_swap_after_published_stat(
+        path: object,
+        *args: object,
+        **kwargs: object,
+    ) -> os.stat_result:
+        nonlocal swapped
+        directory_fd = kwargs.get("dir_fd")
+        if not swapped and path == "book.txt" and isinstance(directory_fd, int):
+            published = real_stat(path, *args, **kwargs)
+            os.rename(
+                "book.txt",
+                "moved.txt",
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            paths.originals.rename(displaced_originals)
+            paths.originals.mkdir()
+            swapped = True
+            return published
+        return real_stat(path, *args, **kwargs)
+
+    monkeypatch.setattr(
+        vault_module.os,
+        "stat",
+        rename_then_swap_after_published_stat,
+    )
+
+    with pytest.raises(ValueError, match=r"originals.*identity"):
+        manager.import_original(source)
+
+    assert swapped is True
+    assert list(displaced_originals.iterdir()) == []
+    assert list(paths.originals.iterdir()) == []
+    assert list(paths.inbox.iterdir()) == []
 
 
 def test_concurrent_imports_preserve_24_same_basename_payloads(

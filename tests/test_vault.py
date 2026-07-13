@@ -223,6 +223,49 @@ def test_import_post_link_interruption_removes_unregistered_original(
     assert cleanup_saw_live_temp is True
 
 
+def test_import_post_link_interruption_removes_renamed_temp(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = AppPaths.from_root(tmp_path / "project")
+    manager = VaultManager(paths)
+    manager.ensure_layout()
+    source = _source(tmp_path, "source", "book.txt", "renamed temp import")
+    real_link_final = manager._link_final
+
+    def link_then_rename_temp_and_interrupt(
+        inbox_fd: int,
+        temp_name: str,
+        originals_fd: int,
+        source_name: str,
+    ) -> str:
+        real_link_final(
+            inbox_fd,
+            temp_name,
+            originals_fd,
+            source_name,
+        )
+        os.rename(
+            temp_name,
+            "renamed-temp",
+            src_dir_fd=inbox_fd,
+            dst_dir_fd=inbox_fd,
+        )
+        raise KeyboardInterrupt("interrupted after temp rename")
+
+    monkeypatch.setattr(
+        manager,
+        "_link_final",
+        link_then_rename_temp_and_interrupt,
+    )
+
+    with pytest.raises(KeyboardInterrupt, match="after temp rename"):
+        manager.import_original(source)
+
+    assert list(paths.originals.iterdir()) == []
+    assert list(paths.inbox.iterdir()) == []
+
+
 def test_import_post_link_stat_failure_removes_unregistered_original(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

@@ -402,12 +402,10 @@ class VaultManager:
             try:
                 if (
                     inbox_cleanup_fd is not None
-                    and temp_name is not None
                     and temp_info is not None
                 ):
-                    self._unlink_if_same(
+                    self._unlink_all_if_same(
                         inbox_cleanup_fd,
-                        temp_name,
                         temp_info,
                     )
             finally:

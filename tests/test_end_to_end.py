@@ -1,5 +1,6 @@
 import json
 from pathlib import Path
+import re
 
 from book_agent.config import MAX_EVIDENCE_TOKENS, MAX_FULL_PASSAGES, MAX_PREVIEWS
 from book_agent.tools import build_tools
@@ -9,7 +10,7 @@ from fakes import DeterministicEmbeddingProvider
 EXACT_PHRASE = "蓝杉钟声只在清晨响起"
 SEMANTIC_TEXT = "晶圆厂扩建通常需要多年，订单突然增加时，新产能无法立刻响应。"
 UNRELATED_TEXT = "品牌广告可以帮助消费者识别新产品。"
-SEMANTIC_QUERY = "为什么市场突然想买更多商品时容易出现供给短缺"
+SEMANTIC_QUERY = "为何市面芯片一度买不到"
 
 
 def _json_round_trip(payload: object) -> object:
@@ -19,6 +20,10 @@ def _json_round_trip(payload: object) -> object:
 def test_codex_tool_boundary_runs_the_complete_grounded_reading_workflow(
     tmp_path: Path,
 ) -> None:
+    query_characters = set(re.findall(r"[\u4e00-\u9fff]", SEMANTIC_QUERY))
+    source_characters = set(re.findall(r"[\u4e00-\u9fff]", SEMANTIC_TEXT))
+    assert query_characters.isdisjoint(source_characters)
+
     source = tmp_path / "合成测试书.md"
     source.write_text(
         "# 供给周期\n\n"

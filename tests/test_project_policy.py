@@ -35,6 +35,11 @@ def test_agents_policy_enforces_grounded_and_safe_book_answers() -> None:
         "30-AI读书笔记",
         "明确要求",
         "多次有界检索",
+        "短引文",
+        "保持简短",
+        "除非用户明确要求原文",
+        "优先简洁转述",
+        "减少 token 消耗",
         "报告错误",
     )
     for rule in required_rules:

@@ -509,6 +509,21 @@ def test_staging_scan_rejects_sqlite_header_with_allowlisted_extension(
 
 
 @pytest.mark.parametrize(
+    "suffix",
+    [".sqlite-wal", ".sqlite-shm", ".sqlite-journal", ".db-journal"],
+)
+def test_staging_scan_rejects_sqlite_sidecar_suffixes(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    staging = tmp_path / "staging"
+    _write(staging / "release" / f"library{suffix}", b"sidecar payload")
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="forbidden"):
+        build_macos_release.scan_staging(staging)
+
+
+@pytest.mark.parametrize(
     "member_name",
     [
         "release/../escape.txt",
@@ -560,6 +575,30 @@ def test_zip_scan_rejects_sqlite_header_with_allowlisted_extension(
     )
 
     with pytest.raises(build_macos_release.ReleaseBuildError, match="SQLite"):
+        build_macos_release.scan_zip(archive_path)
+
+
+@pytest.mark.parametrize(
+    "suffix",
+    [".sqlite-wal", ".sqlite-shm", ".sqlite-journal", ".db-journal"],
+)
+def test_zip_scan_rejects_sqlite_sidecar_suffixes(
+    tmp_path: Path,
+    suffix: str,
+) -> None:
+    archive_path = tmp_path / "sqlite-sidecar.zip"
+    _write_zip_entries(
+        archive_path,
+        [
+            (
+                f"release/library{suffix}",
+                b"sidecar payload",
+                stat.S_IFREG | 0o644,
+            )
+        ],
+    )
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="forbidden"):
         build_macos_release.scan_zip(archive_path)
 
 

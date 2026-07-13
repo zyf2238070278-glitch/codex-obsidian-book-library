@@ -88,15 +88,12 @@ FORBIDDEN_DIRECTORY_NAMES = frozenset(
         "书库",
     }
 )
-FORBIDDEN_FILE_SUFFIXES = (
-    ".db",
-    ".db-shm",
-    ".db-wal",
-    ".epub",
-    ".pdf",
-    ".sqlite",
-    ".sqlite3",
+SQLITE_FILE_SUFFIXES = tuple(
+    f"{database_suffix}{sidecar_suffix}"
+    for database_suffix in (".db", ".sqlite", ".sqlite3")
+    for sidecar_suffix in ("", "-journal", "-shm", "-wal")
 )
+FORBIDDEN_FILE_SUFFIXES = (".epub", ".pdf", *SQLITE_FILE_SUFFIXES)
 TEXT_PATH_MARKERS = (b"/Users/", b"/home/", b"C:\\Users\\")
 GENERIC_ACCOUNT_NAMES = frozenset(
     {

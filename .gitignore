@@ -1,5 +1,6 @@
 .worktrees/
 .venv/
+dist/
 
 # Python and test caches
 __pycache__/

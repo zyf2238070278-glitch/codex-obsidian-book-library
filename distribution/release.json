@@ -1,0 +1,12 @@
+{
+  "version": "0.1.0-beta.1",
+  "tag": "v0.1.0-beta.1",
+  "project": "codex-obsidian-book-library",
+  "model_id": "intfloat/multilingual-e5-small",
+  "model_revision": "614241f622f53c4eeff9890bdc4f31cfecc418b3",
+  "uv_version": "0.11.26",
+  "uv_sha256": "c9300ed8425e2c85230259a172066a32b475bc56f7ebe907783b2459159ea554",
+  "python": "3.12",
+  "archive": "codex-obsidian-book-library-v0.1.0-beta.1-macos-arm64-all-in-one.zip",
+  "top_level_directory": "codex-obsidian-book-library-v0.1.0-beta.1-macos-arm64"
+}

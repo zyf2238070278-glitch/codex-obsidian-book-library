@@ -69,6 +69,25 @@ def test_parsers_report_invalid_utf8(tmp_path: Path, parser, suffix: str) -> Non
         parser(path)
 
 
+def test_parse_txt_wraps_a_missing_file_read_error(tmp_path: Path) -> None:
+    path = tmp_path / "missing.txt"
+
+    with pytest.raises(DocumentParseError, match="missing.txt") as error:
+        parse_txt(path)
+
+    assert isinstance(error.value.__cause__, FileNotFoundError)
+
+
+def test_parse_markdown_wraps_a_directory_read_error(tmp_path: Path) -> None:
+    path = tmp_path / "folder.md"
+    path.mkdir()
+
+    with pytest.raises(DocumentParseError, match="folder.md") as error:
+        parse_markdown(path)
+
+    assert isinstance(error.value.__cause__, IsADirectoryError)
+
+
 def test_parse_markdown_rejects_a_document_with_only_headings(tmp_path: Path) -> None:
     path = tmp_path / "outline.md"
     path.write_text("# 第一章\n\n## 第二节\n", encoding="utf-8")

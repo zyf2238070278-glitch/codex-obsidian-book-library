@@ -17,6 +17,10 @@ def _read_utf8(path: Path) -> str:
         raise DocumentParseError(
             f"Cannot parse '{path.name}': expected UTF-8 text."
         ) from exc
+    except OSError as exc:
+        raise DocumentParseError(
+            f"Cannot parse '{path.name}': unable to read document."
+        ) from exc
 
     content = content.removeprefix("\ufeff")
     if not content.strip():

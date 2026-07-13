@@ -85,6 +85,18 @@ def test_parse_markdown_rejects_only_empty_atx_heading_markers(tmp_path: Path) -
         parse_markdown(path)
 
 
+def test_empty_atx_heading_clears_the_previous_named_section(tmp_path: Path) -> None:
+    path = tmp_path / "empty-section.md"
+    path.write_text("# Previous\nbody\n#\nmore", encoding="utf-8")
+
+    book = parse_markdown(path)
+
+    assert [(unit.section, unit.text) for unit in book.units] == [
+        ("Previous", "body"),
+        (None, "more"),
+    ]
+
+
 def test_parse_document_routes_a_mixed_case_markdown_suffix(tmp_path: Path) -> None:
     path = tmp_path / "Guide.MD"
     path.write_text("# Intro\r\n\r\nBody text.", encoding="utf-8")

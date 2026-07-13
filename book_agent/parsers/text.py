@@ -104,9 +104,10 @@ def parse_markdown(
         if heading_match:
             flush()
             heading_text = heading_match.group(1) or ""
-            current_section = re.sub(
+            normalized_section = re.sub(
                 r"(?:^|[ \t]+)#+[ \t]*$", "", heading_text
             ).strip()
+            current_section = normalized_section or None
             continue
 
         if line.strip():

@@ -2,7 +2,7 @@
 command = "uv"
 args = ["run", "python", "-m", "book_agent.mcp_server"]
 cwd = "/Users/zhaoyunfei/Documents/Codex/2026-07-12/wo"
-env = { BOOK_LIBRARY_ROOT = "/Users/zhaoyunfei/Documents/Codex/2026-07-12/wo", HF_HUB_OFFLINE = "1", TRANSFORMERS_OFFLINE = "1" }
+env = { BOOK_LIBRARY_ROOT = "/Users/zhaoyunfei/Documents/Codex/2026-07-12/wo", BOOK_LIBRARY_OBSIDIAN_VAULT = "/Users/zhaoyunfei/Documents/Obsidian_workspace", HF_HUB_OFFLINE = "1", TRANSFORMERS_OFFLINE = "1" }
 required = true
 enabled = true
 enabled_tools = [

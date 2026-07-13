@@ -33,6 +33,110 @@ def library(tmp_path: Path) -> LibraryTools:
     )
 
 
+def test_build_tools_splits_existing_external_vault_from_project_data(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    obsidian_vault = tmp_path / "Obsidian_workspace"
+    obsidian_vault.mkdir()
+
+    tools = build_tools(
+        project,
+        NullEmbeddingProvider(),
+        vault_root=obsidian_vault,
+    )
+
+    assert tools.paths.vault == obsidian_vault
+    for directory in (
+        tools.paths.inbox,
+        tools.paths.originals,
+        tools.paths.parsed,
+        tools.paths.notes,
+    ):
+        assert directory.is_dir()
+        assert directory.is_relative_to(obsidian_vault)
+    assert tools.paths.database.is_file()
+    assert tools.paths.models.is_dir()
+    assert tools.paths.database.is_relative_to(project)
+    assert tools.paths.models.is_relative_to(project)
+    assert not (project / "vault").exists()
+
+
+@pytest.mark.parametrize("vault_kind", ["missing", "file", "symlink"])
+def test_build_tools_rejects_invalid_explicit_vault_without_writing(
+    tmp_path: Path,
+    vault_kind: str,
+) -> None:
+    project = tmp_path / "project"
+    obsidian_vault = tmp_path / "Obsidian_workspace"
+    target = tmp_path / "vault-target"
+    if vault_kind == "file":
+        obsidian_vault.write_text("not a directory", encoding="utf-8")
+    elif vault_kind == "symlink":
+        target.mkdir()
+        obsidian_vault.symlink_to(target, target_is_directory=True)
+
+    with pytest.raises(ValueError, match=r"Obsidian vault"):
+        build_tools(
+            project,
+            NullEmbeddingProvider(),
+            vault_root=obsidian_vault,
+        )
+
+    assert not project.exists()
+    if vault_kind == "missing":
+        assert not obsidian_vault.exists()
+    elif vault_kind == "symlink":
+        assert list(target.iterdir()) == []
+
+
+def test_external_vault_txt_workflow_routes_every_managed_file(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    obsidian_vault = tmp_path / "Obsidian_workspace"
+    obsidian_vault.mkdir()
+    source = _write_chinese_book(tmp_path / "外部仓库测试.txt")
+    tools = build_tools(
+        project,
+        NullEmbeddingProvider(),
+        vault_root=obsidian_vault,
+    )
+
+    imported = tools.import_book(str(source), title="外部仓库测试")
+    assert imported["ok"] is True
+    assert imported["status"] == "keyword_only", imported
+
+    searched = tools.search_books("库存周期", mode="quote")
+    assert searched["ok"] is True
+    assert searched["count"] >= 1
+
+    saved = tools.save_reading_note(
+        "外部仓库笔记",
+        "这是经过核验的简短笔记。",
+        [searched["results"][0]["passage_id"]],
+    )
+
+    original = Path(imported["original_path"])
+    parsed = Path(imported["parsed_path"])
+    note = Path(saved["path"])
+    assert original.parent == obsidian_vault / "书库" / "10-原始书籍"
+    assert parsed.parent.parent == obsidian_vault / "书库" / "20-解析文本"
+    assert note.parent == obsidian_vault / "书库" / "30-AI读书笔记"
+    assert original.is_file()
+    assert parsed.is_file()
+    assert note.is_file()
+    assert searched["results"][0]["obsidian_link"].startswith(
+        "[[书库/20-解析文本/"
+    )
+    assert saved["wiki_link"].startswith("[[书库/30-AI读书笔记/")
+    assert tools.paths.database == project / "data" / "library.sqlite3"
+    assert tools.paths.database.is_file()
+    assert tools.paths.models == project / "data" / "models"
+    assert tools.paths.models.is_dir()
+    assert not (project / "vault").exists()
+
+
 def test_real_txt_workflow_is_json_safe_and_preserves_content_boundaries(
     library: LibraryTools,
     tmp_path: Path,

@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from collections.abc import Callable, Sequence
 import math
+import os
 from pathlib import Path
+import stat
 from typing import Any
 
 from book_agent.config import AppPaths, MAX_PREVIEWS
@@ -288,10 +290,44 @@ class LibraryTools:
 def build_tools(
     project_root: str | Path,
     embedding_provider: object | None = None,
+    *,
+    vault_root: str | Path | None = None,
 ) -> LibraryTools:
     """Initialize the managed local library without downloading a model."""
 
-    paths = AppPaths.from_root(Path(project_root).expanduser())
+    explicit_vault: Path | None = None
+    if vault_root is not None:
+        try:
+            explicit_vault = Path(
+                os.path.abspath(os.fspath(Path(vault_root).expanduser()))
+            )
+        except (OSError, RuntimeError, TypeError) as exc:
+            raise ValueError(
+                f"Explicit Obsidian vault path is invalid: {vault_root}"
+            ) from exc
+        try:
+            vault_info = os.lstat(explicit_vault)
+        except FileNotFoundError as exc:
+            raise ValueError(
+                f"Explicit Obsidian vault does not exist: {explicit_vault}"
+            ) from exc
+        except OSError as exc:
+            raise ValueError(
+                f"Explicit Obsidian vault is unavailable: {explicit_vault}"
+            ) from exc
+        if stat.S_ISLNK(vault_info.st_mode):
+            raise ValueError(
+                f"Explicit Obsidian vault must not be a symlink: {explicit_vault}"
+            )
+        if not stat.S_ISDIR(vault_info.st_mode):
+            raise ValueError(
+                f"Explicit Obsidian vault must be a directory: {explicit_vault}"
+            )
+
+    paths = AppPaths.from_root(
+        Path(project_root).expanduser(),
+        vault_root=explicit_vault,
+    )
     VaultManager(paths).ensure_layout()
     database = Database(paths.database, root=paths.root)
     database.initialize()

@@ -21,7 +21,13 @@ TOOL_NAMES = (
 )
 
 ROOT = Path(os.environ.get("BOOK_LIBRARY_ROOT", os.getcwd())).expanduser().resolve()
-library_tools = build_tools(ROOT)
+_OBSIDIAN_VAULT_ENV = os.environ.get("BOOK_LIBRARY_OBSIDIAN_VAULT")
+OBSIDIAN_VAULT = (
+    None
+    if _OBSIDIAN_VAULT_ENV is None or not _OBSIDIAN_VAULT_ENV.strip()
+    else Path(_OBSIDIAN_VAULT_ENV).expanduser().absolute()
+)
+library_tools = build_tools(ROOT, vault_root=OBSIDIAN_VAULT)
 mcp = FastMCP("local-book-library")
 
 CodexAttachmentPath = Annotated[

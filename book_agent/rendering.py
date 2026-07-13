@@ -104,10 +104,10 @@ def render_parsed_book(
     source_file: str | Path,
     passages: Iterable[Passage],
     *,
-    project_root: str | Path | None = None,
+    managed_root: str | Path | None = None,
 ) -> Path:
     destination = Path(os.path.abspath(os.fspath(Path(destination).expanduser())))
-    root = Path(destination.anchor) if project_root is None else Path(project_root)
+    root = Path(destination.anchor) if managed_root is None else Path(managed_root)
     content = _render(book_id, parsed, source_file, passages)
 
     with _managed_directory_beneath(
@@ -115,6 +115,7 @@ def render_parsed_book(
         destination.parent,
         "parsed book",
         create=True,
+        root_label="managed root",
     ) as (_, directory_fd):
         try:
             destination_info = os.stat(

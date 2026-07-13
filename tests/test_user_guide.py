@@ -6,6 +6,8 @@ from book_agent.parsers.registry import SUPPORTED_EXTENSIONS
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 GUIDE_PATH = PROJECT_ROOT / "docs" / "USER_GUIDE.md"
+QUICK_START_PATH = PROJECT_ROOT / "outputs" / "书库RAG快速开始.md"
+POLICY_PATH = PROJECT_ROOT / "AGENTS.md"
 
 
 def _guide() -> str:
@@ -150,25 +152,41 @@ def test_user_guide_sets_privacy_token_and_obsidian_browsing_boundaries() -> Non
         "保留在本机",
         "选中少量段落",
         "Codex 上下文",
-        "vault/",
-        "作为 Obsidian vault",
-        "仅用于浏览",
+        "当前 Obsidian 仓库",
+        "不需要切换",
     ):
         assert phrase in guide
 
 
-def test_user_guide_uses_actual_vault_paths_and_readable_spacing() -> None:
-    guide = _guide()
+def test_guides_use_active_obsidian_vault_and_project_data_paths() -> None:
+    guides = (
+        _guide(),
+        QUICK_START_PATH.read_text(encoding="utf-8"),
+    )
 
-    for path in (
-        "vault/书库/30-AI读书笔记/",
-        "vault/书库/10-原始书籍/",
-        "vault/书库/20-解析文本/",
-    ):
-        assert f"`{path}`" in guide
+    for guide in guides:
+        for phrase in (
+            "当前 Obsidian 仓库",
+            "/Users/zhaoyunfei/Documents/Obsidian_workspace",
+            "`书库/10-原始书籍/`",
+            "`书库/20-解析文本/`",
+            "`书库/30-AI读书笔记/`",
+            "项目的 `data/`",
+        ):
+            assert phrase in guide
+        for obsolete in (
+            "作为 Obsidian vault",
+            "Open folder as vault",
+            "vault/书库/",
+        ):
+            assert obsolete not in guide
 
-    assert "`vault/30-AI读书笔记/`" not in guide
-    assert "`vault/10-原始书籍/`" not in guide
-    assert "`vault/20-解析文本/`" not in guide
-    assert "Codex依据" not in guide
-    assert "Codex 依据" in guide
+    assert "Codex依据" not in guides[0]
+    assert "Codex 依据" in guides[0]
+
+
+def test_agents_policy_names_ai_notes_in_the_current_obsidian_vault() -> None:
+    policy = POLICY_PATH.read_text(encoding="utf-8")
+
+    assert "当前 Obsidian 仓库 `书库/30-AI读书笔记`" in policy
+    assert "vault/书库/30-AI读书笔记" not in policy

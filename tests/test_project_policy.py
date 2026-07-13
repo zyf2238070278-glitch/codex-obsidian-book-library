@@ -4,6 +4,7 @@ import tomllib
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 FINAL_PROJECT_ROOT = "/Users/zhaoyunfei/Documents/Codex/2026-07-12/wo"
+ACTIVE_OBSIDIAN_VAULT = "/Users/zhaoyunfei/Documents/Obsidian_workspace"
 TOOL_ALLOWLIST = [
     "import_book",
     "list_books",
@@ -57,6 +58,7 @@ def test_project_config_registers_only_the_local_book_tools() -> None:
     assert server["cwd"] == FINAL_PROJECT_ROOT
     assert server["env"] == {
         "BOOK_LIBRARY_ROOT": FINAL_PROJECT_ROOT,
+        "BOOK_LIBRARY_OBSIDIAN_VAULT": ACTIVE_OBSIDIAN_VAULT,
         "HF_HUB_OFFLINE": "1",
         "TRANSFORMERS_OFFLINE": "1",
     }

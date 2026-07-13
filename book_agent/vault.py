@@ -58,7 +58,13 @@ def _absolute_path(path: Path, label: str) -> Path:
         raise ValueError(f"Managed path '{label}' is invalid: {path}") from exc
 
 
-def _confined_path(configured: Path, label: str, root: Path) -> Path:
+def _confined_path(
+    configured: Path,
+    label: str,
+    root: Path,
+    *,
+    root_label: str = "project root",
+) -> Path:
     try:
         expanded = configured.expanduser()
         if not expanded.is_absolute():
@@ -67,7 +73,7 @@ def _confined_path(configured: Path, label: str, root: Path) -> Path:
         directory.relative_to(root)
     except (OSError, RuntimeError, TypeError, ValueError) as exc:
         raise ValueError(
-            f"Managed directory '{label}' is not beneath project root: {configured}"
+            f"Managed directory '{label}' is not beneath {root_label}: {configured}"
         ) from exc
     return directory
 
@@ -163,10 +169,16 @@ def _managed_directory_beneath(
     label: str,
     *,
     create: bool,
+    root_label: str = "project root",
 ) -> Iterator[tuple[Path, int]]:
-    root = _absolute_path(root_path, "project root")
-    directory = _confined_path(configured, label, root)
-    root_fd = _open_absolute_directory(root, "project root", create=create)
+    root = _absolute_path(root_path, root_label)
+    directory = _confined_path(
+        configured,
+        label,
+        root,
+        root_label=root_label,
+    )
+    root_fd = _open_absolute_directory(root, root_label, create=create)
     current_fd = root_fd
     current_path = root
     try:
@@ -192,16 +204,21 @@ class VaultManager:
         self.paths = paths
 
     def ensure_layout(self) -> None:
-        directories = (
+        vault_directories = (
             ("inbox", self.paths.inbox),
             ("originals", self.paths.originals),
             ("parsed", self.paths.parsed),
             ("notes", self.paths.notes),
+        )
+        project_directories = (
             ("models", self.paths.models),
             ("database.parent", self.paths.database.parent),
         )
-        for label, directory in directories:
+        for label, directory in vault_directories:
             with self._managed_directory(directory, label, create=True):
+                pass
+        for label, directory in project_directories:
+            with self._project_directory(directory, label, create=True):
                 pass
 
     def import_original(self, source: Path) -> Path:
@@ -265,6 +282,23 @@ class VaultManager:
 
     @contextmanager
     def _managed_directory(
+        self,
+        configured: Path,
+        label: str,
+        *,
+        create: bool,
+    ) -> Iterator[tuple[Path, int]]:
+        with _managed_directory_beneath(
+            self.paths.vault,
+            configured,
+            label,
+            create=create,
+            root_label="vault root",
+        ) as managed:
+            yield managed
+
+    @contextmanager
+    def _project_directory(
         self,
         configured: Path,
         label: str,

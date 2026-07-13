@@ -293,7 +293,7 @@ class ImportService:
                 parsed,
                 original,
                 passages,
-                project_root=self.paths.root,
+                managed_root=self.paths.vault,
             )
             parsed_path = str(destination.absolute())
             self.database.replace_passages(book_id, passages)

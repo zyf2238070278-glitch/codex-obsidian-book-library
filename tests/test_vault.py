@@ -47,6 +47,52 @@ def test_ensure_layout_creates_all_user_directories(tmp_path: Path) -> None:
     assert paths.database.parent.is_dir()
 
 
+def test_ensure_layout_splits_external_vault_from_project_data(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    obsidian_vault = tmp_path / "Obsidian_workspace"
+    obsidian_vault.mkdir()
+    paths = AppPaths.from_root(project, vault_root=obsidian_vault)
+
+    VaultManager(paths).ensure_layout()
+
+    assert paths.vault == obsidian_vault
+    for directory in (
+        paths.inbox,
+        paths.originals,
+        paths.parsed,
+        paths.notes,
+    ):
+        assert directory.is_dir()
+        assert directory.is_relative_to(obsidian_vault)
+    assert paths.models.is_dir()
+    assert paths.database.parent.is_dir()
+    assert paths.models.is_relative_to(project)
+    assert paths.database.parent.is_relative_to(project)
+    assert not (project / "vault").exists()
+
+
+def test_ensure_layout_rejects_symlinked_external_vault_before_writing(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    project.mkdir()
+    target = tmp_path / "real-vault"
+    target.mkdir()
+    vault_alias = tmp_path / "vault-alias"
+    vault_alias.symlink_to(target, target_is_directory=True)
+    paths = AppPaths.from_root(project, vault_root=vault_alias)
+
+    with pytest.raises(ValueError, match=r"vault root.*symlink"):
+        VaultManager(paths).ensure_layout()
+
+    assert list(target.iterdir()) == []
+    assert not (project / "data").exists()
+    assert not (project / "vault").exists()
+
+
 def test_tracked_vault_docs_and_ignore_rules() -> None:
     project = Path(__file__).parents[1]
     homepage = (project / "vault" / "首页.md").read_text(encoding="utf-8")

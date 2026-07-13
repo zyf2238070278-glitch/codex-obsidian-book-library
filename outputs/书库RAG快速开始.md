@@ -2,11 +2,15 @@
 
 项目位置：`/Users/zhaoyunfei/Documents/Codex/2026-07-12/wo`
 
+当前 Obsidian 仓库：`/Users/zhaoyunfei/Documents/Obsidian_workspace`
+
 ## 第一次使用
 
 1. 在 Codex 中打开并信任这个项目。
 2. 重新加载一次 Codex，让项目里的 `book_library` MCP 生效。
 3. 本地语义模型已经安装好，以后不需要重复下载。
+
+SQLite 索引、语义向量和本地模型保存在项目的 `data/`；原书、解析文本和 AI 笔记保存在当前 Obsidian 仓库。
 
 ## 导入一本书
 
@@ -42,13 +46,10 @@
 
 > 把刚才的引用和解释保存到 Obsidian，标题叫《标题》，保留出处。
 
-笔记会进入 `vault/书库/30-AI读书笔记/`。AI 笔记不会被当作原书证据重新索引。
+笔记会进入 `书库/30-AI读书笔记/`。AI 笔记不会被当作原书证据重新索引。
 
 ## 在 Obsidian 中浏览
 
-日常导入、检索、解释和保存都不需要打开 Obsidian。如果想浏览文件，首次在 Obsidian 的 vault 切换器中选择 **Open folder as vault**，然后选择：
+日常导入、检索、解释和保存都不需要打开 Obsidian。当前 Obsidian 仓库已经是 `/Users/zhaoyunfei/Documents/Obsidian_workspace`，不需要切换仓库。
 
-`/Users/zhaoyunfei/Documents/Codex/2026-07-12/wo/vault`
-
-之后可在左侧看到 `书库` 文件夹。
-
+想浏览文件时，可直接在左侧打开 `书库` 文件夹：原书在 `书库/10-原始书籍/`，解析文本在 `书库/20-解析文本/`，AI 笔记在 `书库/30-AI读书笔记/`。

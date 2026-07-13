@@ -370,6 +370,50 @@ def test_render_root_swap_restores_a_preexisting_destination(
     assert not list((displaced_root / "nested").glob(".render-backup-*"))
 
 
+def test_render_directory_swap_restores_old_file_and_rejects_stale_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    managed_root = tmp_path / "managed-root"
+    parsed_directory = managed_root / "nested"
+    parsed_directory.mkdir(parents=True)
+    destination = parsed_directory / "book.md"
+    destination.write_text("必须恢复的叶目录旧内容", encoding="utf-8")
+    displaced_directory = tmp_path / "displaced-parsed-directory"
+    sentinel_payload = b"replacement parsed directory sentinel"
+    sentinel = parsed_directory / "sentinel.md"
+    real_replace = rendering.os.replace
+    swapped = False
+
+    def replace_then_swap_directory(*args: object, **kwargs: object) -> None:
+        nonlocal swapped
+        real_replace(*args, **kwargs)
+        if swapped:
+            return
+        swapped = True
+        parsed_directory.rename(displaced_directory)
+        parsed_directory.mkdir()
+        sentinel.write_bytes(sentinel_payload)
+
+    monkeypatch.setattr(rendering.os, "replace", replace_then_swap_directory)
+
+    with pytest.raises(ValueError, match=r"parsed book.*identity"):
+        rendering.render_parsed_book(
+            destination,
+            "book-1",
+            _parsed(),
+            "source.pdf",
+            [_passage(0, "不应返回到替换后的叶目录。")],
+            managed_root=managed_root,
+        )
+
+    restored = displaced_directory / "book.md"
+    assert restored.read_text(encoding="utf-8") == "必须恢复的叶目录旧内容"
+    assert sentinel.read_bytes() == sentinel_payload
+    assert list(parsed_directory.iterdir()) == [sentinel]
+    assert not list(displaced_directory.glob(".render-backup-*"))
+
+
 @pytest.mark.parametrize("preexisting", [False, True])
 def test_replace_post_syscall_interruption_rolls_back_publication(
     tmp_path: Path,

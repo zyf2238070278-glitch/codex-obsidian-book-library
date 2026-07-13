@@ -259,6 +259,61 @@ def test_import_root_swap_after_publication_never_reads_or_deletes_replacement(
     assert list((displaced_vault / "书库" / "10-原始书籍").iterdir()) == []
 
 
+def test_import_originals_directory_swap_never_touches_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    obsidian_vault = tmp_path / "Obsidian_workspace"
+    obsidian_vault.mkdir()
+    tools = build_tools(
+        project,
+        NullEmbeddingProvider(),
+        vault_root=obsidian_vault,
+    )
+    source = _write_chinese_book(tmp_path / "原书目录写入中换位.txt")
+    originals = tools.paths.originals
+    displaced_originals = tmp_path / "displaced-originals"
+    sentinel_payload = b"replacement originals sentinel"
+    sentinel: Path | None = None
+    real_link_final = VaultManager._link_final
+
+    def link_then_replace_originals(
+        inbox_fd: int,
+        temp_name: str,
+        originals_fd: int,
+        source_name: str,
+    ) -> str:
+        nonlocal sentinel
+        final_name = real_link_final(
+            inbox_fd,
+            temp_name,
+            originals_fd,
+            source_name,
+        )
+        originals.rename(displaced_originals)
+        originals.mkdir()
+        sentinel = originals / final_name
+        sentinel.write_bytes(sentinel_payload)
+        return final_name
+
+    monkeypatch.setattr(
+        VaultManager,
+        "_link_final",
+        staticmethod(link_then_replace_originals),
+    )
+
+    imported = tools.import_book(str(source))
+
+    assert imported["ok"] is False
+    assert "originals" in imported["error"]
+    assert "identity" in imported["error"]
+    assert sentinel is not None
+    assert sentinel.read_bytes() == sentinel_payload
+    assert tools.database.list_books() == []
+    assert list(displaced_originals.iterdir()) == []
+
+
 def test_note_save_rejects_replaced_explicit_vault_root(
     tmp_path: Path,
 ) -> None:
@@ -340,6 +395,55 @@ def test_note_root_swap_after_link_never_returns_or_touches_replacement(
     assert list((displaced_vault / "书库" / "30-AI读书笔记").iterdir()) == []
 
 
+def test_note_directory_swap_after_link_never_returns_a_stale_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    project = tmp_path / "project"
+    obsidian_vault = tmp_path / "Obsidian_workspace"
+    obsidian_vault.mkdir()
+    tools = build_tools(
+        project,
+        NullEmbeddingProvider(),
+        vault_root=obsidian_vault,
+    )
+    source = _write_chinese_book(tmp_path / "笔记叶目录写入中换位.txt")
+    imported = tools.import_book(str(source))
+    assert imported["ok"] is True
+    searched = tools.search_books("库存周期", mode="quote")
+    passage_id = searched["results"][0]["passage_id"]
+    notes_directory = tools.paths.notes
+    displaced_notes = tmp_path / "displaced-notes"
+    sentinel = notes_directory / "sentinel.md"
+    real_link = notes_module.os.link
+    swapped = False
+
+    def link_then_replace_notes(*args: object, **kwargs: object) -> None:
+        nonlocal swapped
+        real_link(*args, **kwargs)
+        if swapped:
+            return
+        swapped = True
+        notes_directory.rename(displaced_notes)
+        notes_directory.mkdir()
+        sentinel.write_text("replacement sentinel", encoding="utf-8")
+
+    monkeypatch.setattr(notes_module.os, "link", link_then_replace_notes)
+
+    saved = tools.save_reading_note(
+        "笔记叶目录写入中换位",
+        "不得返回替换后的路径。",
+        [passage_id],
+    )
+
+    assert saved["ok"] is False
+    assert "notes" in saved["error"]
+    assert "identity" in saved["error"]
+    assert sentinel.read_text(encoding="utf-8") == "replacement sentinel"
+    assert list(notes_directory.iterdir()) == [sentinel]
+    assert list(displaced_notes.iterdir()) == []
+
+
 @pytest.mark.parametrize("replacement_kind", ["directory", "symlink"])
 def test_parse_failure_still_reports_a_mid_parse_vault_root_swap(
     tmp_path: Path,
@@ -380,6 +484,41 @@ def test_parse_failure_still_reports_a_mid_parse_vault_root_swap(
         assert list(obsidian_vault.iterdir()) == []
     else:
         assert list(symlink_target.iterdir()) == []
+
+
+def test_switching_to_external_vault_relocates_an_existing_book(
+    tmp_path: Path,
+) -> None:
+    project = tmp_path / "project"
+    source = _write_chinese_book(tmp_path / "已有书籍换到 Obsidian.txt")
+    project_tools = build_tools(
+        project,
+        NullEmbeddingProvider(),
+    )
+    original_import = project_tools.import_book(str(source))
+    assert original_import["ok"] is True
+    assert Path(original_import["original_path"]).is_relative_to(project / "vault")
+
+    obsidian_vault = tmp_path / "Obsidian_workspace"
+    obsidian_vault.mkdir()
+    external_tools = build_tools(
+        project,
+        NullEmbeddingProvider(),
+        vault_root=obsidian_vault,
+    )
+
+    relocated = external_tools.import_book(str(source))
+    stored = external_tools.database.get_book(relocated["book_id"])
+
+    assert relocated["ok"] is True
+    assert relocated["status"] == "keyword_only"
+    assert Path(relocated["original_path"]).is_relative_to(obsidian_vault)
+    assert Path(relocated["parsed_path"]).is_relative_to(obsidian_vault)
+    assert Path(relocated["original_path"]).is_file()
+    assert Path(relocated["parsed_path"]).is_file()
+    assert stored is not None
+    assert Path(str(stored["original_path"])).is_relative_to(obsidian_vault)
+    assert Path(str(stored["parsed_path"])).is_relative_to(obsidian_vault)
 
 
 def test_real_txt_workflow_is_json_safe_and_preserves_content_boundaries(

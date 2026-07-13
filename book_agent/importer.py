@@ -227,9 +227,17 @@ class ImportService:
         author: str | None,
     ) -> ImportResult:
         status = str(existing["status"])
-        if status == "keyword_only" and not self.embedding_provider.available:
+        requires_relocation = self._requires_vault_relocation(existing)
+        if (
+            not requires_relocation
+            and status == "keyword_only"
+            and not self.embedding_provider.available
+        ):
             return self._duplicate_result(existing)
-        if status not in {"keyword_only", "failed", "processing"}:
+        if (
+            not requires_relocation
+            and status not in {"keyword_only", "failed", "processing"}
+        ):
             return self._duplicate_result(existing)
 
         book_id = str(existing["book_id"])
@@ -249,6 +257,33 @@ class ImportService:
             title=recovery_title,
             author=recovery_author,
         )
+
+    def _requires_vault_relocation(self, existing: dict[str, Any]) -> bool:
+        try:
+            book_id = str(existing["book_id"])
+            original_path = Path(
+                os.path.abspath(
+                    os.fspath(Path(str(existing["original_path"])).expanduser())
+                )
+            )
+        except (KeyError, OSError, RuntimeError, TypeError, ValueError):
+            return True
+        if original_path.parent != self.paths.originals.absolute():
+            return True
+
+        parsed_value = existing.get("parsed_path")
+        if parsed_value is None:
+            return str(existing.get("status")) in {"ready", "keyword_only"}
+        try:
+            parsed_path = Path(
+                os.path.abspath(
+                    os.fspath(Path(str(parsed_value)).expanduser())
+                )
+            )
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return True
+        expected_parsed = (self.paths.parsed / book_id / "正文.md").absolute()
+        return parsed_path != expected_parsed
 
     def _recovery_original(
         self,

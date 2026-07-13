@@ -254,6 +254,16 @@ def _managed_directory_beneath(
             current_fd = next_fd
             os.close(previous_fd)
             current_path /= component
+        try:
+            directory_info = os.fstat(current_fd)
+        except OSError as exc:
+            raise ValueError(
+                f"Managed directory '{label}' cannot be inspected safely: {directory}"
+            ) from exc
+        pinned_directory_identity = (
+            directory_info.st_dev,
+            directory_info.st_ino,
+        )
         yield directory, current_fd
         completed = True
     finally:
@@ -263,6 +273,11 @@ def _managed_directory_beneath(
                     root,
                     root_label,
                     pinned_root_identity,
+                )
+                _verify_absolute_directory_identity(
+                    directory,
+                    label,
+                    pinned_directory_identity,
                 )
         finally:
             _close_quietly(current_fd)

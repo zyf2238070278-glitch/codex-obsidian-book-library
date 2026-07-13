@@ -74,6 +74,37 @@ def test_ensure_layout_splits_external_vault_from_project_data(
     assert not (project / "vault").exists()
 
 
+@pytest.mark.parametrize("replacement_kind", ["directory", "symlink"])
+def test_managed_directory_rejects_leaf_identity_change_on_exit(
+    tmp_path: Path,
+    replacement_kind: str,
+) -> None:
+    paths = AppPaths.from_root(tmp_path / "project")
+    manager = VaultManager(paths)
+    manager.ensure_layout()
+    displaced_notes = tmp_path / "displaced-notes"
+    symlink_target = tmp_path / "notes-target"
+
+    with pytest.raises(ValueError, match=r"notes.*identity"):
+        with manager._managed_directory(
+            paths.notes,
+            "notes",
+            create=False,
+        ):
+            paths.notes.rename(displaced_notes)
+            if replacement_kind == "directory":
+                paths.notes.mkdir()
+            else:
+                symlink_target.mkdir()
+                paths.notes.symlink_to(symlink_target, target_is_directory=True)
+
+    assert list(displaced_notes.iterdir()) == []
+    if replacement_kind == "directory":
+        assert list(paths.notes.iterdir()) == []
+    else:
+        assert list(symlink_target.iterdir()) == []
+
+
 def test_ensure_layout_rejects_symlinked_external_vault_before_writing(
     tmp_path: Path,
 ) -> None:

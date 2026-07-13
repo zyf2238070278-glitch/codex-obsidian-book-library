@@ -1,6 +1,7 @@
 import hashlib
 import json
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
+from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
 from pathlib import Path
 from threading import Event, Lock
@@ -268,6 +269,121 @@ def test_hash_drift_to_an_existing_book_removes_the_new_copy_as_duplicate(
     assert duplicate.passage_count == existing.passage_count
     assert len(list(paths.originals.iterdir())) == original_count
     assert len(database.list_books()) == 1
+
+
+def test_hash_drift_relocks_authoritative_content_before_concurrent_registration(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, first_database = app
+    source = _write_txt(tmp_path / "drifting-concurrent.txt", marker="预检内容甲")
+    replacement = _write_txt(tmp_path / "replacement.txt", marker="权威内容乙")
+    preflight_hash = sha256_file(source)
+    authoritative_hash = sha256_file(replacement)
+    assert preflight_hash != authoritative_hash
+
+    second_database = Database(paths.database)
+    first_service = ImportService(paths, first_database, NullEmbeddingProvider())
+    second_service = ImportService(paths, second_database, NullEmbeddingProvider())
+    real_import_original = first_service.vault.import_original
+    real_first_find = first_database.find_book_by_hash
+    real_second_find = second_database.find_book_by_hash
+    real_first_lock = first_service._book_lock
+    source_replaced = Event()
+    stale_lock_lookup_entered = Event()
+    second_authoritative_lookup_done = Event()
+    held_lock_guard = Lock()
+    held_lock_id: str | None = None
+
+    @contextmanager
+    def track_first_lock(book_id: str):
+        nonlocal held_lock_id
+        with real_first_lock(book_id):
+            with held_lock_guard:
+                held_lock_id = book_id
+            try:
+                yield
+            finally:
+                with held_lock_guard:
+                    held_lock_id = None
+
+    def replace_then_copy(source_path: Path) -> Path:
+        source.write_bytes(replacement.read_bytes())
+        copied = real_import_original(source_path)
+        source_replaced.set()
+        return copied
+
+    def find_from_first(content_hash: str):
+        with held_lock_guard:
+            current_lock_id = held_lock_id
+        if (
+            content_hash == authoritative_hash
+            and current_lock_id == preflight_hash[:24]
+        ):
+            result = real_first_find(content_hash)
+            assert result is None
+            stale_lock_lookup_entered.set()
+            if not second_authoritative_lookup_done.wait(timeout=5):
+                raise TimeoutError("second authoritative lookup did not complete")
+            return result
+        return real_first_find(content_hash)
+
+    def find_from_second(content_hash: str):
+        if content_hash == authoritative_hash:
+            # The broken implementation reaches the B lookup while still holding
+            # A.  A corrected implementation serializes on B, so this wait may
+            # legitimately time out before the only B owner performs the lookup.
+            stale_lock_lookup_entered.wait(timeout=0.5)
+            result = real_second_find(content_hash)
+            second_authoritative_lookup_done.set()
+            return result
+        return real_second_find(content_hash)
+
+    monkeypatch.setattr(first_service, "_book_lock", track_first_lock)
+    monkeypatch.setattr(first_service.vault, "import_original", replace_then_copy)
+    monkeypatch.setattr(first_database, "find_book_by_hash", find_from_first)
+    monkeypatch.setattr(second_database, "find_book_by_hash", find_from_second)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(first_service.import_book, source)
+        assert source_replaced.wait(timeout=5)
+        second_future = pool.submit(second_service.import_book, source)
+        first = first_future.result(timeout=10)
+        second = second_future.result(timeout=10)
+
+    assert {first.status, second.status} == {"keyword_only", "duplicate"}
+    assert first.book_id == second.book_id == authoritative_hash[:24]
+    assert len(first_database.list_books()) == 1
+    assert len(list(paths.originals.iterdir())) == 1
+
+
+def test_continuously_changing_source_stops_without_database_or_file_residue(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / "always-changing.txt", marker="初始内容")
+    service = ImportService(paths, database, NullEmbeddingProvider())
+    real_import_original = service.vault.import_original
+    copy_calls = 0
+
+    def change_before_every_copy(source_path: Path) -> Path:
+        nonlocal copy_calls
+        copy_calls += 1
+        _write_txt(source, marker=f"第{copy_calls}次变化后的内容")
+        return real_import_original(source_path)
+
+    monkeypatch.setattr(service.vault, "import_original", change_before_every_copy)
+
+    with pytest.raises(ValueError, match="持续.*变化|多次.*变化"):
+        service.import_book(source)
+
+    assert 1 < copy_calls <= 4
+    assert database.list_books() == []
+    assert list(paths.originals.iterdir()) == []
+    assert list(paths.inbox.iterdir()) == []
 
 
 def test_post_copy_hash_failure_reraises_and_removes_the_unregistered_original(

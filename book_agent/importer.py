@@ -25,6 +25,11 @@ from book_agent.vault import VaultManager
 
 
 _HASH_BLOCK_SIZE = 1024 * 1024
+_MAX_HASH_DRIFT_ATTEMPTS = 3
+
+
+class _ContentHashDrift(Exception):
+    """Signal that copied bytes no longer match the hash whose lock is held."""
 
 
 @dataclass(frozen=True)
@@ -84,18 +89,34 @@ class ImportService:
             content_hash = sha256_file(source_path)
         except OSError as error:
             raise ValueError(f"无法读取待导入文件：{source_path}") from error
-        book_id = content_hash[:24]
 
         self.vault.ensure_layout()
-        with self._book_lock(book_id):
-            return self._import_locked(
-                source_path=source_path,
-                suffix=suffix,
-                content_hash=content_hash,
-                book_id=book_id,
-                title=title,
-                author=author,
-            )
+        for attempt in range(_MAX_HASH_DRIFT_ATTEMPTS):
+            book_id = content_hash[:24]
+            try:
+                with self._book_lock(book_id):
+                    return self._import_locked(
+                        source_path=source_path,
+                        suffix=suffix,
+                        content_hash=content_hash,
+                        book_id=book_id,
+                        title=title,
+                        author=author,
+                    )
+            except _ContentHashDrift:
+                if attempt + 1 == _MAX_HASH_DRIFT_ATTEMPTS:
+                    break
+                try:
+                    content_hash = sha256_file(source_path)
+                except OSError as error:
+                    raise ValueError(
+                        f"无法重新读取发生变化的待导入文件：{source_path}"
+                    ) from error
+
+        raise ValueError(
+            "待导入文件在复制期间持续发生变化，"
+            f"已停止导入（共尝试 {_MAX_HASH_DRIFT_ATTEMPTS} 次）：{source_path}"
+        )
 
     def _import_locked(
         self,
@@ -123,19 +144,11 @@ class ImportService:
             original_path = str(original.absolute())
             copied_hash = sha256_file(original)
             if copied_hash != content_hash:
-                content_hash = copied_hash
-                book_id = content_hash[:24]
-                duplicate = self.database.find_book_by_hash(content_hash)
-                if duplicate is not None:
-                    self._remove_imported_original(original)
-                    return self._existing_result(
-                        duplicate,
-                        source_path=source_path,
-                        content_hash=content_hash,
-                        title=title,
-                        author=author,
-                    )
+                raise _ContentHashDrift
             initial_title = source_path.stem if title is None else title
+        except _ContentHashDrift:
+            self._remove_imported_original(original)
+            raise
         except BaseException as ownership_error:
             self._cleanup_unregistered_original(
                 original,

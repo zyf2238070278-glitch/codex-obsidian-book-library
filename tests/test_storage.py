@@ -148,6 +148,79 @@ def test_connect_rejects_database_leaf_replaced_during_open(
     assert external_database.read_bytes() == original_bytes
 
 
+@pytest.mark.parametrize("replacement", ["symlink", "directory"])
+def test_initialize_rejects_database_parent_replaced_during_open(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement: str,
+) -> None:
+    project = tmp_path / "project"
+    database_directory = project / "data"
+    database_directory.mkdir(parents=True)
+    database_path = database_directory / "library.sqlite3"
+    safe_connection = sqlite3.connect(database_path)
+    try:
+        safe_connection.execute("CREATE TABLE safe_marker(value TEXT)")
+        safe_connection.commit()
+    finally:
+        safe_connection.close()
+    safe_bytes = database_path.read_bytes()
+    safe_info = database_path.stat()
+
+    external_directory = tmp_path / "outside-data"
+    external_directory.mkdir()
+    external_database = external_directory / "library.sqlite3"
+    external_connection = sqlite3.connect(external_database)
+    try:
+        external_connection.execute("CREATE TABLE protected(value TEXT)")
+        external_connection.execute("INSERT INTO protected VALUES ('sentinel')")
+        external_connection.commit()
+    finally:
+        external_connection.close()
+    external_bytes = external_database.read_bytes()
+
+    displaced_directory = project / "data-old"
+    real_connect = sqlite3.connect
+    opened_connection: sqlite3.Connection | None = None
+    executed_sql: list[str] = []
+
+    def swap_parent_then_connect(*args, **kwargs):
+        nonlocal opened_connection
+        database_directory.rename(displaced_directory)
+        if replacement == "symlink":
+            database_directory.symlink_to(
+                external_directory,
+                target_is_directory=True,
+            )
+        else:
+            external_directory.rename(database_directory)
+        opened_connection = real_connect(*args, **kwargs)
+        opened_connection.set_trace_callback(executed_sql.append)
+        return opened_connection
+
+    monkeypatch.setattr(sqlite3, "connect", swap_parent_then_connect)
+
+    expected_error = "symlink" if replacement == "symlink" else "parent changed"
+    with pytest.raises(ValueError, match=expected_error):
+        Database(database_path, root=project).initialize()
+
+    assert opened_connection is not None
+    with pytest.raises(sqlite3.ProgrammingError, match="closed"):
+        opened_connection.execute("SELECT 1")
+    assert executed_sql == []
+    replacement_database = (
+        external_database if replacement == "symlink" else database_path
+    )
+    assert replacement_database.read_bytes() == external_bytes
+    displaced_database = displaced_directory / database_path.name
+    displaced_info = displaced_database.stat()
+    assert (displaced_info.st_dev, displaced_info.st_ino) == (
+        safe_info.st_dev,
+        safe_info.st_ino,
+    )
+    assert displaced_database.read_bytes() == safe_bytes
+
+
 def test_database_single_link_leaf_remains_usable(tmp_path: Path) -> None:
     project = tmp_path / "project"
     database_path = project / "data" / "library.sqlite3"

@@ -92,16 +92,36 @@ class Database:
 
     def connect(self) -> sqlite3.Connection:
         with self._safe_parent(create=False) as directory_fd:
+            parent_before_open = self._open_parent_identity(directory_fd)
             before_open = self._inspect_safe_leaf(directory_fd, allow_missing=True)
             connection = sqlite3.connect(self.path)
             try:
-                after_open = self._inspect_safe_leaf(directory_fd, allow_missing=False)
+                # sqlite3.connect accepts a pathname rather than a trusted dir_fd.
+                # Reopening narrows same-user swaps, but check-open-check cannot make
+                # an ABA rename race atomic without lower-level SQLite file controls.
+                with self._safe_parent(create=False) as current_directory_fd:
+                    current_parent = self._open_parent_identity(current_directory_fd)
+                    if current_parent != parent_before_open:
+                        raise ValueError(
+                            "Database parent changed while the file was being opened"
+                        )
+                    after_open = self._inspect_safe_leaf(
+                        current_directory_fd,
+                        allow_missing=False,
+                    )
+                    after_open_from_original_parent = self._inspect_safe_leaf(
+                        directory_fd,
+                        allow_missing=False,
+                    )
+                    if self._stat_identity(after_open) != self._stat_identity(
+                        after_open_from_original_parent
+                    ):
+                        raise ValueError(
+                            "Database file changed while its parent was being reopened"
+                        )
                 if before_open is not None and (
-                    before_open.st_dev,
-                    before_open.st_ino,
-                ) != (
-                    after_open.st_dev,
-                    after_open.st_ino,
+                    self._stat_identity(before_open)
+                    != self._stat_identity(after_open)
                 ):
                     raise ValueError("Database file changed while it was being opened")
             except BaseException:
@@ -120,6 +140,20 @@ class Database:
             create=create,
         ) as (_, directory_fd):
             yield directory_fd
+
+    @staticmethod
+    def _stat_identity(info: os.stat_result) -> tuple[int, int]:
+        return info.st_dev, info.st_ino
+
+    @staticmethod
+    def _open_parent_identity(directory_fd: int) -> tuple[int, int]:
+        try:
+            parent_info = os.fstat(directory_fd)
+        except OSError as exc:
+            raise ValueError("Database parent cannot be inspected safely") from exc
+        if not stat.S_ISDIR(parent_info.st_mode):
+            raise ValueError("Database parent must be a directory")
+        return Database._stat_identity(parent_info)
 
     def _inspect_safe_leaf(
         self,

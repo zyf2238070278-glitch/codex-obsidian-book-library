@@ -25,6 +25,7 @@ def _passage(
     book_id: str = "book-1",
     ordinal: int = 0,
     text: str = "芯片行业会反复经历缺货和库存过剩。",
+    section: str | None = "第一章",
     page_start: int | None = 12,
     embedding: bytes | None = None,
 ) -> Passage:
@@ -33,7 +34,7 @@ def _passage(
         book_id=book_id,
         ordinal=ordinal,
         text=text,
-        section="第一章",
+        section=section,
         page_start=page_start,
         page_end=page_start,
         page_label=str(page_start) if page_start is not None else None,
@@ -127,6 +128,184 @@ def test_fts_trigram_finds_a_three_plus_character_chinese_substring(db: Database
     hits = db.keyword_search("芯片行业", 5)
 
     assert [hit.passage_id for hit in hits] == ["passage-1"]
+
+
+def test_whitespace_terms_all_must_match_text_and_exact_phrase_ranks_first(
+    db: Database,
+) -> None:
+    _book(db)
+    db.replace_passages(
+        "book-1",
+        [
+            _passage(
+                "separated-reversed",
+                ordinal=0,
+                text="库存过剩会压低价格；多年后半导体企业才削减产能。",
+            ),
+            _passage(
+                "exact-phrase",
+                ordinal=1,
+                text="报告把半导体 库存过剩列为首要风险。",
+            ),
+            _passage("first-term-only", ordinal=2, text="半导体行业正在扩产。"),
+            _passage("second-term-only", ordinal=3, text="库存过剩会压低价格。"),
+        ],
+    )
+    db.update_book_status("book-1", "keyword_only")
+
+    first = db.keyword_search("半导体 库存过剩", 20)
+    second = db.keyword_search("半导体 库存过剩", 20)
+
+    assert [hit.passage_id for hit in first] == [
+        "exact-phrase",
+        "separated-reversed",
+    ]
+    assert second == first
+    assert [hit.passage_id for hit in db.keyword_search("半导体 库存过剩", 1)] == [
+        "exact-phrase"
+    ]
+
+
+def test_whitespace_search_combines_short_cjk_like_and_long_fts_terms(
+    db: Database,
+) -> None:
+    _book(db)
+    db.replace_passages(
+        "book-1",
+        [
+            _passage("both", ordinal=0, text="芯片价格最终因库存过剩而下跌。"),
+            _passage("long-only", ordinal=1, text="库存过剩也影响其他行业。"),
+        ],
+    )
+    db.update_book_status("book-1", "keyword_only")
+
+    assert [
+        hit.passage_id for hit in db.keyword_search("芯片 库存过剩", 20)
+    ] == ["both"]
+
+
+def test_keyword_search_merges_title_author_and_section_with_text_hits(
+    db: Database,
+) -> None:
+    _book(db, "ready-book", "ready-hash")
+    db.update_book_metadata("ready-book", "中国芯片产业周期", "李明研究组")
+    db.replace_passages(
+        "ready-book",
+        [
+            _passage(
+                "text-and-title",
+                book_id="ready-book",
+                ordinal=0,
+                text="芯片产业周期会影响企业利润。",
+                section="供给冲击",
+            ),
+            _passage(
+                "title-only",
+                book_id="ready-book",
+                ordinal=1,
+                text="这一段没有查询词。",
+                section="需求侧库存周期",
+            ),
+        ],
+    )
+    db.update_book_status("ready-book", "ready")
+
+    _book(db, "keyword-book", "keyword-hash")
+    db.update_book_metadata("keyword-book", "产业观察", "王芳研究组")
+    db.replace_passages(
+        "keyword-book",
+        [
+            _passage(
+                "author-hit",
+                book_id="keyword-book",
+                text="作者访谈摘录。",
+                section="市场回顾",
+            )
+        ],
+    )
+    db.update_book_status("keyword-book", "keyword_only")
+
+    assert [
+        hit.passage_id for hit in db.keyword_search("芯片 周期", 20)
+    ] == ["text-and-title", "title-only"]
+    assert [hit.passage_id for hit in db.keyword_search("李明", 20)] == [
+        "text-and-title",
+        "title-only",
+    ]
+    assert [
+        hit.passage_id for hit in db.keyword_search("需求 库存周期", 20)
+    ] == ["title-only"]
+    assert [hit.passage_id for hit in db.keyword_search("王芳研究组", 20)] == [
+        "author-hit"
+    ]
+
+
+def test_metadata_search_respects_all_terms_status_filters_limits_and_dedup(
+    db: Database,
+) -> None:
+    for book_id, status in (
+        ("visible", "keyword_only"),
+        ("partial", "ready"),
+        ("hidden", "failed"),
+    ):
+        _book(db, book_id, f"hash-{book_id}")
+        title = "资本 市场周期" if book_id != "partial" else "资本观察"
+        db.update_book_metadata(book_id, title, "研究作者")
+        db.replace_passages(
+            book_id,
+            [
+                _passage(
+                    f"{book_id}-0",
+                    book_id=book_id,
+                    ordinal=0,
+                    text="资本 市场周期会影响估值。" if book_id == "visible" else "无关原文。",
+                    section="资本 市场周期" if book_id == "visible" else "普通章节",
+                ),
+                _passage(
+                    f"{book_id}-1",
+                    book_id=book_id,
+                    ordinal=1,
+                    text="第二段无关原文。",
+                    section="普通章节",
+                ),
+            ],
+        )
+        db.update_book_status(book_id, status)
+
+    first = db.keyword_search("资本 市场周期", 20)
+    second = db.keyword_search("资本 市场周期", 20)
+
+    assert [hit.passage_id for hit in first] == ["visible-0", "visible-1"]
+    assert second == first
+    assert [
+        hit.passage_id
+        for hit in db.keyword_search("资本 市场周期", 20, ["visible"])
+    ] == ["visible-0", "visible-1"]
+    assert db.keyword_search("资本 市场周期", 20, ["partial"]) == []
+    assert db.keyword_search("资本 市场周期", 20, []) == []
+    assert [hit.passage_id for hit in db.keyword_search("资本 市场周期", 1)] == [
+        "visible-0"
+    ]
+
+
+def test_fts_operator_characters_are_literal_and_cannot_broaden_results(
+    db: Database,
+) -> None:
+    _book(db)
+    db.replace_passages(
+        "book-1",
+        [
+            _passage("literal", ordinal=0, text='代号 foo"bar 与 baz*qux 分开放置。'),
+            _passage("one-term", ordinal=1, text='这里只出现 foo"bar。'),
+            _passage("unrelated", ordinal=2, text="普通内容。"),
+        ],
+    )
+    db.update_book_status("book-1", "keyword_only")
+
+    assert [
+        hit.passage_id for hit in db.keyword_search('foo"bar baz*qux', 20)
+    ] == ["literal"]
+    assert db.keyword_search('missing" OR *', 20) == []
 
 
 @pytest.mark.parametrize(

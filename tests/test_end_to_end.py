@@ -8,6 +8,7 @@ from fakes import DeterministicEmbeddingProvider
 
 
 EXACT_PHRASE = "蓝杉钟声只在清晨响起"
+NOTE_ONLY_PHRASE = "银狐邮差只在午夜送达"
 SEMANTIC_TEXT = "晶圆厂扩建通常需要多年，订单突然增加时，新产能无法立刻响应。"
 UNRELATED_TEXT = "品牌广告可以帮助消费者识别新产品。"
 SEMANTIC_QUERY = "为何市面芯片一度买不到"
@@ -81,7 +82,8 @@ def test_codex_tool_boundary_runs_the_complete_grounded_reading_workflow(
 
     saved = tools.save_reading_note(
         "供给周期通俗解释",
-        "扩产很慢，所以突然增加的购买需求可能暂时得不到满足。",
+        "扩产很慢，所以突然增加的购买需求可能暂时得不到满足。"
+        f"\n\n{NOTE_ONLY_PHRASE}。",
         [evidence["passage_id"]],
     )
     assert saved["ok"] is True
@@ -91,6 +93,11 @@ def test_codex_tool_boundary_runs_the_complete_grounded_reading_workflow(
     assert "index_for_evidence: false" in note_text
     assert "《供给周期测试书》：供给周期" in note_text
     assert f"#^{evidence['passage_id']}]]" in note_text
+
+    note_only_search = tools.search_books(NOTE_ONLY_PHRASE, mode="quote", limit=2)
+    assert note_only_search["ok"] is True
+    assert note_only_search["count"] == 0
+    assert tools.database.keyword_search(NOTE_ONLY_PHRASE, 20) == []
 
     assert quoted["count"] <= MAX_PREVIEWS
     assert paraphrased["count"] <= MAX_PREVIEWS

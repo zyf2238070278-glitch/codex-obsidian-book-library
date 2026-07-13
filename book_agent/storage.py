@@ -5,6 +5,7 @@ import os
 import stat
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from itertools import chain
 from pathlib import Path
 from typing import Any
 
@@ -66,6 +67,14 @@ _HIT_COLUMNS = """
 """
 
 _SEARCHABLE_STATUSES_SQL = "('ready', 'keyword_only')"
+
+
+def _escape_like(value: str) -> str:
+    return value.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def _quote_fts_term(value: str) -> str:
+    return '"' + value.replace('"', '""') + '"'
 
 
 class Database:
@@ -329,52 +338,111 @@ class Database:
         limit: int,
         book_ids: Sequence[str] | None = None,
     ) -> list[SearchHit]:
+        """Search source passages and metadata using strict all-terms semantics.
+
+        Nonblank whitespace-delimited terms must all occur in the passage text or
+        all occur across that passage's title, author, and section metadata. Text
+        matches rank before metadata-only matches, and an adjacent exact phrase
+        ranks before separated multi-term text matches.
+        """
         normalized = query.strip()
         if not normalized or book_ids is not None and not book_ids:
             return []
         safe_limit = max(1, min(int(limit), 20))
+        terms = tuple(dict.fromkeys(normalized.split()))
+        exact_phrase = " ".join(terms)
+        exact_pattern = f"%{_escape_like(exact_phrase)}%"
+        fts_terms = [term for term in terms if len(term) >= 3]
+        like_terms = [term for term in terms if len(term) < 3]
 
-        if len(normalized) < 3:
-            escaped = (
-                normalized.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
-            )
-            sql = f"""
-                SELECT {_HIT_COLUMNS}
+        if fts_terms:
+            fts_expression = " AND ".join(_quote_fts_term(term) for term in fts_terms)
+            text_sql = f"""
+                SELECT {_HIT_COLUMNS}, bm25(passages_fts) AS rank,
+                       CASE WHEN p.text LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END
+                           AS exact_match
+                FROM passages_fts
+                JOIN passages AS p ON p.passage_id = passages_fts.passage_id
+                JOIN books AS b ON b.book_id = p.book_id
+                WHERE b.status IN {_SEARCHABLE_STATUSES_SQL}
+                  AND passages_fts MATCH ?
+            """
+            text_parameters: list[Any] = [exact_pattern, fts_expression]
+            for term in like_terms:
+                text_sql += " AND p.text LIKE ? ESCAPE '\\'"
+                text_parameters.append(f"%{_escape_like(term)}%")
+            text_order = " ORDER BY exact_match, rank, p.book_id, p.ordinal, p.passage_id"
+        else:
+            text_sql = f"""
+                SELECT {_HIT_COLUMNS},
+                       CASE WHEN p.text LIKE ? ESCAPE '\\' THEN 0 ELSE 1 END
+                           AS exact_match
                 FROM passages AS p
                 JOIN books AS b ON b.book_id = p.book_id
                 WHERE b.status IN {_SEARCHABLE_STATUSES_SQL}
-                  AND p.text LIKE ? ESCAPE '\\'
             """
-            parameters: list[Any] = [f"%{escaped}%"]
-            if book_ids is not None:
-                placeholders = ", ".join("?" for _ in book_ids)
-                sql += f" AND p.book_id IN ({placeholders})"
-                parameters.extend(book_ids)
-            sql += " ORDER BY p.book_id, p.ordinal LIMIT ?"
-            parameters.append(safe_limit)
-            with self._connection() as connection:
-                rows = connection.execute(sql, parameters).fetchall()
-            return [self._hit(row, 1.0) for row in rows]
+            text_parameters = [exact_pattern]
+            for term in terms:
+                text_sql += " AND p.text LIKE ? ESCAPE '\\'"
+                text_parameters.append(f"%{_escape_like(term)}%")
+            text_order = " ORDER BY exact_match, p.book_id, p.ordinal, p.passage_id"
 
-        phrase = '"' + normalized.replace('"', '""') + '"'
-        sql = f"""
-            SELECT {_HIT_COLUMNS}, bm25(passages_fts) AS rank
-            FROM passages_fts
-            JOIN passages AS p ON p.passage_id = passages_fts.passage_id
-            JOIN books AS b ON b.book_id = p.book_id
-            WHERE b.status IN {_SEARCHABLE_STATUSES_SQL}
-              AND passages_fts MATCH ?
-        """
-        parameters = [phrase]
         if book_ids is not None:
             placeholders = ", ".join("?" for _ in book_ids)
-            sql += f" AND p.book_id IN ({placeholders})"
-            parameters.extend(book_ids)
-        sql += " ORDER BY rank, p.book_id, p.ordinal LIMIT ?"
-        parameters.append(safe_limit)
+            text_sql += f" AND p.book_id IN ({placeholders})"
+            text_parameters.extend(book_ids)
+        text_sql += text_order + " LIMIT ?"
+        text_parameters.append(safe_limit)
+
+        metadata_conditions: list[str] = []
+        metadata_parameters: list[Any] = []
+        for term in terms:
+            metadata_conditions.append(
+                """(
+                    b.title LIKE ? ESCAPE '\\'
+                    OR COALESCE(b.author, '') LIKE ? ESCAPE '\\'
+                    OR COALESCE(p.section, '') LIKE ? ESCAPE '\\'
+                )"""
+            )
+            pattern = f"%{_escape_like(term)}%"
+            metadata_parameters.extend((pattern, pattern, pattern))
+        metadata_sql = f"""
+            SELECT {_HIT_COLUMNS}
+            FROM passages AS p
+            JOIN books AS b ON b.book_id = p.book_id
+            WHERE b.status IN {_SEARCHABLE_STATUSES_SQL}
+              AND {' AND '.join(metadata_conditions)}
+        """
+        if book_ids is not None:
+            placeholders = ", ".join("?" for _ in book_ids)
+            metadata_sql += f" AND p.book_id IN ({placeholders})"
+            metadata_parameters.extend(book_ids)
+        metadata_sql += " ORDER BY p.book_id, p.ordinal, p.passage_id LIMIT ?"
+        metadata_parameters.append(safe_limit)
+
         with self._connection() as connection:
-            rows = connection.execute(sql, parameters).fetchall()
-        return [self._hit(row, -float(row["rank"])) for row in rows]
+            text_rows = connection.execute(text_sql, text_parameters).fetchall()
+            metadata_rows = connection.execute(
+                metadata_sql, metadata_parameters
+            ).fetchall()
+
+        hits: list[SearchHit] = []
+        seen_passage_ids: set[str] = set()
+        text_candidates = (
+            ((row, -float(row["rank"])) for row in text_rows)
+            if fts_terms
+            else ((row, 1.0) for row in text_rows)
+        )
+        metadata_candidates = ((row, 0.5) for row in metadata_rows)
+        for row, score in chain(text_candidates, metadata_candidates):
+            passage_id = str(row["passage_id"])
+            if passage_id in seen_passage_ids:
+                continue
+            seen_passage_ids.add(passage_id)
+            hits.append(self._hit(row, score))
+            if len(hits) >= safe_limit:
+                break
+        return hits
 
     def get_passages(self, passage_ids: Sequence[str]) -> list[SearchHit]:
         requested = list(passage_ids)

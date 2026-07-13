@@ -39,6 +39,7 @@ def _render(
     source_file: str | Path,
     passages: Iterable[Passage],
 ) -> str:
+    display_title = " ".join(parsed.title.splitlines()).strip()
     lines = [
         "---",
         f"book_id: {_json_string(book_id)}",
@@ -48,7 +49,7 @@ def _render(
         "source_type: original",
         "---",
         "",
-        f"# {parsed.title}",
+        f"# {display_title}",
         "",
     ]
     for passage in passages:

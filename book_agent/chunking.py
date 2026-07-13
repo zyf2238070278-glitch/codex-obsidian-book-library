@@ -16,7 +16,6 @@ _CLOSING_PUNCTUATION = frozenset('"\'”’）)]】》」』')
 @dataclass(frozen=True)
 class _Fragment:
     text: str
-    separator: str
     section: str | None
     page_start: int | None
     page_end: int | None
@@ -55,6 +54,23 @@ def _split_oversized_paragraph(text: str, max_chars: int) -> list[str]:
     return pieces
 
 
+def _split_paragraph_with_boundary(
+    text: str, has_boundary: bool, max_chars: int
+) -> list[str]:
+    if not has_boundary or max_chars == 1:
+        return _split_oversized_paragraph(text, max_chars)
+
+    boundary = "\n\n" if max_chars >= 3 else "\n"
+    body_capacity = max_chars - len(boundary)
+    if len(text) > body_capacity:
+        body_end = _preferred_break(text, body_capacity)
+    else:
+        body_end = len(text)
+
+    first = boundary + text[:body_end]
+    return [first, *_split_oversized_paragraph(text[body_end:], max_chars)]
+
+
 def _fragments(parsed: ParsedBook, max_chars: int) -> list[_Fragment]:
     fragments: list[_Fragment] = []
     saw_paragraph = False
@@ -65,12 +81,13 @@ def _fragments(parsed: ParsedBook, max_chars: int) -> list[_Fragment]:
         for paragraph in paragraphs:
             if not paragraph:
                 continue
-            pieces = _split_oversized_paragraph(paragraph, max_chars)
-            for piece_index, piece in enumerate(pieces):
+            pieces = _split_paragraph_with_boundary(
+                paragraph, saw_paragraph, max_chars
+            )
+            for piece in pieces:
                 fragments.append(
                     _Fragment(
                         text=piece,
-                        separator="\n\n" if saw_paragraph and piece_index == 0 else "",
                         section=unit.section,
                         page_start=unit.page_start,
                         page_end=unit.page_end,
@@ -144,7 +161,7 @@ def chunk_book(
             current_text = fragment.text
             continue
 
-        addition = fragment.separator + fragment.text
+        addition = fragment.text
         combined_length = len(current_text) + len(addition)
         if combined_length > max_chars or not _should_add(
             len(current_text), combined_length, target_chars
@@ -163,9 +180,7 @@ def chunk_book(
     passages: list[Passage] = []
     rendered_path = str(markdown_path)
     for ordinal, group in enumerate(groups):
-        text = group[0].text + "".join(
-            fragment.separator + fragment.text for fragment in group[1:]
-        )
+        text = "".join(fragment.text for fragment in group)
         digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
         passage_id = hashlib.sha256(
             f"{book_id}:{ordinal}:{digest}".encode("utf-8")

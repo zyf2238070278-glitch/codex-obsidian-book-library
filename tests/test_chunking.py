@@ -48,9 +48,7 @@ def test_ordinary_chunks_preserve_paragraph_order_and_stay_under_maximum() -> No
 
     assert passages
     assert all(0 < len(passage.text) <= 18 for passage in passages)
-    assert "\n\n".join(passage.text for passage in passages) == "\n\n".join(
-        paragraphs
-    )
+    assert "".join(passage.text for passage in passages) == "\n\n".join(paragraphs)
     assert all(
         left.text != right.text for left, right in zip(passages, passages[1:])
     )
@@ -61,7 +59,10 @@ def test_blank_line_separator_is_counted_exactly_at_maximum() -> None:
 
     passages = chunk_book("book", parsed, "book.md", target_chars=10, max_chars=10)
 
-    assert [passage.text for passage in passages] == ["甲乙丙丁\n\n戊己庚辛", "壬癸"]
+    assert [passage.text for passage in passages] == [
+        "甲乙丙丁\n\n戊己庚辛",
+        "\n\n壬癸",
+    ]
     assert len(passages[0].text) == 10
 
 
@@ -86,6 +87,43 @@ def test_one_oversized_paragraph_is_split_without_losing_text(text: str) -> None
     assert all(passage.section == "长段落" for passage in passages)
 
 
+def test_oversized_paragraph_then_new_paragraph_preserves_the_real_boundary() -> None:
+    text = "AAAABBBB\n\nCCCC"
+
+    passages = chunk_book(
+        "book",
+        _book(SourceUnit(text=text)),
+        "book.md",
+        target_chars=4,
+        max_chars=4,
+    )
+
+    assert "".join(passage.text for passage in passages) == text
+    assert all(0 < len(passage.text) <= 4 for passage in passages)
+    assert all(passage.text.strip() for passage in passages)
+
+
+@pytest.mark.parametrize("limit", [1, 2])
+def test_tiny_limits_preserve_body_characters_without_whitespace_passages(
+    limit: int,
+) -> None:
+    text = "AABB\n\nCC"
+
+    passages = chunk_book(
+        "book",
+        _book(SourceUnit(text=text)),
+        "book.md",
+        target_chars=limit,
+        max_chars=limit,
+    )
+
+    rebuilt = "".join(passage.text for passage in passages)
+    assert rebuilt in {"AABBCC", "AABB\nCC"}
+    assert rebuilt.replace("\n", "") == "AABBCC"
+    assert all(0 < len(passage.text) <= limit for passage in passages)
+    assert all(passage.text.strip() for passage in passages)
+
+
 def test_long_paragraph_prefers_newline_or_sentence_boundaries() -> None:
     text = "甲" * 16 + "。" + "乙" * 15 + "\n" + "丙" * 30
 
@@ -108,7 +146,7 @@ def test_section_change_forces_a_passage_boundary() -> None:
 
     assert [(passage.section, passage.text) for passage in passages] == [
         ("第一章", "第一章甲。\n\n第一章乙。"),
-        ("第二章", "第二章甲。\n\n第二章乙。"),
+        ("第二章", "\n\n第二章甲。\n\n第二章乙。"),
     ]
 
 
@@ -142,7 +180,7 @@ def test_pdf_chunks_can_span_adjacent_pages_and_preserve_metadata_order() -> Non
 
     assert [passage.text for passage in passages] == [
         "第三页内容。\n\n第四页内容。",
-        "第五页新章。",
+        "\n\n第五页新章。",
     ]
     assert (
         passages[0].page_start,

@@ -95,6 +95,32 @@ def test_render_includes_locations_page_ranges_and_each_anchor_once(
     assert content.index("跨页原文。") < content.index("无位置原文。")
 
 
+def test_render_collapses_title_line_breaks_in_the_h1_only(tmp_path: Path) -> None:
+    destination = tmp_path / "book.md"
+    parsed = ParsedBook(
+        title="标题\n## 伪章节",
+        author=None,
+        source_format="txt",
+        units=(),
+    )
+
+    rendering.render_parsed_book(
+        destination,
+        "book-1",
+        parsed,
+        "source.txt",
+        [_passage(0, "正文。")],
+    )
+
+    content = destination.read_text(encoding="utf-8")
+    assert f"title: {json.dumps(parsed.title, ensure_ascii=False)}" in content
+    assert "# 标题 ## 伪章节\n" in content
+    assert "\n## 伪章节\n" not in content
+    assert [line for line in content.splitlines() if line.startswith("# ")] == [
+        "# 标题 ## 伪章节"
+    ]
+
+
 def test_render_atomically_replaces_an_existing_destination(tmp_path: Path) -> None:
     destination = tmp_path / "book.md"
     destination.write_text("旧文件内容", encoding="utf-8")

@@ -86,7 +86,8 @@ class VaultManager:
 
     def _open_source(self, source: Path) -> tuple[Path, int, os.stat_result]:
         try:
-            source_path = Path(source).expanduser().resolve(strict=True)
+            expanded_source = Path(source).expanduser()
+            source_path = Path(os.path.abspath(os.fspath(expanded_source)))
         except (OSError, RuntimeError, TypeError) as exc:
             raise ValueError(f"Source file is unavailable: {source}") from exc
 
@@ -260,6 +261,25 @@ class VaultManager:
                 temp_fd,
                 ns=(source_info.st_atime_ns, source_info.st_mtime_ns),
             )
+            temp_after_copy = os.fstat(temp_fd)
+            source_after_copy = os.fstat(source_fd)
+            if temp_after_copy.st_size != source_info.st_size:
+                raise ValueError("Copied file size does not match source")
+            source_snapshot = (
+                source_info.st_dev,
+                source_info.st_ino,
+                source_info.st_size,
+                source_info.st_mtime_ns,
+            )
+            current_source = (
+                source_after_copy.st_dev,
+                source_after_copy.st_ino,
+                source_after_copy.st_size,
+                source_after_copy.st_mtime_ns,
+            )
+            if current_source != source_snapshot:
+                raise ValueError("Source changed while it was being copied")
+            os.fsync(temp_fd)
         except Exception as exc:
             raise ValueError(f"Could not copy source during atomic import: {source}") from exc
 

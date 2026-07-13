@@ -182,6 +182,95 @@ def test_import_requires_existing_regular_source(
     assert list(paths.originals.iterdir()) == []
 
 
+def test_import_rejects_source_symlink(tmp_path: Path) -> None:
+    paths = AppPaths.from_root(tmp_path / "project")
+    paths.root.mkdir()
+    manager = VaultManager(paths)
+    manager.ensure_layout()
+    target = _source(tmp_path, "source", "target.txt", "content")
+    source_symlink = tmp_path / "book.txt"
+    source_symlink.symlink_to(target)
+
+    with pytest.raises(ValueError, match="Source"):
+        manager.import_original(source_symlink)
+
+    assert list(paths.inbox.iterdir()) == []
+    assert list(paths.originals.iterdir()) == []
+
+
+def test_import_fsyncs_complete_temp_before_publishing(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = AppPaths.from_root(tmp_path / "project")
+    paths.root.mkdir()
+    manager = VaultManager(paths)
+    manager.ensure_layout()
+    source = _source(tmp_path, "source", "book.txt", "content")
+    synced_files: list[tuple[int, int]] = []
+    original_fsync = os.fsync
+
+    def record_fsync(file_descriptor: int) -> None:
+        original_fsync(file_descriptor)
+        file_info = os.fstat(file_descriptor)
+        synced_files.append((file_info.st_dev, file_info.st_ino))
+
+    monkeypatch.setattr(os, "fsync", record_fsync)
+
+    imported = manager.import_original(source)
+
+    imported_info = imported.stat()
+    assert (imported_info.st_dev, imported_info.st_ino) in synced_files
+    assert imported.read_text(encoding="utf-8") == "content"
+    assert list(paths.inbox.iterdir()) == []
+
+
+def test_silent_short_copy_is_not_published(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = AppPaths.from_root(tmp_path / "project")
+    paths.root.mkdir()
+    manager = VaultManager(paths)
+    manager.ensure_layout()
+    source = _source(tmp_path, "source", "book.txt", "0123456789abcdef")
+
+    def copy_one_byte(source_stream: object, target_stream: object) -> None:
+        target_stream.write(source_stream.read(1))
+
+    monkeypatch.setattr(shutil, "copyfileobj", copy_one_byte)
+
+    with pytest.raises(ValueError, match="copy|size"):
+        manager.import_original(source)
+
+    assert list(paths.inbox.iterdir()) == []
+    assert list(paths.originals.iterdir()) == []
+
+
+def test_source_change_during_copy_is_not_published(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths = AppPaths.from_root(tmp_path / "project")
+    paths.root.mkdir()
+    manager = VaultManager(paths)
+    manager.ensure_layout()
+    source = _source(tmp_path, "source", "book.txt", "original")
+    original_copy = shutil.copyfileobj
+
+    def copy_then_change(source_stream: object, target_stream: object) -> None:
+        original_copy(source_stream, target_stream)
+        source.write_text("changed while copying", encoding="utf-8")
+
+    monkeypatch.setattr(shutil, "copyfileobj", copy_then_change)
+
+    with pytest.raises(ValueError, match="copy|changed"):
+        manager.import_original(source)
+
+    assert list(paths.inbox.iterdir()) == []
+    assert list(paths.originals.iterdir()) == []
+
+
 def test_copy_failure_leaves_no_temp_or_partial_final(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,

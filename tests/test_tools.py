@@ -1,3 +1,4 @@
+import inspect
 import json
 import math
 from pathlib import Path
@@ -112,6 +113,21 @@ def test_real_txt_workflow_is_json_safe_and_preserves_content_boundaries(
         duplicate,
     ):
         assert _json_round_trip(payload) == payload
+
+
+def test_import_facade_names_codex_attachment_path_explicitly(
+    library: LibraryTools,
+    tmp_path: Path,
+) -> None:
+    source = _write_chinese_book(tmp_path / "Codex附件.txt")
+
+    result = library.import_book(file_path=str(source))
+    signature = inspect.signature(LibraryTools.import_book)
+
+    assert result["ok"] is True
+    assert "file_path" in signature.parameters
+    assert "source" not in signature.parameters
+    assert _json_round_trip(result) == result
 
 
 def test_library_status_reports_actionable_issues_without_book_text(

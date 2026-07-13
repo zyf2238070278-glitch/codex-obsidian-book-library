@@ -2,9 +2,10 @@ from __future__ import annotations
 
 import os
 from pathlib import Path
-from typing import Any, Optional
+from typing import Annotated, Any, Optional
 
 from mcp.server.fastmcp import FastMCP
+from pydantic import Field
 
 from book_agent.config import MAX_PREVIEWS
 from book_agent.tools import build_tools
@@ -23,16 +24,26 @@ ROOT = Path(os.environ.get("BOOK_LIBRARY_ROOT", os.getcwd())).expanduser().resol
 library_tools = build_tools(ROOT)
 mcp = FastMCP("local-book-library")
 
+CodexAttachmentPath = Annotated[
+    str,
+    Field(
+        description=(
+            "The absolute local filesystem path of the book attachment uploaded in "
+            "Codex."
+        )
+    ),
+]
+
 
 @mcp.tool()
 def import_book(
-    source: str,
+    file_path: CodexAttachmentPath,
     title: Optional[str] = None,
     author: Optional[str] = None,
 ) -> dict[str, Any]:
-    """Import a local TXT, Markdown, EPUB, or PDF book into the managed library."""
+    """Import a Codex book attachment using its absolute local filesystem path."""
 
-    return library_tools.import_book(source, title=title, author=author)
+    return library_tools.import_book(file_path, title=title, author=author)
 
 
 @mcp.tool()

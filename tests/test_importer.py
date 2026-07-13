@@ -1,7 +1,9 @@
 import hashlib
 import json
+from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from dataclasses import FrozenInstanceError
 from pathlib import Path
+from threading import Event, Lock
 
 import fitz
 import numpy as np
@@ -354,6 +356,182 @@ def test_available_provider_marks_ready_and_persists_every_embedding(
             decode_vector(payload),
             np.array([ordinal, ordinal + 0.5, ordinal + 1.0], dtype=np.float32),
         )
+
+
+def test_keyword_only_reimport_with_available_provider_recovers_embeddings(
+    app: tuple[AppPaths, Database], tmp_path: Path
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / "recover-keyword-only.txt", marker="恢复语义索引")
+    first = ImportService(paths, database, NullEmbeddingProvider()).import_book(source)
+    assert first.parsed_path is not None
+    Path(first.parsed_path).unlink()
+    original_count = len(list(paths.originals.iterdir()))
+    provider = _ReadyEmbeddingProvider()
+
+    recovered = ImportService(paths, database, provider).import_book(source)
+
+    assert first.status == "keyword_only"
+    assert recovered.status == "ready"
+    assert recovered.book_id == first.book_id
+    assert recovered.original_path == first.original_path
+    assert recovered.parsed_path == first.parsed_path
+    assert Path(recovered.parsed_path).is_file()
+    assert recovered.passage_count == first.passage_count == len(provider.received)
+    assert database.get_book(first.book_id)["status"] == "ready"
+    assert len(list(database.iter_embeddings([first.book_id]))) == first.passage_count
+    assert len(list(paths.originals.iterdir())) == original_count
+    assert len(database.list_books()) == 1
+
+
+def test_failed_reimport_retries_pipeline_without_copying_original_again(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / "recover-failed.txt", marker="失败后恢复")
+    real_parse = importer_module.parse_document
+
+    def fail_once(*args, **kwargs):
+        raise RuntimeError("temporary parser failure")
+
+    monkeypatch.setattr(importer_module, "parse_document", fail_once)
+    first = ImportService(paths, database, NullEmbeddingProvider()).import_book(source)
+    monkeypatch.setattr(importer_module, "parse_document", real_parse)
+    original_count = len(list(paths.originals.iterdir()))
+
+    recovered = ImportService(paths, database, NullEmbeddingProvider()).import_book(
+        source
+    )
+
+    assert first.status == "failed"
+    assert recovered.status == "keyword_only"
+    assert recovered.book_id == first.book_id
+    assert recovered.original_path == first.original_path
+    assert recovered.passage_count > 0
+    assert database.keyword_search("失败后恢复", 5)
+    assert len(list(paths.originals.iterdir())) == original_count
+    assert len(database.list_books()) == 1
+
+
+def test_failed_reimport_restores_a_missing_managed_original_from_supplied_file(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / "restore-original.txt", marker="恢复原书")
+    real_parse = importer_module.parse_document
+
+    def fail_once(*args, **kwargs):
+        raise RuntimeError("temporary parser failure")
+
+    monkeypatch.setattr(importer_module, "parse_document", fail_once)
+    first = ImportService(paths, database, NullEmbeddingProvider()).import_book(source)
+    missing_original = Path(first.original_path)
+    missing_original.unlink()
+    monkeypatch.setattr(importer_module, "parse_document", real_parse)
+
+    recovered = ImportService(paths, database, NullEmbeddingProvider()).import_book(
+        source
+    )
+
+    persisted = database.get_book(first.book_id)
+    assert first.status == "failed"
+    assert recovered.status == "keyword_only"
+    assert recovered.book_id == first.book_id
+    assert Path(recovered.original_path).is_file()
+    assert Path(recovered.original_path).read_bytes() == source.read_bytes()
+    assert persisted["original_path"] == recovered.original_path
+    assert len(list(paths.originals.iterdir())) == 1
+    assert len(database.list_books()) == 1
+
+
+def test_processing_reimport_finishes_committed_passages_after_status_failure(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / "recover-processing.txt", marker="处理中恢复")
+    real_update = database.update_book_status
+
+    def always_fail(*args, **kwargs) -> None:
+        raise OSError("status database unavailable")
+
+    monkeypatch.setattr(database, "update_book_status", always_fail)
+    first = ImportService(paths, database, NullEmbeddingProvider()).import_book(source)
+    monkeypatch.setattr(database, "update_book_status", real_update)
+    original_count = len(list(paths.originals.iterdir()))
+
+    recovered = ImportService(paths, database, NullEmbeddingProvider()).import_book(
+        source
+    )
+
+    assert first.status == "processing"
+    assert first.passage_count > 0
+    assert recovered.status == "keyword_only"
+    assert recovered.book_id == first.book_id
+    assert recovered.original_path == first.original_path
+    assert recovered.passage_count == first.passage_count
+    assert database.get_book(first.book_id)["status"] == "keyword_only"
+    assert database.keyword_search("处理中恢复", 5)
+    assert len(list(paths.originals.iterdir())) == original_count
+    assert len(database.list_books()) == 1
+
+
+def test_same_hash_imports_are_serialized_until_the_first_status_is_final(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / "concurrent.txt", marker="并发状态安全")
+    real_parse = importer_module.parse_document
+    first_parse_entered = Event()
+    release_first_parse = Event()
+    second_import_entered = Event()
+    counter_lock = Lock()
+    parse_calls = 0
+
+    def hold_first_parse(*args, **kwargs):
+        nonlocal parse_calls
+        with counter_lock:
+            parse_calls += 1
+            call_number = parse_calls
+        if call_number == 1:
+            first_parse_entered.set()
+            if not release_first_parse.wait(timeout=5):
+                raise TimeoutError("test did not release first parse")
+        return real_parse(*args, **kwargs)
+
+    monkeypatch.setattr(importer_module, "parse_document", hold_first_parse)
+    first_service = ImportService(paths, database, _ReadyEmbeddingProvider())
+    second_service = ImportService(paths, database, _ReadyEmbeddingProvider())
+
+    def import_second() -> ImportResult:
+        second_import_entered.set()
+        return second_service.import_book(source)
+
+    with ThreadPoolExecutor(max_workers=2) as pool:
+        first_future = pool.submit(first_service.import_book, source)
+        assert first_parse_entered.wait(timeout=5)
+        second_future = pool.submit(import_second)
+        assert second_import_entered.wait(timeout=5)
+        try:
+            with pytest.raises(FutureTimeoutError):
+                second_future.result(timeout=0.2)
+        finally:
+            release_first_parse.set()
+        first = first_future.result(timeout=5)
+        second = second_future.result(timeout=5)
+
+    assert first.status == "ready"
+    assert second.status == "duplicate"
+    assert parse_calls == 1
+    assert len(database.list_books()) == 1
+    assert len(list(paths.originals.iterdir())) == 1
 
 
 @pytest.mark.parametrize(

@@ -168,6 +168,19 @@ class Database:
                 (title, author, book_id),
             )
 
+    def update_book_original_path(self, book_id: str, original_path: str) -> None:
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE books
+                SET original_path = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE book_id = ?
+                """,
+                (original_path, book_id),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError(f"Unknown book_id: {book_id}")
+
     def find_book_by_hash(self, content_sha256: str) -> dict[str, Any] | None:
         with self._connection() as connection:
             row = connection.execute(

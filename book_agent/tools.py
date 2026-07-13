@@ -107,14 +107,14 @@ class LibraryTools:
 
     def import_book(
         self,
-        source: str,
+        file_path: str,
         title: str | None = None,
         author: str | None = None,
     ) -> dict[str, Any]:
-        """Import one supported local document into the managed library."""
+        """Import a book from the absolute local path of a Codex attachment."""
 
         def operation() -> dict[str, Any]:
-            result = self.importer.import_book(source, title=title, author=author)
+            result = self.importer.import_book(file_path, title=title, author=author)
             return {"ok": True, **result.to_dict()}
 
         return self._guard(operation)

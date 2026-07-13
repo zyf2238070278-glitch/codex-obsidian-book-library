@@ -1,11 +1,13 @@
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import os
 import stat
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Iterator
 
 import numpy as np
 
@@ -78,18 +80,44 @@ class ImportService:
         author: str | None = None,
     ) -> ImportResult:
         source_path, suffix = self._validate_source(source)
-        source_format = suffix.removeprefix(".")
         try:
             content_hash = sha256_file(source_path)
         except OSError as error:
             raise ValueError(f"无法读取待导入文件：{source_path}") from error
         book_id = content_hash[:24]
 
+        self.vault.ensure_layout()
+        with self._book_lock(book_id):
+            return self._import_locked(
+                source_path=source_path,
+                suffix=suffix,
+                content_hash=content_hash,
+                book_id=book_id,
+                title=title,
+                author=author,
+            )
+
+    def _import_locked(
+        self,
+        *,
+        source_path: Path,
+        suffix: str,
+        content_hash: str,
+        book_id: str,
+        title: str | None,
+        author: str | None,
+    ) -> ImportResult:
+        source_format = suffix.removeprefix(".")
         duplicate = self.database.find_book_by_hash(content_hash)
         if duplicate is not None:
-            return self._duplicate_result(duplicate)
+            return self._existing_result(
+                duplicate,
+                source_path=source_path,
+                content_hash=content_hash,
+                title=title,
+                author=author,
+            )
 
-        self.vault.ensure_layout()
         original = self.vault.import_original(source_path)
         try:
             original_path = str(original.absolute())
@@ -99,9 +127,14 @@ class ImportService:
                 book_id = content_hash[:24]
                 duplicate = self.database.find_book_by_hash(content_hash)
                 if duplicate is not None:
-                    duplicate_result = self._duplicate_result(duplicate)
                     self._remove_imported_original(original)
-                    return duplicate_result
+                    return self._existing_result(
+                        duplicate,
+                        source_path=source_path,
+                        content_hash=content_hash,
+                        title=title,
+                        author=author,
+                    )
             initial_title = source_path.stem if title is None else title
         except BaseException as ownership_error:
             self._cleanup_unregistered_original(
@@ -128,6 +161,91 @@ class ImportService:
             )
             raise
 
+        return self._process_registered_book(
+            book_id=book_id,
+            source_format=source_format,
+            original=original,
+            original_path=original_path,
+            title=title,
+            author=author,
+        )
+
+    def _existing_result(
+        self,
+        existing: dict[str, Any],
+        *,
+        source_path: Path,
+        content_hash: str,
+        title: str | None,
+        author: str | None,
+    ) -> ImportResult:
+        status = str(existing["status"])
+        if status == "keyword_only" and not self.embedding_provider.available:
+            return self._duplicate_result(existing)
+        if status not in {"keyword_only", "failed", "processing"}:
+            return self._duplicate_result(existing)
+
+        book_id = str(existing["book_id"])
+        original, original_path = self._recovery_original(
+            existing,
+            supplied_source=source_path,
+            content_hash=content_hash,
+        )
+        self.database.update_book_status(book_id, "processing")
+        recovery_title = str(existing["title"]) if title is None else title
+        recovery_author = existing.get("author") if author is None else author
+        return self._process_registered_book(
+            book_id=book_id,
+            source_format=str(existing["source_format"]),
+            original=original,
+            original_path=original_path,
+            title=recovery_title,
+            author=recovery_author,
+        )
+
+    def _recovery_original(
+        self,
+        existing: dict[str, Any],
+        *,
+        supplied_source: Path,
+        content_hash: str,
+    ) -> tuple[Path, str]:
+        configured = Path(str(existing["original_path"]))
+        try:
+            original, _ = self._validate_source(configured)
+            if original.parent != self.paths.originals.absolute():
+                raise ValueError("原书不在受管书库目录中。")
+            if sha256_file(original) != content_hash:
+                raise ValueError("受管原书内容与数据库哈希不一致。")
+        except (OSError, ValueError):
+            restored = self.vault.import_original(supplied_source)
+            try:
+                if sha256_file(restored) != content_hash:
+                    raise ValueError("待恢复文件在导入期间发生变化。")
+                restored_path = str(restored.absolute())
+                self.database.update_book_original_path(
+                    str(existing["book_id"]), restored_path
+                )
+            except BaseException as restore_error:
+                self._cleanup_unregistered_original(
+                    restored,
+                    restore_error,
+                    "恢复原书失败后无法清理刚复制的文件",
+                )
+                raise
+            return restored, restored_path
+        return original, str(original.absolute())
+
+    def _process_registered_book(
+        self,
+        *,
+        book_id: str,
+        source_format: str,
+        original: Path,
+        original_path: str,
+        title: str | None,
+        author: str | None,
+    ) -> ImportResult:
         parsed_path: str | None = None
         passage_count = 0
         try:
@@ -192,6 +310,35 @@ class ImportService:
                     "记录导入中断状态时失败：" + _error_detail(status_error)
                 )
             raise
+
+    @contextmanager
+    def _book_lock(self, book_id: str) -> Iterator[None]:
+        lock_directory = self.paths.database.parent / ".import-locks"
+        lock_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
+        directory_info = lock_directory.lstat()
+        if stat.S_ISLNK(directory_info.st_mode) or not stat.S_ISDIR(
+            directory_info.st_mode
+        ):
+            raise ValueError(f"导入锁目录不安全：{lock_directory}")
+
+        flags = (
+            os.O_CREAT
+            | os.O_RDWR
+            | getattr(os, "O_CLOEXEC", 0)
+            | getattr(os, "O_NOFOLLOW", 0)
+        )
+        try:
+            descriptor = os.open(lock_directory / f"{book_id}.lock", flags, 0o600)
+        except OSError as error:
+            raise ValueError(f"无法创建书籍导入锁：{book_id}") from error
+        try:
+            lock_info = os.fstat(descriptor)
+            if not stat.S_ISREG(lock_info.st_mode):
+                raise ValueError(f"书籍导入锁不是普通文件：{book_id}")
+            fcntl.flock(descriptor, fcntl.LOCK_EX)
+            yield
+        finally:
+            os.close(descriptor)
 
     @staticmethod
     def _validate_source(source: str | Path) -> tuple[Path, str]:

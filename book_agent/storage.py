@@ -92,10 +92,18 @@ class Database:
 
     def connect(self) -> sqlite3.Connection:
         with self._safe_parent(create=False) as directory_fd:
-            self._reject_unsafe_leaf(directory_fd, allow_missing=True)
+            before_open = self._inspect_safe_leaf(directory_fd, allow_missing=True)
             connection = sqlite3.connect(self.path)
             try:
-                self._reject_unsafe_leaf(directory_fd, allow_missing=False)
+                after_open = self._inspect_safe_leaf(directory_fd, allow_missing=False)
+                if before_open is not None and (
+                    before_open.st_dev,
+                    before_open.st_ino,
+                ) != (
+                    after_open.st_dev,
+                    after_open.st_ino,
+                ):
+                    raise ValueError("Database file changed while it was being opened")
             except BaseException:
                 connection.close()
                 raise
@@ -113,7 +121,12 @@ class Database:
         ) as (_, directory_fd):
             yield directory_fd
 
-    def _reject_unsafe_leaf(self, directory_fd: int, *, allow_missing: bool) -> None:
+    def _inspect_safe_leaf(
+        self,
+        directory_fd: int,
+        *,
+        allow_missing: bool,
+    ) -> os.stat_result | None:
         try:
             leaf_info = os.stat(
                 self.path.name,
@@ -122,7 +135,7 @@ class Database:
             )
         except FileNotFoundError:
             if allow_missing:
-                return
+                return None
             raise ValueError("Database file was not created safely") from None
         except OSError as exc:
             raise ValueError("Database file cannot be inspected safely") from exc
@@ -130,6 +143,9 @@ class Database:
             raise ValueError("Database file must not be a symlink")
         if not stat.S_ISREG(leaf_info.st_mode):
             raise ValueError("Database path must be a regular file")
+        if leaf_info.st_nlink != 1:
+            raise ValueError("Database file must not have hard-link aliases")
+        return leaf_info
 
     @contextmanager
     def _connection(self) -> Iterator[sqlite3.Connection]:
@@ -142,7 +158,7 @@ class Database:
 
     def initialize(self) -> None:
         with self._safe_parent(create=True) as directory_fd:
-            self._reject_unsafe_leaf(directory_fd, allow_missing=True)
+            self._inspect_safe_leaf(directory_fd, allow_missing=True)
         try:
             with self._connection() as connection:
                 connection.executescript(_SCHEMA)

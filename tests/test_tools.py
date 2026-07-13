@@ -133,7 +133,7 @@ def test_import_facade_names_codex_attachment_path_explicitly(
 def test_library_status_reports_actionable_issues_without_book_text(
     library: LibraryTools,
 ) -> None:
-    for status in ("processing", "needs_ocr", "failed"):
+    for status in ("processing", "keyword_only", "needs_ocr", "failed"):
         library.database.create_book(
             book_id=f"book-{status}",
             title=f"书-{status}",
@@ -148,9 +148,10 @@ def test_library_status_reports_actionable_issues_without_book_text(
     report = library.library_status()
 
     assert report["ok"] is True
-    assert report["counts"]["books"] == 3
+    assert report["counts"]["books"] == 4
     assert {issue["status"] for issue in report["issues"]} == {
         "processing",
+        "keyword_only",
         "needs_ocr",
         "failed",
     }
@@ -162,6 +163,14 @@ def test_library_status_reports_actionable_issues_without_book_text(
     for book in report["books"]:
         assert "text" not in book
         assert "embedding" not in book
+
+    keyword_issue = next(
+        issue for issue in report["issues"] if issue["status"] == "keyword_only"
+    )
+    assert keyword_issue["action"] == (
+        "恢复顺序：下载模型 → 重新加载 Codex/MCP → 重新导入同一文件；"
+        "完成后会补建语义向量。"
+    )
 
 
 def test_search_caps_results_and_normalizes_non_finite_scores(

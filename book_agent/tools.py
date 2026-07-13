@@ -29,7 +29,10 @@ _BOOK_FIELDS = (
 )
 _ISSUE_ACTIONS = {
     "processing": "等待导入完成；若长期停留，请检查源文件后重新导入。",
-    "keyword_only": "当前可使用关键词检索；配置完整本地 E5 模型后重新导入可启用语义检索。",
+    "keyword_only": (
+        "恢复顺序：下载模型 → 重新加载 Codex/MCP → 重新导入同一文件；"
+        "完成后会补建语义向量。"
+    ),
     "needs_ocr": "请先对原文件执行 OCR，再重新导入。",
     "failed": "请根据 error 修复源文件或本地依赖后重新导入。",
 }

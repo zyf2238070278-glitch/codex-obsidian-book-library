@@ -109,7 +109,7 @@ def test_epub_body_extraction_removes_noise_and_preserves_dom_order(
                 <p>段落一 <span>重点</span></p>
                 <nav><p>导航噪声</p></nav>
                 <ul>
-                  <li>条目一<ul><li>子条目</li></ul></li>
+                  <li>before<ul><li>inner</li></ul>after</li>
                 </ul>
                 <p>段落二</p>
                 """,
@@ -121,7 +121,9 @@ def test_epub_body_extraction_removes_noise_and_preserves_dom_order(
 
     assert len(book.units) == 1
     assert book.units[0].section == "结构化内容"
-    assert book.units[0].text == "段落一 重点\n\n条目一\n\n子条目\n\n段落二"
+    assert book.units[0].text == (
+        "段落一 重点\n\nbefore\n\ninner\n\nafter\n\n段落二"
+    )
     assert "脚本噪声" not in book.units[0].text
     assert "导航噪声" not in book.units[0].text
 

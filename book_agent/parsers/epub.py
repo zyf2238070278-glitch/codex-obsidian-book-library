@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import ebooklib
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup
 from ebooklib import epub
 
 from book_agent.models import ParsedBook, SourceUnit
@@ -27,15 +27,33 @@ def _spine_item(book: epub.EpubBook, entry: Any) -> Any:
     return entry
 
 
-def _block_text(block: Tag) -> str:
-    parts = []
-    for text_node in block.find_all(string=True):
-        if text_node.find_parent(["p", "li"]) is not block:
+def _body_blocks(soup: BeautifulSoup) -> list[str]:
+    blocks = []
+    current_block_id = None
+    current_parts = []
+
+    def flush() -> None:
+        nonlocal current_parts
+        if current_parts:
+            blocks.append(" ".join(current_parts))
+            current_parts = []
+
+    for text_node in soup.find_all(string=True):
+        block = text_node.find_parent(["p", "li"])
+        if block is None:
             continue
         normalized = " ".join(str(text_node).split())
-        if normalized:
-            parts.append(normalized)
-    return " ".join(parts)
+        if not normalized:
+            continue
+
+        block_id = id(block)
+        if block_id != current_block_id:
+            flush()
+            current_block_id = block_id
+        current_parts.append(normalized)
+
+    flush()
+    return blocks
 
 
 def _source_unit(item: Any) -> Optional[SourceUnit]:
@@ -55,11 +73,7 @@ def _source_unit(item: Any) -> Optional[SourceUnit]:
             section = heading_text
             break
 
-    blocks = []
-    for block in soup.find_all(["p", "li"]):
-        block_text = _block_text(block)
-        if block_text:
-            blocks.append(block_text)
+    blocks = _body_blocks(soup)
     if not blocks:
         return None
 

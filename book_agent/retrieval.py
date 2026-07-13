@@ -67,9 +67,18 @@ class Retriever:
         passage_ids: Sequence[str],
         neighbor_count: int = 1,
     ) -> list[dict[str, object]]:
+        if isinstance(passage_ids, (str, bytes)) or not isinstance(
+            passage_ids, Sequence
+        ):
+            raise ValueError("passage_ids 必须是字符串 ID 的序列，不能是 str/bytes。")
         raw_ids = list(passage_ids)
         if not 1 <= len(raw_ids) <= MAX_FULL_PASSAGES:
             raise ValueError(f"passage_ids 必须包含 1 到 {MAX_FULL_PASSAGES} 个 ID。")
+        if any(
+            not isinstance(passage_id, str) or not passage_id.strip()
+            for passage_id in raw_ids
+        ):
+            raise ValueError("passage_ids 中每个 ID 必须是非空白字符串。")
         if type(neighbor_count) is not int or neighbor_count not in (0, 1):
             raise ValueError("neighbor_count 必须是整数 0 或 1。")
 

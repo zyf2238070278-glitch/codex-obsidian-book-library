@@ -117,6 +117,33 @@ def test_rejects_empty_too_many_and_unknown_passage_ids(db: Database) -> None:
         retriever.get_passages(["known", "known", "missing"])
 
 
+@pytest.mark.parametrize("passage_ids", ["abc", b"abc", None])
+def test_passage_ids_rejects_string_bytes_and_non_sequence_containers(
+    db: Database, passage_ids: object
+) -> None:
+    with pytest.raises(ValueError, match="passage_ids|ID"):
+        _retriever(db).get_passages(passage_ids)  # type: ignore[arg-type]
+
+
+@pytest.mark.parametrize("invalid_id", [1, None, "", " \t\n"])
+def test_passage_ids_rejects_non_string_and_blank_elements(
+    db: Database, invalid_id: object
+) -> None:
+    with pytest.raises(ValueError, match="passage_ids|ID"):
+        _retriever(db).get_passages([invalid_id])  # type: ignore[list-item]
+
+
+@pytest.mark.parametrize("passage_ids", [["known"], ("known",)])
+def test_passage_ids_keeps_normal_list_and_tuple_inputs(
+    db: Database, passage_ids: Sequence[str]
+) -> None:
+    _add_book(db, "known-inputs", [_passage("known", "known-inputs", 0, "正文")])
+
+    evidence = _retriever(db).get_passages(passage_ids, neighbor_count=0)
+
+    assert [item["passage_id"] for item in evidence] == ["known"]
+
+
 @pytest.mark.parametrize("neighbor_count", [True, False, 1.0, -1, 2, None, "1"])
 def test_neighbor_count_must_be_the_strict_integer_zero_or_one(
     db: Database, neighbor_count: object

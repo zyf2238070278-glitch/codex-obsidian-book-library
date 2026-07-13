@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+import codecs
 import hashlib
 import json
 import os
@@ -11,7 +12,7 @@ import tempfile
 import unicodedata
 import zipfile
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Iterable, Mapping
 
 
@@ -94,7 +95,18 @@ SQLITE_FILE_SUFFIXES = tuple(
     for sidecar_suffix in ("", "-journal", "-shm", "-wal")
 )
 FORBIDDEN_FILE_SUFFIXES = (".epub", ".pdf", *SQLITE_FILE_SUFFIXES)
-TEXT_PATH_MARKERS = (b"/Users/", b"/home/", b"C:\\Users\\")
+TEXT_PATH_MARKERS = (b"/Users/", b"/home/")
+WINDOWS_PRIVATE_PATH_PATTERN = re.compile(
+    rb"(?<![A-Za-z0-9])[A-Za-z]:[\\/]Users[\\/]",
+    re.IGNORECASE,
+)
+BINARY_PAYLOAD_PATHS = frozenset(
+    {
+        "bin/uv",
+        "data/models/model.safetensors",
+        "data/models/sentencepiece.bpe.model",
+    }
+)
 GENERIC_ACCOUNT_NAMES = frozenset(
     {
         "admin",
@@ -134,6 +146,12 @@ class ReleaseBuildError(ValueError):
 class BuildResult:
     archive: Path
     checksums: Path
+
+
+@dataclass(frozen=True)
+class ModelFileSpec:
+    size: int
+    sha256: str
 
 
 def _sha256_file(path: Path) -> str:
@@ -181,19 +199,14 @@ def _privacy_markers(private_paths: Iterable[Path | str]) -> tuple[bytes, ...]:
     return tuple(markers)
 
 
-def _looks_binary(path_hint: str, first_chunk: bytes) -> bool:
-    lowered = path_hint.casefold()
-    if lowered.endswith("/bin/uv") or lowered == "bin/uv":
-        return True
-    if lowered.endswith((".safetensors", ".model")):
-        return True
-    sample = first_chunk[:8192]
-    if b"\x00" in sample:
-        return True
-    try:
-        sample.decode("utf-8")
-    except UnicodeDecodeError:
-        return True
+def _is_binary_payload_path(path_hint: str) -> bool:
+    parts = tuple(part for part in path_hint.replace("\\", "/").split("/") if part)
+    for relative in BINARY_PAYLOAD_PATHS:
+        binary_parts = tuple(relative.split("/"))
+        if parts == binary_parts or (
+            len(parts) == len(binary_parts) + 1 and parts[1:] == binary_parts
+        ):
+            return True
     return False
 
 
@@ -212,6 +225,8 @@ def _scan_chunk(
     for marker in TEXT_PATH_MARKERS:
         if marker in chunk:
             raise ReleaseBuildError(f"private absolute path detected in {label}")
+    if WINDOWS_PRIVATE_PATH_PATTERN.search(chunk):
+        raise ReleaseBuildError(f"private absolute path detected in {label}")
     for pattern in SECRET_PATTERNS:
         if pattern.search(chunk):
             raise ReleaseBuildError(f"secret pattern detected in {label}")
@@ -226,10 +241,18 @@ def _scan_stream(
     first = source.read(COPY_CHUNK_SIZE)
     if first.startswith(SQLITE_FILE_HEADER):
         raise ReleaseBuildError(f"SQLite database content detected in {path_hint}")
-    binary = _looks_binary(path_hint, first)
+    binary = _is_binary_payload_path(path_hint)
+    decoder = None if binary else codecs.getincrementaldecoder("utf-8")("strict")
     previous = b""
     current = first
     while current:
+        if decoder is not None:
+            try:
+                decoder.decode(current, final=False)
+            except UnicodeDecodeError as exc:
+                raise ReleaseBuildError(
+                    f"text payload must be valid UTF-8: {path_hint}"
+                ) from exc
         combined = previous + current
         _scan_chunk(
             combined,
@@ -239,6 +262,13 @@ def _scan_stream(
         )
         previous = combined[-SCAN_OVERLAP:]
         current = source.read(COPY_CHUNK_SIZE)
+    if decoder is not None:
+        try:
+            decoder.decode(b"", final=True)
+        except UnicodeDecodeError as exc:
+            raise ReleaseBuildError(
+                f"text payload must be valid UTF-8: {path_hint}"
+            ) from exc
 
 
 def _scan_file_content(
@@ -324,6 +354,64 @@ def _ensure_regular_file(path: Path, label: str) -> os.stat_result:
     if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
         raise ReleaseBuildError(f"{label} must be a regular file: {path}")
     return info
+
+
+def _load_model_manifest(
+    path: Path,
+    metadata: Mapping[str, str],
+) -> dict[str, ModelFileSpec]:
+    _ensure_regular_file(path, "model manifest")
+    try:
+        raw = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ReleaseBuildError(f"cannot read model manifest {path}: {exc}") from exc
+    if not isinstance(raw, dict) or set(raw) != {
+        "model_id",
+        "model_revision",
+        "files",
+    }:
+        raise ReleaseBuildError("model manifest must contain exactly model_id, model_revision, and files")
+    if raw["model_id"] != metadata["model_id"]:
+        raise ReleaseBuildError("model manifest model_id does not match release metadata")
+    if raw["model_revision"] != metadata["model_revision"]:
+        raise ReleaseBuildError("model manifest revision does not match release metadata")
+    files = raw["files"]
+    if not isinstance(files, list):
+        raise ReleaseBuildError("model manifest files must be a list")
+
+    records: dict[str, ModelFileSpec] = {}
+    ordered_paths: list[str] = []
+    for index, record in enumerate(files):
+        if not isinstance(record, dict) or set(record) != {"path", "size", "sha256"}:
+            raise ReleaseBuildError(
+                f"model manifest file record {index} must contain exactly path, size, and sha256"
+            )
+        relative = record["path"]
+        if not isinstance(relative, str) or not relative or "\\" in relative:
+            raise ReleaseBuildError(f"model manifest file record {index} has an unsafe path")
+        parsed = PurePosixPath(relative)
+        if (
+            parsed.is_absolute()
+            or any(part in {"", ".", ".."} for part in parsed.parts)
+            or parsed.as_posix() != relative
+        ):
+            raise ReleaseBuildError(f"model manifest file record {index} has an unsafe path")
+        if relative in records:
+            raise ReleaseBuildError(f"model manifest contains duplicate path: {relative}")
+        size = record["size"]
+        if type(size) is not int or size <= 0:
+            raise ReleaseBuildError(f"model manifest has invalid size for {relative}")
+        sha256 = record["sha256"]
+        if not isinstance(sha256, str) or re.fullmatch(r"[0-9a-f]{64}", sha256) is None:
+            raise ReleaseBuildError(f"model manifest has invalid sha256 for {relative}")
+        records[relative] = ModelFileSpec(size=size, sha256=sha256)
+        ordered_paths.append(relative)
+
+    if tuple(ordered_paths) != MODEL_FILES:
+        raise ReleaseBuildError(
+            "model manifest must list the exact pinned model files in stable order"
+        )
+    return records
 
 
 def _ensure_source_file(project_root: Path, path: Path, label: str) -> os.stat_result:
@@ -451,6 +539,7 @@ def _copy_model_payload(
     snapshot: Path,
     payload_root: Path,
     expected_revision: str,
+    trusted_files: Mapping[str, ModelFileSpec],
 ) -> set[str]:
     if snapshot.name != expected_revision:
         raise ReleaseBuildError(
@@ -493,6 +582,16 @@ def _copy_model_payload(
         content_info = content_source.lstat()
         if not stat.S_ISREG(content_info.st_mode) or content_info.st_size <= 0:
             raise ReleaseBuildError(f"model file must be a non-empty regular file: {relative}")
+        trusted = trusted_files[relative]
+        if content_info.st_size != trusted.size:
+            raise ReleaseBuildError(
+                f"model file size does not match trusted model manifest: {relative}"
+            )
+        actual_sha256 = _sha256_file(content_source)
+        if actual_sha256 != trusted.sha256:
+            raise ReleaseBuildError(
+                f"model file SHA-256 does not match trusted model manifest: {relative}"
+            )
         destination_relative = f"data/models/{relative}"
         _copy_file(content_source, payload_root / destination_relative, 0o644)
         copied.add(destination_relative)
@@ -745,6 +844,87 @@ def _verify_archive(
             raise ReleaseBuildError("ZIP release manifest does not match archive contents")
 
 
+def _validate_output_target(path: Path, label: str) -> bool:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise ReleaseBuildError(f"cannot inspect {label}: {path}") from exc
+    if stat.S_ISLNK(info.st_mode):
+        raise ReleaseBuildError(f"{label} must not be a symlink: {path}")
+    if not stat.S_ISREG(info.st_mode):
+        raise ReleaseBuildError(f"{label} must be a regular file: {path}")
+    return True
+
+
+def _unlink_regular_artifact(path: Path, label: str) -> None:
+    try:
+        info = path.lstat()
+    except FileNotFoundError:
+        return
+    if not stat.S_ISREG(info.st_mode):
+        raise ReleaseBuildError(f"cannot remove non-regular {label}: {path}")
+    path.unlink()
+
+
+def _publish_release_artifacts(
+    *,
+    candidate_archive: Path,
+    candidate_checksums: Path,
+    archive_path: Path,
+    checksums_path: Path,
+    backup_dir: Path,
+) -> None:
+    artifacts = (
+        (candidate_archive, archive_path, "release ZIP"),
+        (candidate_checksums, checksums_path, "SHA256SUMS"),
+    )
+    backups: dict[Path, Path] = {}
+    published: list[tuple[Path, str]] = []
+
+    for candidate, target, label in artifacts:
+        _ensure_regular_file(candidate, f"candidate {label}")
+        existed = _validate_output_target(target, label)
+        if existed:
+            backup = backup_dir / f"previous-{len(backups)}"
+            try:
+                os.link(target, backup, follow_symlinks=False)
+            except OSError as exc:
+                for created_backup in backups.values():
+                    created_backup.unlink(missing_ok=True)
+                raise ReleaseBuildError(f"cannot back up existing {label}: {target}") from exc
+            _ensure_regular_file(backup, f"backup {label}")
+            backups[target] = backup
+
+    try:
+        for candidate, target, label in artifacts:
+            os.replace(candidate, target)
+            published.append((target, label))
+            _validate_output_target(target, label)
+    except (OSError, ReleaseBuildError) as exc:
+        rollback_errors: list[str] = []
+        for target, label in reversed(published):
+            backup = backups.get(target)
+            try:
+                if backup is None:
+                    _unlink_regular_artifact(target, label)
+                else:
+                    os.replace(backup, target)
+                    _validate_output_target(target, label)
+            except (OSError, ReleaseBuildError) as rollback_exc:
+                rollback_errors.append(f"{label}: {rollback_exc}")
+        for backup in backups.values():
+            backup.unlink(missing_ok=True)
+        message = f"release artifact publication failed: {exc}"
+        if rollback_errors:
+            message += "; rollback failed for " + ", ".join(rollback_errors)
+        raise ReleaseBuildError(message) from exc
+    else:
+        for backup in backups.values():
+            backup.unlink(missing_ok=True)
+
+
 def build_release(
     *,
     project_root: Path,
@@ -752,6 +932,7 @@ def build_release(
     uv_binary: Path,
     output_dir: Path,
     metadata_path: Path | None = None,
+    model_manifest_path: Path | None = None,
 ) -> BuildResult:
     project_root = Path(project_root).expanduser().absolute()
     model_snapshot = Path(model_snapshot).expanduser().absolute()
@@ -760,11 +941,19 @@ def build_release(
     if metadata_path is None:
         metadata_path = project_root / "distribution" / "release.json"
     metadata = _load_metadata(Path(metadata_path).expanduser().absolute())
+    if model_manifest_path is None:
+        model_manifest_path = project_root / "distribution" / "model-manifest.json"
+    trusted_model_files = _load_model_manifest(
+        Path(model_manifest_path).expanduser().absolute(),
+        metadata,
+    )
 
     output_dir.mkdir(parents=True, exist_ok=True)
     _validate_real_directory(output_dir, "output directory")
     archive_path = output_dir / metadata["archive"]
     checksums_path = output_dir / "SHA256SUMS"
+    _validate_output_target(archive_path, "release ZIP")
+    _validate_output_target(checksums_path, "SHA256SUMS")
     private_paths = (project_root, Path.home(), model_snapshot)
     with tempfile.TemporaryDirectory(prefix=".macos-release-", dir=output_dir) as temp:
         staging_root = Path(temp)
@@ -776,6 +965,7 @@ def build_release(
                 model_snapshot,
                 payload_root,
                 metadata["model_revision"],
+                trusted_model_files,
             )
         )
         payload_files.add(
@@ -805,13 +995,21 @@ def build_release(
             payload_files,
             private_paths=private_paths,
         )
-        os.replace(candidate_archive, archive_path)
-
-    checksums_path.write_text(
-        f"{_sha256_file(archive_path)}  {archive_path.name}\n",
-        encoding="utf-8",
-    )
-    checksums_path.chmod(0o644)
+        candidate_archive.chmod(0o644)
+        candidate_checksums = staging_root / "candidate-SHA256SUMS"
+        checksum_data = (
+            f"{_sha256_file(candidate_archive)}  {archive_path.name}\n"
+        ).encode("utf-8")
+        _write_payload(candidate_checksums, checksum_data, 0o644)
+        if candidate_checksums.read_bytes() != checksum_data:
+            raise ReleaseBuildError("candidate SHA256SUMS verification failed")
+        _publish_release_artifacts(
+            candidate_archive=candidate_archive,
+            candidate_checksums=candidate_checksums,
+            archive_path=archive_path,
+            checksums_path=checksums_path,
+            backup_dir=staging_root,
+        )
     return BuildResult(archive=archive_path, checksums=checksums_path)
 
 
@@ -828,6 +1026,11 @@ def _parser() -> argparse.ArgumentParser:
         type=Path,
         help="Override distribution/release.json (intended for offline test fixtures).",
     )
+    parser.add_argument(
+        "--model-manifest",
+        type=Path,
+        help="Override distribution/model-manifest.json (intended for offline test fixtures).",
+    )
     return parser
 
 
@@ -840,6 +1043,7 @@ def main(argv: list[str] | None = None) -> int:
             uv_binary=arguments.uv_binary,
             output_dir=arguments.output_dir,
             metadata_path=arguments.metadata,
+            model_manifest_path=arguments.model_manifest,
         )
     except ReleaseBuildError as exc:
         raise SystemExit(f"release build failed: {exc}") from exc

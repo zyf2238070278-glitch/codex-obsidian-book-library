@@ -64,6 +64,59 @@ FIXED_METADATA = {
     "top_level_directory": "codex-obsidian-book-library-v0.1.0-beta.1-macos-arm64",
 }
 
+FIXED_MODEL_FILES = (
+    {
+        "path": "1_Pooling/config.json",
+        "size": 200,
+        "sha256": "987f7a67a38fa564c849bb5d277c52ab9088a84368fc0be31a354125aebb12a0",
+    },
+    {
+        "path": "README.md",
+        "size": 497538,
+        "sha256": "0038de97aee16258cecbad7ffda4b4febd6953e747a00e0ddbc8e6ed241e9c1c",
+    },
+    {
+        "path": "config.json",
+        "size": 655,
+        "sha256": "69137736cab8b8903a07fe8afaafdda25aac55415a12a55d1bffa9f581abf959",
+    },
+    {
+        "path": "model.safetensors",
+        "size": 470641600,
+        "sha256": "1a55775f53449dac10a2bcbc312469fac40b96d53198c407081a831f81c98477",
+    },
+    {
+        "path": "modules.json",
+        "size": 387,
+        "sha256": "c6e29747481e8b5dd2b58401966aeac910de39092f90cda9a704b1545f902b04",
+    },
+    {
+        "path": "sentence_bert_config.json",
+        "size": 57,
+        "sha256": "948201d8329907aae938fa62f9ceeed53f5694dacc2b87b9f3b78b37ee986529",
+    },
+    {
+        "path": "sentencepiece.bpe.model",
+        "size": 5069051,
+        "sha256": "cfc8146abe2a0488e9e2a0c56de7952f7c11ab059eca145a0a727afce0db2865",
+    },
+    {
+        "path": "special_tokens_map.json",
+        "size": 167,
+        "sha256": "d05497f1da52c5e09554c0cd874037a083e1dc1b9cfd48034d1c717f1afc07a7",
+    },
+    {
+        "path": "tokenizer.json",
+        "size": 17082730,
+        "sha256": "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39",
+    },
+    {
+        "path": "tokenizer_config.json",
+        "size": 443,
+        "sha256": "a1d6bc8734a6f635dc158508bef000f8e2e5a759c7d92f984b2c86e5ff53425b",
+    },
+)
+
 
 def _sha256(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
@@ -115,6 +168,27 @@ def _make_model_snapshot(tmp_path: Path) -> Path:
     return snapshot
 
 
+def _write_fixture_model_manifest(project: Path, snapshot: Path) -> Path:
+    records = []
+    for relative in MODEL_FILES:
+        data = (snapshot / relative).resolve(strict=True).read_bytes()
+        records.append(
+            {
+                "path": relative,
+                "size": len(data),
+                "sha256": _sha256(data),
+            }
+        )
+    manifest = {
+        "model_id": FIXED_METADATA["model_id"],
+        "model_revision": FIXED_METADATA["model_revision"],
+        "files": records,
+    }
+    path = project / "distribution" / "model-manifest.json"
+    _write(path, json.dumps(manifest, ensure_ascii=False, indent=2) + "\n")
+    return path
+
+
 def _make_uv_and_metadata(tmp_path: Path) -> tuple[Path, Path, dict[str, str]]:
     # The NUL keeps this binary for privacy scanning; /Users/runner is expected in
     # some official build artifacts and must not be treated as the local user.
@@ -145,6 +219,7 @@ def _make_release_inputs(
 ) -> tuple[Path, Path, Path, Path, dict[str, str]]:
     project = _make_project(tmp_path)
     snapshot = _make_model_snapshot(tmp_path)
+    _write_fixture_model_manifest(project, snapshot)
     uv, metadata_path, metadata = _make_uv_and_metadata(tmp_path)
     return project, snapshot, uv, metadata_path, metadata
 
@@ -166,6 +241,99 @@ def test_release_metadata_is_pinned_for_macos_arm64() -> None:
         (PROJECT_ROOT / "distribution" / "release.json").read_text(encoding="utf-8")
     )
     assert metadata == FIXED_METADATA
+
+
+def test_model_manifest_is_pinned_to_release_and_real_snapshot() -> None:
+    manifest_path = PROJECT_ROOT / "distribution" / "model-manifest.json"
+    assert manifest_path.is_file()
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    assert manifest == {
+        "model_id": FIXED_METADATA["model_id"],
+        "model_revision": FIXED_METADATA["model_revision"],
+        "files": list(FIXED_MODEL_FILES),
+    }
+
+
+def test_build_requires_default_project_model_manifest(tmp_path: Path) -> None:
+    project, snapshot, uv, metadata_path, _ = _make_release_inputs(tmp_path)
+    (project / "distribution" / "model-manifest.json").unlink()
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="model manifest"):
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=tmp_path / "dist",
+            metadata_path=metadata_path,
+        )
+
+
+def test_model_content_must_match_trusted_manifest_sha256(tmp_path: Path) -> None:
+    project, snapshot, uv, metadata_path, _ = _make_release_inputs(tmp_path)
+    target = (snapshot / "config.json").resolve(strict=True)
+    original = target.read_bytes()
+    target.write_bytes(b"x" + original[1:])
+    assert target.stat().st_size == len(original)
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="model manifest|SHA-256"):
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=tmp_path / "dist",
+            metadata_path=metadata_path,
+        )
+
+
+@pytest.mark.parametrize(
+    "corruption",
+    [
+        "extra-top-level-key",
+        "wrong-model-id",
+        "wrong-revision",
+        "duplicate-path",
+        "unsafe-path",
+        "missing-path",
+        "invalid-size",
+        "invalid-sha256",
+        "extra-record-key",
+    ],
+)
+def test_model_manifest_schema_is_strict(
+    tmp_path: Path,
+    corruption: str,
+) -> None:
+    project, snapshot, uv, metadata_path, _ = _make_release_inputs(tmp_path)
+    manifest_path = project / "distribution" / "model-manifest.json"
+    manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+    if corruption == "extra-top-level-key":
+        manifest["unexpected"] = True
+    elif corruption == "wrong-model-id":
+        manifest["model_id"] = "other/model"
+    elif corruption == "wrong-revision":
+        manifest["model_revision"] = "0" * 40
+    elif corruption == "duplicate-path":
+        manifest["files"].append(dict(manifest["files"][0]))
+    elif corruption == "unsafe-path":
+        manifest["files"][0]["path"] = "../config.json"
+    elif corruption == "missing-path":
+        manifest["files"].pop()
+    elif corruption == "invalid-size":
+        manifest["files"][0]["size"] = 0
+    elif corruption == "invalid-sha256":
+        manifest["files"][0]["sha256"] = "not-a-sha256"
+    elif corruption == "extra-record-key":
+        manifest["files"][0]["unexpected"] = True
+    _write(manifest_path, json.dumps(manifest, ensure_ascii=False) + "\n")
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="model manifest"):
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=tmp_path / "dist",
+            metadata_path=metadata_path,
+        )
 
 
 def test_build_has_one_top_level_and_exact_allowlisted_payload(tmp_path: Path) -> None:
@@ -238,6 +406,95 @@ def test_manifest_checksum_and_zip_are_reproducible(tmp_path: Path) -> None:
                 "sha256": _sha256(data),
                 "mode": "0755" if item["path"] in {"install-macos.command", "bin/uv"} else "0644",
             }
+
+
+def test_build_rejects_checksum_symlink_without_touching_victim(
+    tmp_path: Path,
+) -> None:
+    project, snapshot, uv, metadata_path, metadata = _make_release_inputs(tmp_path)
+    output = tmp_path / "dist"
+    output.mkdir()
+    victim = tmp_path / "victim.txt"
+    _write(victim, "keep victim unchanged\n")
+    (output / "SHA256SUMS").symlink_to(victim)
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="SHA256SUMS|symlink"):
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=output,
+            metadata_path=metadata_path,
+        )
+
+    assert victim.read_text(encoding="utf-8") == "keep victim unchanged\n"
+    assert not (output / metadata["archive"]).exists()
+    assert (output / "SHA256SUMS").is_symlink()
+
+
+def test_build_rejects_checksum_directory_without_publishing_zip(
+    tmp_path: Path,
+) -> None:
+    project, snapshot, uv, metadata_path, metadata = _make_release_inputs(tmp_path)
+    output = tmp_path / "dist"
+    (output / "SHA256SUMS").mkdir(parents=True)
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="SHA256SUMS|regular"):
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=output,
+            metadata_path=metadata_path,
+        )
+
+    assert not (output / metadata["archive"]).exists()
+    assert (output / "SHA256SUMS").is_dir()
+
+
+@pytest.mark.parametrize("with_existing", [False, True], ids=["new", "overwrite"])
+def test_checksum_publish_failure_rolls_back_both_artifacts(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    with_existing: bool,
+) -> None:
+    project, snapshot, uv, metadata_path, metadata = _make_release_inputs(tmp_path)
+    output = tmp_path / "dist"
+    output.mkdir()
+    archive_path = output / metadata["archive"]
+    checksums_path = output / "SHA256SUMS"
+    if with_existing:
+        _write(archive_path, b"old archive")
+        _write(checksums_path, "old checksum\n")
+
+    real_replace = os.replace
+    failed = False
+
+    def fail_second_publish(source: Path | str, destination: Path | str) -> None:
+        nonlocal failed
+        if Path(destination) == checksums_path and not failed:
+            failed = True
+            raise OSError("simulated checksum publication failure")
+        real_replace(source, destination)
+
+    monkeypatch.setattr(build_macos_release.os, "replace", fail_second_publish)
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="publication"):
+        build_macos_release.build_release(
+            project_root=project,
+            model_snapshot=snapshot,
+            uv_binary=uv,
+            output_dir=output,
+            metadata_path=metadata_path,
+        )
+
+    if with_existing:
+        assert archive_path.read_bytes() == b"old archive"
+        assert checksums_path.read_text(encoding="utf-8") == "old checksum\n"
+    else:
+        assert not archive_path.exists()
+        assert not checksums_path.exists()
+    assert not any(path.name.startswith(".macos-release-") for path in output.iterdir())
 
 
 def test_unzip_preserves_two_executables_and_normalizes_other_modes(
@@ -495,6 +752,57 @@ def test_staging_scan_rejects_private_path_and_secret_content(tmp_path: Path) ->
         build_macos_release.scan_staging(staging, private_paths=[private_path])
 
 
+def test_staging_scan_treats_allowlisted_markdown_with_nul_as_text(
+    tmp_path: Path,
+) -> None:
+    staging = tmp_path / "staging"
+    _write(
+        staging / "release" / "README.md",
+        b"\x00/Users/alice/private\napi_key=abcdefghijklmnopqrstuvwxyz123456\n",
+    )
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="private|secret"):
+        build_macos_release.scan_staging(staging)
+
+
+def test_staging_scan_rejects_invalid_utf8_in_allowlisted_text(tmp_path: Path) -> None:
+    staging = tmp_path / "staging"
+    _write(staging / "release" / "README.md", b"\xffinvalid utf-8")
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="UTF-8"):
+        build_macos_release.scan_staging(staging)
+
+
+@pytest.mark.parametrize(
+    "private_path",
+    ["C:/Users/alice/private", r"c:\users\alice\private"],
+)
+def test_staging_scan_rejects_windows_private_path_variants(
+    tmp_path: Path,
+    private_path: str,
+) -> None:
+    staging = tmp_path / "staging"
+    _write(staging / "release" / "README.md", private_path + "\n")
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="private"):
+        build_macos_release.scan_staging(staging)
+
+
+def test_staging_scan_allows_only_the_three_binary_payload_paths(
+    tmp_path: Path,
+) -> None:
+    staging = tmp_path / "staging"
+    binary_payloads = {
+        "release/bin/uv": b"\xcf\xfa\xed\xfe\x00/Users/runner/build\x00",
+        "release/data/models/model.safetensors": b"\xff\x00safetensors",
+        "release/data/models/sentencepiece.bpe.model": b"\x80\x00sentencepiece",
+    }
+    for relative, data in binary_payloads.items():
+        _write(staging / relative, data)
+
+    build_macos_release.scan_staging(staging)
+
+
 def test_staging_scan_rejects_sqlite_header_with_allowlisted_extension(
     tmp_path: Path,
 ) -> None:
@@ -635,6 +943,86 @@ def test_zip_scan_rejects_denylist_private_text_and_secret(tmp_path: Path) -> No
 
     with pytest.raises(build_macos_release.ReleaseBuildError, match="forbidden|private|secret"):
         build_macos_release.scan_zip(archive_path, private_paths=[private_path])
+
+
+def test_zip_scan_treats_allowlisted_markdown_with_nul_as_text(
+    tmp_path: Path,
+) -> None:
+    archive_path = tmp_path / "nul-markdown.zip"
+    _write_zip_entries(
+        archive_path,
+        [
+            (
+                "release/README.md",
+                b"\x00/Users/alice/private\napi_key=abcdefghijklmnopqrstuvwxyz123456\n",
+                stat.S_IFREG | 0o644,
+            )
+        ],
+    )
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="private|secret"):
+        build_macos_release.scan_zip(archive_path)
+
+
+def test_zip_scan_rejects_invalid_utf8_in_allowlisted_text(tmp_path: Path) -> None:
+    archive_path = tmp_path / "invalid-text.zip"
+    _write_zip_entries(
+        archive_path,
+        [("release/README.md", b"\xffinvalid utf-8", stat.S_IFREG | 0o644)],
+    )
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="UTF-8"):
+        build_macos_release.scan_zip(archive_path)
+
+
+@pytest.mark.parametrize(
+    "private_path",
+    ["C:/Users/alice/private", r"c:\users\alice\private"],
+)
+def test_zip_scan_rejects_windows_private_path_variants(
+    tmp_path: Path,
+    private_path: str,
+) -> None:
+    archive_path = tmp_path / "windows-private-path.zip"
+    _write_zip_entries(
+        archive_path,
+        [
+            (
+                "release/README.md",
+                (private_path + "\n").encode(),
+                stat.S_IFREG | 0o644,
+            )
+        ],
+    )
+
+    with pytest.raises(build_macos_release.ReleaseBuildError, match="private"):
+        build_macos_release.scan_zip(archive_path)
+
+
+def test_zip_scan_allows_only_the_three_binary_payload_paths(tmp_path: Path) -> None:
+    archive_path = tmp_path / "binary-payloads.zip"
+    _write_zip_entries(
+        archive_path,
+        [
+            (
+                "release/bin/uv",
+                b"\xcf\xfa\xed\xfe\x00/Users/runner/build\x00",
+                stat.S_IFREG | 0o755,
+            ),
+            (
+                "release/data/models/model.safetensors",
+                b"\xff\x00safetensors",
+                stat.S_IFREG | 0o644,
+            ),
+            (
+                "release/data/models/sentencepiece.bpe.model",
+                b"\x80\x00sentencepiece",
+                stat.S_IFREG | 0o644,
+            ),
+        ],
+    )
+
+    build_macos_release.scan_zip(archive_path)
 
 
 def test_large_payload_paths_are_copied_hashed_and_verified_streamingly(

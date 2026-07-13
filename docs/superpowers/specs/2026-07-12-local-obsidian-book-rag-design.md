@@ -104,9 +104,15 @@ The importer accepts only `.pdf`, `.epub`, `.md`, and `.txt`. It resolves paths 
 
 ## 7. Import Pipeline
 
+### Approved atomic-import amendment (2026-07-13)
+
+The vault manager exposes one public file-admission operation, `import_original(source)`, instead of exposing separate `stage()` and `promote(path)` calls. The operation copies the source into a short, unique hidden temporary file under `00-待导入`, finishes and verifies that file, atomically hard-links it to a collision-safe name under `10-原始书籍`, and removes the hidden temporary entry. No reusable staged pathname or in-memory ownership token crosses a public API boundary.
+
+This amendment preserves the user-visible workflow and the four-folder vault layout. It replaces the earlier split stage/promote mechanism because a plain pathname cannot safely identify one import generation across concurrency, retries, and process lifetime. Ordinary concurrent imports must remain no-clobber; pre-existing destination symlinks must be treated as occupied; hidden temporary files must be cleaned on success and expected failure; collision suffixes and temporary names must respect the filesystem byte-length limit.
+
 1. Codex receives a local attachment path and calls `import_book`.
 2. The importer validates the extension, resolves the path, computes SHA-256, and checks for duplicates.
-3. The file is staged in `vault/书库/00-待导入/` using a collision-safe name, then atomically moved into `vault/书库/10-原始书籍/` after validation. The staging copy is removed after a successful move and retained with a failure record only when it helps recovery.
+3. `import_original(source)` writes a short unique hidden temporary file below `vault/书库/00-待导入/`, atomically admits the completed file into `vault/书库/10-原始书籍/` under a collision-safe user-facing name, and removes the temporary entry. The public API returns only the final original path.
 4. The appropriate parser extracts ordered source units and metadata from the preserved original.
 5. A readable Markdown representation is written below `vault/书库/20-解析文本/<book-id>/`. PDF page boundaries and EPUB chapter boundaries are represented with stable anchors.
 6. The chunker groups adjacent paragraphs into passages, targeting approximately 1,500 Unicode characters and never exceeding 2,500 characters unless a single paragraph itself is longer. One preceding paragraph may be repeated as overlap.

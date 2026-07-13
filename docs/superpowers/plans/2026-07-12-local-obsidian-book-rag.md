@@ -14,6 +14,18 @@
 
 Implement against `docs/superpowers/specs/2026-07-12-local-obsidian-book-rag-design.md`. If this plan and the specification differ, the specification wins and the plan must be corrected before implementation continues.
 
+## Approved Architecture Amendment (2026-07-13)
+
+This amendment overrides every Task 2 and Task 8 instruction that exposes separate `stage()` and `promote(path)` methods.
+
+- `VaultManager` has two public operations: `ensure_layout()` and `import_original(source: Path) -> Path`.
+- `import_original` securely opens a regular source, copies it to a short unique hidden temporary file below `00-待导入`, finishes metadata copying, atomically hard-links the complete temporary inode to a no-clobber collision-safe name below `10-原始书籍`, and cleans the temporary entry.
+- The method never returns an inbox path and keeps no in-memory generation/ownership registry.
+- Concurrent same-basename calls must all preserve their payloads under distinct final names; dangling symlinks count as occupied; a failed import must not expose a partial final file.
+- Internal temporary names use a bounded fixed-size random identifier. Final collision names truncate the UTF-8 filename stem as needed so the suffix and extension remain within the filesystem `NAME_MAX` byte budget.
+- Tests replace split stage/promote assertions with public `import_original` assertions for sequential collisions, concurrent collisions, symlinked managed directories, dangling final entries, cleanup on copy/link failure, regular-source validation, and maximum-length filenames.
+- Task 8 calls `original = self.vault.import_original(source)` directly.
+
 ## File Responsibility Map
 
 - `pyproject.toml` — Python version, runtime/semantic/test dependencies, pytest configuration.
@@ -1465,8 +1477,7 @@ class ImportService:
             )
 
         self.vault.ensure_layout()
-        staged = self.vault.stage(source)
-        original = self.vault.promote(staged)
+        original = self.vault.import_original(source)
         self.database.create_book(
             book_id, title or source.stem, author, suffix[1:], content_hash,
             str(original), "processing",

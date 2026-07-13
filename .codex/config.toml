@@ -1,0 +1,17 @@
+[mcp_servers.book_library]
+command = "uv"
+args = ["run", "python", "-m", "book_agent.mcp_server"]
+cwd = "/Users/zhaoyunfei/Documents/Codex/2026-07-12/wo"
+env = { BOOK_LIBRARY_ROOT = "/Users/zhaoyunfei/Documents/Codex/2026-07-12/wo", HF_HUB_OFFLINE = "1", TRANSFORMERS_OFFLINE = "1" }
+required = true
+enabled = true
+enabled_tools = [
+  "import_book",
+  "list_books",
+  "library_status",
+  "search_books",
+  "get_passages",
+  "save_reading_note",
+]
+startup_timeout_sec = 60
+tool_timeout_sec = 120

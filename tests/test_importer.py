@@ -1,5 +1,7 @@
+import errno
 import hashlib
 import json
+import os
 from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeoutError
 from contextlib import contextmanager
 from dataclasses import FrozenInstanceError
@@ -648,6 +650,110 @@ def test_same_hash_imports_are_serialized_until_the_first_status_is_final(
     assert parse_calls == 1
     assert len(database.list_books()) == 1
     assert len(list(paths.originals.iterdir())) == 1
+
+
+def test_book_lock_stays_anchored_when_lock_directory_is_swapped_for_symlink(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database = app
+    service = ImportService(paths, database, NullEmbeddingProvider())
+    book_id = "a" * 24
+    lock_directory = paths.database.parent / ".import-locks"
+    displaced_directory = paths.database.parent / ".import-locks-displaced"
+    external_directory = tmp_path / "external-lock-domain"
+    external_directory.mkdir()
+    real_open = os.open
+    swapped = False
+
+    def swap_before_lock_file_open(
+        path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        nonlocal swapped
+        if (
+            not swapped
+            and flags & os.O_CREAT
+            and os.fspath(path).endswith(f"{book_id}.lock")
+        ):
+            lock_directory.rename(displaced_directory)
+            lock_directory.symlink_to(external_directory, target_is_directory=True)
+            swapped = True
+        return real_open(path, flags, mode, dir_fd=dir_fd)
+
+    monkeypatch.setattr(importer_module.os, "open", swap_before_lock_file_open)
+
+    with service._book_lock(book_id):
+        pass
+
+    assert swapped is True
+    assert list(external_directory.iterdir()) == []
+    assert (displaced_directory / f"{book_id}.lock").is_file()
+
+
+def test_book_lock_rejects_a_symlinked_data_parent_without_external_writes(
+    tmp_path: Path,
+) -> None:
+    root = tmp_path / "app"
+    root.mkdir()
+    external_directory = tmp_path / "external-data"
+    external_directory.mkdir()
+    (root / "data").symlink_to(external_directory, target_is_directory=True)
+    paths = AppPaths.from_root(root)
+    service = ImportService(
+        paths,
+        Database(paths.database),
+        NullEmbeddingProvider(),
+    )
+
+    with pytest.raises(ValueError, match="锁|安全|symlink|symbolic"):
+        with service._book_lock("b" * 24):
+            pass
+
+    assert list(external_directory.iterdir()) == []
+
+
+@pytest.mark.parametrize("failure", [None, RuntimeError, KeyboardInterrupt])
+def test_book_lock_closes_every_opened_descriptor(
+    app: tuple[AppPaths, Database],
+    monkeypatch: pytest.MonkeyPatch,
+    failure: type[BaseException] | None,
+) -> None:
+    paths, database = app
+    service = ImportService(paths, database, NullEmbeddingProvider())
+    real_open = os.open
+    opened_descriptors: list[int] = []
+
+    def track_open(
+        path,
+        flags: int,
+        mode: int = 0o777,
+        *,
+        dir_fd: int | None = None,
+    ) -> int:
+        descriptor = real_open(path, flags, mode, dir_fd=dir_fd)
+        opened_descriptors.append(descriptor)
+        return descriptor
+
+    monkeypatch.setattr(importer_module.os, "open", track_open)
+
+    if failure is None:
+        with service._book_lock("c" * 24):
+            pass
+    else:
+        with pytest.raises(failure, match="injected lock body failure"):
+            with service._book_lock("c" * 24):
+                raise failure("injected lock body failure")
+
+    assert opened_descriptors
+    for descriptor in set(opened_descriptors):
+        with pytest.raises(OSError) as caught:
+            os.fstat(descriptor)
+        assert caught.value.errno == errno.EBADF
 
 
 @pytest.mark.parametrize(

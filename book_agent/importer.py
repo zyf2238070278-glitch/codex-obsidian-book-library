@@ -26,10 +26,28 @@ from book_agent.vault import VaultManager
 
 _HASH_BLOCK_SIZE = 1024 * 1024
 _MAX_HASH_DRIFT_ATTEMPTS = 3
+_BOOK_ID_LENGTH = 24
+_LOWER_HEX_DIGITS = frozenset("0123456789abcdef")
 
 
 class _ContentHashDrift(Exception):
     """Signal that copied bytes no longer match the hash whose lock is held."""
+
+
+def _required_open_flag(name: str) -> int:
+    flag = getattr(os, name, None)
+    if not isinstance(flag, int) or flag == 0:
+        raise RuntimeError(f"当前平台缺少安全打开导入锁所需的 {name} 支持。")
+    return flag
+
+
+def _secure_directory_open_flags() -> int:
+    return (
+        os.O_RDONLY
+        | getattr(os, "O_CLOEXEC", 0)
+        | _required_open_flag("O_DIRECTORY")
+        | _required_open_flag("O_NOFOLLOW")
+    )
 
 
 @dataclass(frozen=True)
@@ -326,32 +344,98 @@ class ImportService:
 
     @contextmanager
     def _book_lock(self, book_id: str) -> Iterator[None]:
-        lock_directory = self.paths.database.parent / ".import-locks"
-        lock_directory.mkdir(mode=0o700, parents=True, exist_ok=True)
-        directory_info = lock_directory.lstat()
-        if stat.S_ISLNK(directory_info.st_mode) or not stat.S_ISDIR(
-            directory_info.st_mode
+        if (
+            len(book_id) != _BOOK_ID_LENGTH
+            or any(character not in _LOWER_HEX_DIGITS for character in book_id)
         ):
-            raise ValueError(f"导入锁目录不安全：{lock_directory}")
+            raise ValueError("书籍导入锁标识必须是 24 位小写十六进制字符。")
 
         flags = (
             os.O_CREAT
             | os.O_RDWR
             | getattr(os, "O_CLOEXEC", 0)
-            | getattr(os, "O_NOFOLLOW", 0)
+            | _required_open_flag("O_NOFOLLOW")
         )
+        lock_directory_fd = self._open_lock_directory()
+        descriptor: int | None = None
         try:
-            descriptor = os.open(lock_directory / f"{book_id}.lock", flags, 0o600)
-        except OSError as error:
-            raise ValueError(f"无法创建书籍导入锁：{book_id}") from error
-        try:
+            try:
+                descriptor = os.open(
+                    f"{book_id}.lock",
+                    flags,
+                    0o600,
+                    dir_fd=lock_directory_fd,
+                )
+            except OSError as error:
+                raise ValueError(f"无法安全创建书籍导入锁：{book_id}") from error
             lock_info = os.fstat(descriptor)
             if not stat.S_ISREG(lock_info.st_mode):
                 raise ValueError(f"书籍导入锁不是普通文件：{book_id}")
             fcntl.flock(descriptor, fcntl.LOCK_EX)
             yield
         finally:
-            os.close(descriptor)
+            try:
+                if descriptor is not None:
+                    os.close(descriptor)
+            finally:
+                os.close(lock_directory_fd)
+
+    def _open_lock_directory(self) -> int:
+        try:
+            root = self.paths.root.expanduser()
+            lock_directory = (
+                self.paths.database.parent / ".import-locks"
+            ).expanduser()
+            if not root.is_absolute() or not lock_directory.is_absolute():
+                raise ValueError
+            relative = lock_directory.relative_to(root)
+        except (OSError, RuntimeError, TypeError, ValueError) as error:
+            raise ValueError("导入锁目录必须位于项目根目录内。") from error
+
+        components = relative.parts
+        if not components or any(
+            not component or component in {os.curdir, os.pardir}
+            for component in components
+        ):
+            raise ValueError("导入锁目录包含不安全的相对路径组件。")
+
+        directory_flags = _secure_directory_open_flags()
+        try:
+            current_fd = os.open(root, directory_flags)
+        except OSError as error:
+            raise ValueError(f"无法安全打开项目根目录：{root}") from error
+
+        current_path = root
+        try:
+            for component in components:
+                try:
+                    os.mkdir(component, mode=0o700, dir_fd=current_fd)
+                except FileExistsError:
+                    pass
+                except OSError as error:
+                    raise ValueError(
+                        f"无法安全创建导入锁目录：{current_path / component}"
+                    ) from error
+
+                try:
+                    next_fd = os.open(
+                        component,
+                        directory_flags,
+                        dir_fd=current_fd,
+                    )
+                except OSError as error:
+                    raise ValueError(
+                        f"导入锁目录不安全：{current_path / component}"
+                    ) from error
+
+                previous_fd = current_fd
+                current_fd = next_fd
+                os.close(previous_fd)
+                current_path /= component
+            return current_fd
+        except BaseException:
+            os.close(current_fd)
+            raise
 
     @staticmethod
     def _validate_source(source: str | Path) -> tuple[Path, str]:

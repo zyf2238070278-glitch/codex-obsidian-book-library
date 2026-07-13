@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 import subprocess
 import tomllib
 from pathlib import Path
@@ -17,6 +18,12 @@ EXPECTED_TOOLS = [
     "get_passages",
     "save_reading_note",
 ]
+
+
+def _create_executable(path: Path) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("#!/bin/sh\n", encoding="utf-8")
+    path.chmod(0o755)
 
 
 def test_default_project_root_is_distribution_root() -> None:
@@ -151,9 +158,14 @@ def test_sync_prefers_bundled_uv_over_path_uv(tmp_path: Path) -> None:
         return "/opt/homebrew/bin/uv"
 
     def run_command(
-        command: list[str], *, cwd: Path, check: bool
+        command: list[str],
+        *,
+        cwd: Path,
+        check: bool,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         calls.append((command, cwd, check))
+        _create_executable(project_root / ".venv" / "bin" / "python")
         return subprocess.CompletedProcess(command, 0)
 
     install_macos.install(
@@ -186,11 +198,16 @@ def test_sync_falls_back_to_uv_on_path(tmp_path: Path) -> None:
     calls: list[list[str]] = []
 
     def run_command(
-        command: list[str], *, cwd: Path, check: bool
+        command: list[str],
+        *,
+        cwd: Path,
+        check: bool,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess[str]:
         assert cwd == project_root.resolve()
         assert check is True
         calls.append(command)
+        _create_executable(project_root / ".venv" / "bin" / "python")
         return subprocess.CompletedProcess(command, 0)
 
     install_macos.install(
@@ -211,6 +228,103 @@ def test_sync_falls_back_to_uv_on_path(tmp_path: Path) -> None:
             "3.12",
         ]
     ]
+
+
+def test_sync_forces_project_venv_without_discarding_other_environment(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project_root = tmp_path / "Release With Spaces"
+    external_environment = tmp_path / "redirected elsewhere"
+    observed_environment: list[dict[str, str]] = []
+    monkeypatch.setenv("UV_PROJECT_ENVIRONMENT", str(external_environment))
+    monkeypatch.setenv("BOOK_INSTALLER_TEST_SENTINEL", "keep-me")
+
+    def run_command(
+        command: list[str],
+        *,
+        cwd: Path,
+        check: bool,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        observed_environment.append(dict(os.environ if env is None else env))
+        _create_executable(project_root / ".venv" / "bin" / "python")
+        return subprocess.CompletedProcess(command, 0)
+
+    install_macos.install(
+        project_root=project_root,
+        find_executable=lambda _: "/usr/local/bin/uv",
+        run_command=run_command,
+    )
+
+    assert observed_environment[0]["UV_PROJECT_ENVIRONMENT"] == str(
+        (project_root / ".venv").resolve()
+    )
+    assert observed_environment[0]["BOOK_INSTALLER_TEST_SENTINEL"] == "keep-me"
+
+
+def test_rerun_keeps_venv_python_symlink_path_in_config(tmp_path: Path) -> None:
+    project_root = tmp_path / "Release With Spaces"
+    base_python = tmp_path / "uv managed Python" / "python3.12"
+    venv_python = project_root / ".venv" / "bin" / "python"
+    _create_executable(base_python)
+    venv_python.parent.mkdir(parents=True)
+    venv_python.symlink_to(base_python)
+
+    def run_command(
+        command: list[str],
+        *,
+        cwd: Path,
+        check: bool,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        return subprocess.CompletedProcess(command, 0)
+
+    result = install_macos.install(
+        project_root=project_root,
+        find_executable=lambda _: "/usr/local/bin/uv",
+        run_command=run_command,
+    )
+
+    expected_python = Path(os.path.abspath(venv_python))
+    parsed = tomllib.loads(result.config.read_text(encoding="utf-8"))
+    assert result.python == expected_python
+    assert parsed["mcp_servers"]["book_library"]["command"] == str(
+        expected_python
+    )
+
+
+@pytest.mark.parametrize(
+    "created_mode",
+    [None, 0o644],
+    ids=["missing", "not-executable"],
+)
+def test_sync_does_not_publish_config_without_executable_python(
+    tmp_path: Path, created_mode: int | None
+) -> None:
+    project_root = tmp_path / "Release"
+    python = project_root / ".venv" / "bin" / "python"
+
+    def run_command(
+        command: list[str],
+        *,
+        cwd: Path,
+        check: bool,
+        env: dict[str, str] | None = None,
+    ) -> subprocess.CompletedProcess[str]:
+        if created_mode is not None:
+            python.parent.mkdir(parents=True)
+            python.write_text("#!/bin/sh\n", encoding="utf-8")
+            python.chmod(created_mode)
+        return subprocess.CompletedProcess(command, 0)
+
+    with pytest.raises(install_macos.InstallError, match="Python.*(不存在|不可执行)"):
+        install_macos.install(
+            project_root=project_root,
+            find_executable=lambda _: "/usr/local/bin/uv",
+            run_command=run_command,
+        )
+
+    assert not (project_root / ".codex" / "config.toml").exists()
 
 
 def test_missing_bundled_and_path_uv_is_a_clear_chinese_error(

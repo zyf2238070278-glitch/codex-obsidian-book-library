@@ -60,6 +60,15 @@ def _absolute(path: Path, base: Optional[Path] = None) -> Path:
     return expanded.resolve(strict=False)
 
 
+def _absolute_without_symlink_resolution(
+    path: Path, base: Optional[Path] = None
+) -> Path:
+    expanded = path.expanduser()
+    if not expanded.is_absolute():
+        expanded = (base or Path.cwd()) / expanded
+    return Path(os.path.abspath(os.fspath(expanded)))
+
+
 def _toml_string(value: object) -> str:
     # JSON escapes quotes, backslashes, and C0 controls like TOML basic strings.
     # TOML also forbids DEL, which JSON otherwise leaves literal.
@@ -154,8 +163,15 @@ def _sync_environment(
         "--python",
         "3.12",
     ]
+    child_environment = os.environ.copy()
+    child_environment["UV_PROJECT_ENVIRONMENT"] = str(project_root / ".venv")
     try:
-        run_command(command, cwd=project_root, check=True)
+        run_command(
+            command,
+            cwd=project_root,
+            check=True,
+            env=child_environment,
+        )
     except subprocess.CalledProcessError as exc:
         raise InstallError(
             "uv sync 安装依赖失败（退出码 %s）。请检查网络后重新运行。"
@@ -167,6 +183,13 @@ def _sync_environment(
         ) from exc
     except OSError as exc:
         raise InstallError("无法运行 uv：%s" % exc) from exc
+
+
+def _validate_python(python: Path) -> None:
+    if not python.is_file():
+        raise InstallError("Python 解释器不存在或不是文件：%s" % python)
+    if not os.access(str(python), os.X_OK):
+        raise InstallError("Python 解释器不可执行：%s" % python)
 
 
 def _create_runtime_directories(project_root: Path, vault: Path) -> None:
@@ -200,7 +223,7 @@ def install(
         if codex_config is not None
         else resolved_root / ".codex" / "config.toml"
     )
-    resolved_python = _absolute(
+    resolved_python = _absolute_without_symlink_resolution(
         Path(python)
         if python is not None
         else resolved_root / ".venv" / "bin" / "python"
@@ -213,6 +236,7 @@ def install(
             uv=uv,
             run_command=run_command or subprocess.run,
         )
+        _validate_python(resolved_python)
 
     _create_runtime_directories(resolved_root, resolved_vault)
     try:

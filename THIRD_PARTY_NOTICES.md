@@ -19,4 +19,9 @@ The executable is placed at `bin/uv` in the all-in-one ZIP and is used to prepar
 - License declared by the upstream model card: MIT
 - License text: `third_party/model/LICENSE-MIT`
 
+The pinned model repository does not contain a separate LICENSE file.
+`third_party/model/LICENSE-MIT` is a standard MIT license text supplied for
+license reference based on the upstream model-card metadata; it is not
+presented as a verbatim upstream license file.
+
 模型权重随 all-in-one ZIP 分发，安装后从本机 `data/models` 加载。模型名称、固定 revision 和来源链接用于标识所分发的确切权重；上游模型卡中的说明和归属仍然适用。

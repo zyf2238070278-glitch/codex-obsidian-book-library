@@ -184,12 +184,14 @@ def test_faq_answers_the_expected_first_run_questions() -> None:
 
 
 def test_release_text_contains_no_private_paths_or_live_credentials() -> None:
-    forbidden_literals = (
+    forbidden_literals = [
         "/Users/",
         "/home/",
         "C:\\Users\\",
-        "zhaoyunfei",
-    )
+    ]
+    home_account = Path.home().name
+    if home_account.casefold() not in {"admin", "guest", "root", "runner", "user"}:
+        forbidden_literals.append(home_account)
     credential_patterns = (
         re.compile(r"\bsk-(?:proj-)?[A-Za-z0-9_-]{16,}"),
         re.compile(r"\bgithub_pat_[A-Za-z0-9_]{20,}"),
@@ -260,5 +262,7 @@ def test_third_party_notice_pins_exact_components_and_license_paths() -> None:
             "MIT",
             "third_party/model/LICENSE-MIT",
             "模型权重随 all-in-one ZIP 分发",
+            "does not contain a separate LICENSE file",
+            "standard MIT license text",
         ),
     )

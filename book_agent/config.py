@@ -27,7 +27,7 @@ class AppPaths:
 
     @classmethod
     def from_root(cls, root: Path, vault_root: Path | None = None) -> Self:
-        resolved_root = root.expanduser().resolve()
+        resolved_root = root.resolve()
         vault = (
             resolved_root / "vault"
             if vault_root is None

@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from book_agent.config import AppPaths
 
 
@@ -20,6 +22,17 @@ def test_app_paths_are_rooted_under_project(tmp_path: Path) -> None:
         database=resolved_root / "data" / "library.sqlite3",
         models=resolved_root / "data" / "models",
     )
+
+
+def test_app_paths_preserve_literal_tilde_in_relative_project_root(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.chdir(tmp_path)
+
+    paths = AppPaths.from_root(Path("~/project"))
+
+    assert paths.root == (tmp_path / "~" / "project").resolve()
 
 
 def test_app_paths_keep_external_obsidian_files_separate_from_project_data(

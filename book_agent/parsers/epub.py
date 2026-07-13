@@ -25,6 +25,7 @@ _BODY_BLOCK_TAGS = (
 _HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
 _NON_RENDERED_TAGS = ("head", "script", "style", "nav", "template", "noscript")
 _NON_TEXT_NODES = (Comment, Declaration, Doctype, ProcessingInstruction)
+_HIDDEN_INLINE_STYLES = {("display", "none"), ("visibility", "hidden")}
 
 
 def _metadata_text(book: epub.EpubBook, name: str) -> Optional[str]:
@@ -33,6 +34,23 @@ def _metadata_text(book: epub.EpubBook, name: str) -> Optional[str]:
         if isinstance(value, str) and value.strip():
             return value.strip()
     return None
+
+
+def _is_explicitly_hidden(element: Any) -> bool:
+    if element.has_attr("hidden"):
+        return True
+
+    style = element.get("style")
+    if not isinstance(style, str):
+        return False
+    for declaration in style.split(";"):
+        property_name, separator, value = declaration.partition(":")
+        if separator and (
+            property_name.strip().casefold(),
+            value.strip().casefold(),
+        ) in _HIDDEN_INLINE_STYLES:
+            return True
+    return False
 
 
 def _spine_item(book: epub.EpubBook, entry: Any) -> Any:
@@ -87,6 +105,11 @@ def _source_unit(item: Any) -> Optional[SourceUnit]:
     soup = BeautifulSoup(item.get_content(), "html.parser")
     for unwanted in soup.find_all(_NON_RENDERED_TAGS):
         unwanted.decompose()
+    explicitly_hidden = [
+        element for element in soup.find_all(True) if _is_explicitly_hidden(element)
+    ]
+    for hidden in reversed(explicitly_hidden):
+        hidden.decompose()
 
     section = None
     for heading in soup.find_all(_HEADING_TAGS):

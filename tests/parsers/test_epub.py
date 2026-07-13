@@ -151,7 +151,16 @@ def test_epub_excludes_non_rendered_markup_but_keeps_visible_body_text(
                     <h1>可见章节</h1>
                     <template><div>模板提示词噪声</div></template>
                     <noscript><p>无脚本回退噪声</p></noscript>
+                    <p hidden>隐藏属性噪声</p>
+                    <div hidden><p>祖先隐藏属性噪声</p></div>
+                    <p style="display:none">内联显示隐藏噪声</p>
+                    <div style="DISPLAY: none"><p>祖先内联显示隐藏噪声</p></div>
+                    <p style="visibility:hidden">内联可见性隐藏噪声</p>
+                    <div style="visibility : HIDDEN">
+                      <p>祖先内联可见性隐藏噪声</p>
+                    </div>
                     <p>真实段落 <span>继续</span></p>
+                    <p style="display: block; visibility: visible">仍然可见</p>
                     <div>
                       真实容器
                       <blockquote>真实引用</blockquote>
@@ -169,7 +178,7 @@ def test_epub_excludes_non_rendered_markup_but_keeps_visible_body_text(
     assert len(book.units) == 1
     assert book.units[0].section == "可见章节"
     assert book.units[0].text == (
-        "真实段落 继续\n\n真实容器\n\n真实引用\n\n结尾"
+        "真实段落 继续\n\n仍然可见\n\n真实容器\n\n真实引用\n\n结尾"
     )
     for noise in (
         "头部标题噪声",
@@ -178,6 +187,12 @@ def test_epub_excludes_non_rendered_markup_but_keeps_visible_body_text(
         "隐藏处理指令",
         "模板提示词噪声",
         "无脚本回退噪声",
+        "隐藏属性噪声",
+        "祖先隐藏属性噪声",
+        "内联显示隐藏噪声",
+        "祖先内联显示隐藏噪声",
+        "内联可见性隐藏噪声",
+        "祖先内联可见性隐藏噪声",
     ):
         assert noise not in book.units[0].text
     assert book.units[0].text.count("真实段落") == 1

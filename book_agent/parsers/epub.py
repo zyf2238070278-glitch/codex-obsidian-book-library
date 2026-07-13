@@ -9,6 +9,22 @@ from book_agent.models import ParsedBook, SourceUnit
 from book_agent.parsers.base import DocumentParseError
 
 
+_BODY_BLOCK_TAGS = (
+    "p",
+    "li",
+    "div",
+    "blockquote",
+    "td",
+    "th",
+    "pre",
+    "dd",
+    "dt",
+    "figcaption",
+    "body",
+)
+_HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
+
+
 def _metadata_text(book: epub.EpubBook, name: str) -> Optional[str]:
     for entry in book.get_metadata("DC", name):
         value = entry[0] if isinstance(entry, (tuple, list)) and entry else entry
@@ -39,7 +55,9 @@ def _body_blocks(soup: BeautifulSoup) -> list[str]:
             current_parts = []
 
     for text_node in soup.find_all(string=True):
-        block = text_node.find_parent(["p", "li"])
+        if text_node.find_parent(_HEADING_TAGS) is not None:
+            continue
+        block = text_node.find_parent(_BODY_BLOCK_TAGS)
         if block is None:
             continue
         normalized = " ".join(str(text_node).split())
@@ -67,7 +85,7 @@ def _source_unit(item: Any) -> Optional[SourceUnit]:
         unwanted.decompose()
 
     section = None
-    for heading in soup.find_all(["h1", "h2", "h3", "h4", "h5", "h6"]):
+    for heading in soup.find_all(_HEADING_TAGS):
         heading_text = heading.get_text(" ", strip=True)
         if heading_text:
             section = heading_text

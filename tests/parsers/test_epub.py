@@ -128,6 +128,97 @@ def test_epub_body_extraction_removes_noise_and_preserves_dom_order(
     assert "导航噪声" not in book.units[0].text
 
 
+def test_epub_extracts_common_body_containers_and_direct_body_text(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "common-containers.epub"
+    _write_epub(
+        path,
+        [
+            (
+                "chapter.xhtml",
+                """
+                <h1>容器章节</h1>
+                直属   正文
+                <div>div <span>内容</span></div>
+                <blockquote>引用   内容</blockquote>
+                <table><tr><th>表头   文本</th><td>单元格 <strong>文本</strong></td></tr></table>
+                <pre>预格式
+                    内容</pre>
+                <dl><dt>术语   名称</dt><dd>术语
+                    定义</dd></dl>
+                <figure><figcaption>图注   文本</figcaption></figure>
+                """,
+            )
+        ],
+    )
+
+    book = parse_epub(path)
+
+    assert len(book.units) == 1
+    assert book.units[0].section == "容器章节"
+    assert book.units[0].text == (
+        "直属 正文\n\n"
+        "div 内容\n\n"
+        "引用 内容\n\n"
+        "表头 文本\n\n"
+        "单元格 文本\n\n"
+        "预格式 内容\n\n"
+        "术语 名称\n\n"
+        "术语 定义\n\n"
+        "图注 文本"
+    )
+    assert "容器章节" not in book.units[0].text
+
+
+def test_epub_common_containers_preserve_order_without_nested_duplicates_or_noise(
+    tmp_path: Path,
+) -> None:
+    path = tmp_path / "nested-containers.epub"
+    _write_epub(
+        path,
+        [
+            (
+                "second.xhtml",
+                "<h2>第二节</h2><div>末章   正文</div>",
+            ),
+            (
+                "first.xhtml",
+                """
+                <h1>第一节</h1>
+                <style>.hidden { display: none; } 样式噪声</style>
+                <script>脚本噪声</script>
+                <nav><div>导航噪声</div></nav>
+                <div>
+                  开头
+                  <blockquote>
+                    引用 <span>只出现一次</span>
+                    <div>内部   内容</div>
+                    结尾
+                  </blockquote>
+                  收尾
+                </div>
+                """,
+            ),
+        ],
+        spine=["first.xhtml", "second.xhtml"],
+    )
+
+    book = parse_epub(path)
+
+    assert [unit.section for unit in book.units] == ["第一节", "第二节"]
+    assert [unit.text for unit in book.units] == [
+        "开头\n\n引用 只出现一次\n\n内部 内容\n\n结尾\n\n收尾",
+        "末章 正文",
+    ]
+    assert book.units[0].text.count("只出现一次") == 1
+    assert "第一节" not in book.units[0].text
+    assert "第二节" not in book.units[1].text
+    assert "样式噪声" not in book.units[0].text
+    assert "脚本噪声" not in book.units[0].text
+    assert "导航噪声" not in book.units[0].text
+
+
 def test_epub_skips_navigation_and_empty_spine_documents(tmp_path: Path) -> None:
     path = tmp_path / "skip-empty.epub"
     _write_epub(

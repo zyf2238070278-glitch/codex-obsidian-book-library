@@ -9,7 +9,11 @@ from pathlib import Path
 
 from book_agent.markdown import markdown_literal
 from book_agent.models import ParsedBook, Passage
-from book_agent.vault import _managed_directory_beneath, _secure_create_open_flags
+from book_agent.vault import (
+    VaultManager,
+    _managed_directory_beneath,
+    _secure_create_open_flags,
+)
 
 
 def _json_string(value: str) -> str:
@@ -111,51 +115,77 @@ def render_parsed_book(
     root = Path(destination.anchor) if managed_root is None else Path(managed_root)
     content = _render(book_id, parsed, source_file, passages)
 
-    with _managed_directory_beneath(
-        root,
-        destination.parent,
-        "parsed book",
-        create=True,
-        root_label="managed root",
-        create_root=False,
-        expected_root_identity=expected_root_identity,
-    ) as (_, directory_fd):
-        try:
-            destination_info = os.stat(
-                destination.name,
-                dir_fd=directory_fd,
-                follow_symlinks=False,
-            )
-        except FileNotFoundError:
-            pass
-        else:
-            if stat.S_ISLNK(destination_info.st_mode):
-                raise ValueError("Parsed Markdown destination must not be a symlink")
-
-        temp_name = f".render-{secrets.token_hex(12)}"
-        temp_fd = os.open(
-            temp_name,
-            _secure_create_open_flags(),
-            0o600,
-            dir_fd=directory_fd,
-        )
-        try:
+    cleanup_fd: int | None = None
+    published_info: os.stat_result | None = None
+    try:
+        with _managed_directory_beneath(
+            root,
+            destination.parent,
+            "parsed book",
+            create=True,
+            root_label="managed root",
+            create_root=False,
+            expected_root_identity=expected_root_identity,
+        ) as (_, directory_fd):
+            cleanup_fd = os.dup(directory_fd)
             try:
-                _write_complete(temp_fd, content.encode("utf-8"))
-            finally:
-                os.close(temp_fd)
-            try:
-                os.replace(
-                    temp_name,
+                destination_info = os.stat(
                     destination.name,
-                    src_dir_fd=directory_fd,
-                    dst_dir_fd=directory_fd,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
                 )
-            except (TypeError, NotImplementedError) as exc:
-                raise RuntimeError(
-                    "This platform cannot atomically publish parsed Markdown by directory FD"
-                ) from exc
-            temp_name = None
-        finally:
-            _remove_temp(directory_fd, temp_name)
+            except FileNotFoundError:
+                pass
+            else:
+                if stat.S_ISLNK(destination_info.st_mode):
+                    raise ValueError(
+                        "Parsed Markdown destination must not be a symlink"
+                    )
+
+            temp_name = f".render-{secrets.token_hex(12)}"
+            temp_fd = os.open(
+                temp_name,
+                _secure_create_open_flags(),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            try:
+                try:
+                    _write_complete(temp_fd, content.encode("utf-8"))
+                finally:
+                    os.close(temp_fd)
+                try:
+                    os.replace(
+                        temp_name,
+                        destination.name,
+                        src_dir_fd=directory_fd,
+                        dst_dir_fd=directory_fd,
+                    )
+                except (TypeError, NotImplementedError) as exc:
+                    raise RuntimeError(
+                        "This platform cannot atomically publish parsed Markdown "
+                        "by directory FD"
+                    ) from exc
+                temp_name = None
+                published_info = os.stat(
+                    destination.name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+            finally:
+                _remove_temp(directory_fd, temp_name)
+    except BaseException:
+        if cleanup_fd is not None and published_info is not None:
+            VaultManager._unlink_if_same(
+                cleanup_fd,
+                destination.name,
+                published_info,
+            )
+        raise
+    finally:
+        if cleanup_fd is not None:
+            try:
+                os.close(cleanup_fd)
+            except OSError:
+                pass
     return destination

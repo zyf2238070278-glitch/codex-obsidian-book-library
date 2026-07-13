@@ -20,6 +20,13 @@ class SavedNote:
     wiki_link: str
 
 
+@dataclass(frozen=True)
+class _PublishedNote:
+    path: Path
+    name: str
+    info: os.stat_result
+
+
 _UNSAFE_FILENAME = re.compile(r'[<>:"/\\|?*\[\]#^\x00-\x1f\x7f]')
 _SAFE_CITATION_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9_-]{0,127}\Z")
 _TEMP_PREFIX = ".note-"
@@ -136,7 +143,8 @@ class NoteService:
             vault_root_identity=self.vault_root_identity,
         )
         manager.ensure_layout()
-        directory_fd: int | None = None
+        cleanup_fd: int | None = None
+        published: _PublishedNote | None = None
         notes_directory = self.paths.notes
         try:
             with manager._managed_directory(
@@ -144,21 +152,31 @@ class NoteService:
                 "notes",
                 create=False,
             ) as (notes_directory, verified_fd):
-                directory_fd = os.dup(verified_fd)
+                cleanup_fd = os.dup(verified_fd)
+                published = self._publish(
+                    content,
+                    safe_title,
+                    timestamp,
+                    verified_fd,
+                    notes_directory,
+                )
         except BaseException:
-            if directory_fd is not None:
+            if cleanup_fd is not None and published is not None:
+                VaultManager._unlink_if_same(
+                    cleanup_fd,
+                    published.name,
+                    published.info,
+                )
+            raise
+        finally:
+            if cleanup_fd is not None:
                 try:
-                    os.close(directory_fd)
+                    os.close(cleanup_fd)
                 except OSError:
                     pass
-            raise
-        destination = self._publish(
-            content,
-            safe_title,
-            timestamp,
-            directory_fd,
-            notes_directory,
-        )
+        if published is None:
+            raise AssertionError("note publication did not produce a file")
+        destination = published.path
         relative = destination.relative_to(self.paths.vault).with_suffix("")
         return SavedNote(
             path=str(Path(destination).absolute()),
@@ -172,15 +190,19 @@ class NoteService:
         timestamp: str,
         directory_fd: int,
         notes_directory: Path,
-    ) -> Path:
+    ) -> _PublishedNote:
         temp_name: str | None = None
-        published: Path | None = None
+        temp_info: os.stat_result | None = None
+        published_name: str | None = None
+        published_info: os.stat_result | None = None
+        published: _PublishedNote | None = None
         primary_error: BaseException | None = None
         try:
             temp_name, temp_fd = self._reserve_temp(directory_fd)
             write_error: BaseException | None = None
             try:
                 self._write_complete(temp_fd, content.encode("utf-8"))
+                temp_info = os.fstat(temp_fd)
             except BaseException as exc:
                 write_error = exc
             try:
@@ -198,7 +220,9 @@ class NoteService:
                     "Unable to determine the notes filesystem filename limit"
                 ) from exc
             if name_max <= 0:
-                raise RuntimeError("The notes filesystem reported an invalid filename limit")
+                raise RuntimeError(
+                    "The notes filesystem reported an invalid filename limit"
+                )
 
             for candidate in self._candidate_names(
                 safe_title,
@@ -220,10 +244,41 @@ class NoteService:
                         "Atomic hard-link publication failed; the notes filesystem "
                         "may not support hard links or cross-filesystem linking"
                     ) from exc
-                published = notes_directory / candidate
+                published_name = candidate
+                published_info = os.stat(
+                    candidate,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if temp_info is None or (
+                    published_info.st_dev,
+                    published_info.st_ino,
+                ) != (temp_info.st_dev, temp_info.st_ino):
+                    raise RuntimeError(
+                        "Published note identity differs from temporary note"
+                    )
                 break
+            if published_name is None or published_info is None:
+                raise RuntimeError("Unable to choose a unique note filename")
+            published = _PublishedNote(
+                path=notes_directory / published_name,
+                name=published_name,
+                info=published_info,
+            )
         except BaseException as exc:
             primary_error = exc
+            if published_name is not None and published_info is not None:
+                VaultManager._unlink_if_same(
+                    directory_fd,
+                    published_name,
+                    published_info,
+                )
+            elif published_name is not None and temp_info is not None:
+                VaultManager._unlink_if_same(
+                    directory_fd,
+                    published_name,
+                    temp_info,
+                )
 
         cleanup_error: OSError | None = None
         try:
@@ -233,18 +288,19 @@ class NoteService:
             pass
         except OSError as exc:
             cleanup_error = exc
-        try:
-            os.close(directory_fd)
-        except OSError as exc:
-            if cleanup_error is None:
-                cleanup_error = exc
 
         if primary_error is not None:
+            if cleanup_error is not None:
+                primary_error.add_note(
+                    "Temporary note cleanup also failed: " + str(cleanup_error)
+                )
             raise primary_error
         if published is not None:
             return published
         if cleanup_error is not None:
-            raise RuntimeError("Unable to clean up an unpublished temporary note") from cleanup_error
+            raise RuntimeError(
+                "Unable to clean up an unpublished temporary note"
+            ) from cleanup_error
         raise RuntimeError("Unable to choose a unique note filename")
 
     @staticmethod

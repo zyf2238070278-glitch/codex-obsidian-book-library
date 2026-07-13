@@ -21,7 +21,7 @@ from book_agent.parsers import (
 )
 from book_agent.rendering import render_parsed_book
 from book_agent.storage import Database
-from book_agent.vault import VaultManager
+from book_agent.vault import ImportedOriginal, VaultManager
 
 
 _HASH_BLOCK_SIZE = 1024 * 1024
@@ -72,9 +72,13 @@ class ImportResult:
         }
 
 
-def sha256_file(path: str | Path) -> str:
+def sha256_file(path: str | Path | int) -> str:
     digest = hashlib.sha256()
-    with Path(path).open("rb") as stream:
+    if isinstance(path, int):
+        stream_context = os.fdopen(os.dup(path), "rb")
+    else:
+        stream_context = Path(path).open("rb")
+    with stream_context as stream:
         while block := stream.read(_HASH_BLOCK_SIZE):
             digest.update(block)
     return digest.hexdigest()
@@ -163,19 +167,25 @@ class ImportService:
                 author=author,
             )
 
-        original = self.vault.import_original(source_path)
+        copied_path = self.vault.import_original(source_path)
+        imported_original = self.vault._inspect_original(
+            copied_path,
+            hasher=sha256_file,
+            remove_on_hash_error=True,
+        )
+        original = imported_original.path
         try:
             original_path = str(original.absolute())
-            copied_hash = sha256_file(original)
+            copied_hash = imported_original.content_sha256
             if copied_hash != content_hash:
                 raise _ContentHashDrift
             initial_title = source_path.stem if title is None else title
         except _ContentHashDrift:
-            self._remove_imported_original(original)
+            self._remove_imported_original(imported_original)
             raise
         except BaseException as ownership_error:
             self._cleanup_unregistered_original(
-                original,
+                imported_original,
                 ownership_error,
                 "注册书籍前失败后无法清理刚复制的原书",
             )
@@ -192,7 +202,7 @@ class ImportService:
             )
         except BaseException as create_error:
             self._cleanup_unregistered_original(
-                original,
+                imported_original,
                 create_error,
                 "创建书籍记录失败后无法清理刚复制的原书",
             )
@@ -201,7 +211,7 @@ class ImportService:
         return self._process_registered_book(
             book_id=book_id,
             source_format=source_format,
-            original=original,
+            original=imported_original,
             original_path=original_path,
             title=title,
             author=author,
@@ -246,20 +256,27 @@ class ImportService:
         *,
         supplied_source: Path,
         content_hash: str,
-    ) -> tuple[Path, str]:
+    ) -> tuple[ImportedOriginal, str]:
         configured = Path(str(existing["original_path"]))
         try:
-            original, _ = self._validate_source(configured)
-            if original.parent != self.paths.originals.absolute():
+            original = self.vault._inspect_original(
+                configured,
+                hasher=sha256_file,
+            )
+            if original.path.parent != self.paths.originals.absolute():
                 raise ValueError("原书不在受管书库目录中。")
-            if sha256_file(original) != content_hash:
+            if original.content_sha256 != content_hash:
                 raise ValueError("受管原书内容与数据库哈希不一致。")
         except (OSError, ValueError):
-            restored = self.vault.import_original(supplied_source)
+            restored_path = self.vault.import_original(supplied_source)
+            restored = self.vault._inspect_original(
+                restored_path,
+                hasher=sha256_file,
+            )
             try:
-                if sha256_file(restored) != content_hash:
+                if restored.content_sha256 != content_hash:
                     raise ValueError("待恢复文件在导入期间发生变化。")
-                restored_path = str(restored.absolute())
+                restored_path = str(restored.path.absolute())
                 self.database.update_book_original_path(
                     str(existing["book_id"]), restored_path
                 )
@@ -271,14 +288,14 @@ class ImportService:
                 )
                 raise
             return restored, restored_path
-        return original, str(original.absolute())
+        return original, str(original.path.absolute())
 
     def _process_registered_book(
         self,
         *,
         book_id: str,
         source_format: str,
-        original: Path,
+        original: ImportedOriginal,
         original_path: str,
         title: str | None,
         author: str | None,
@@ -286,7 +303,9 @@ class ImportService:
         parsed_path: str | None = None
         passage_count = 0
         try:
-            parsed = parse_document(original, title=title, author=author)
+            self.vault._validate_original_identity(original.path, original.identity)
+            parsed = parse_document(original.path, title=title, author=author)
+            self.vault._validate_original_identity(original.path, original.identity)
             self.database.update_book_metadata(book_id, parsed.title, parsed.author)
             destination = self.paths.parsed / book_id / "正文.md"
             markdown_path = destination.relative_to(self.paths.vault).as_posix()
@@ -297,7 +316,7 @@ class ImportService:
                 destination,
                 book_id,
                 parsed,
-                original,
+                original.path,
                 passages,
                 managed_root=self.paths.vault,
                 expected_root_identity=self.vault_root_identity,
@@ -485,21 +504,12 @@ class ImportService:
             message="这本书已经导入，无需重复复制。",
         )
 
-    def _remove_imported_original(self, original: Path) -> None:
-        original = original.absolute()
-        originals = self.paths.originals.absolute()
-        if original.parent != originals:
-            raise RuntimeError(f"拒绝删除书库目录外的文件：{original}")
-        original_info = original.lstat()
-        if stat.S_ISLNK(original_info.st_mode) or not stat.S_ISREG(
-            original_info.st_mode
-        ):
-            raise RuntimeError(f"拒绝删除非普通原书文件：{original}")
-        original.unlink()
+    def _remove_imported_original(self, original: ImportedOriginal) -> None:
+        self.vault._remove_original(original.path, original.identity)
 
     def _cleanup_unregistered_original(
         self,
-        original: Path,
+        original: ImportedOriginal,
         failure: BaseException,
         context: str,
     ) -> None:

@@ -1,10 +1,12 @@
 import errno
+import hashlib
 import os
 import secrets
 import shutil
 import stat
-from collections.abc import Iterator
+from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from dataclasses import dataclass
 from itertools import count
 from pathlib import Path
 
@@ -13,6 +15,14 @@ from book_agent.config import AppPaths
 
 _TEMP_PREFIX = ".import-"
 _TEMP_RANDOM_BYTES = 12
+_HASH_BLOCK_SIZE = 1024 * 1024
+
+
+@dataclass(frozen=True)
+class ImportedOriginal:
+    path: Path
+    content_sha256: str
+    identity: tuple[int, int]
 
 
 def _required_open_flag(name: str) -> int:
@@ -49,6 +59,13 @@ def _secure_create_open_flags() -> int:
         | getattr(os, "O_CLOEXEC", 0)
         | _required_open_flag("O_NOFOLLOW")
     )
+
+
+def _close_quietly(file_descriptor: int) -> None:
+    try:
+        os.close(file_descriptor)
+    except OSError:
+        pass
 
 
 def _absolute_path(path: Path, label: str) -> Path:
@@ -154,12 +171,34 @@ def _open_absolute_directory(directory: Path, label: str, *, create: bool) -> in
             )
             previous_fd = current_fd
             current_fd = next_fd
-            os.close(previous_fd)
+            _close_quietly(previous_fd)
             current_path /= component
         return current_fd
     except BaseException:
-        os.close(current_fd)
+        _close_quietly(current_fd)
         raise
+
+
+def _verify_absolute_directory_identity(
+    directory: Path,
+    label: str,
+    expected_identity: tuple[int, int],
+) -> None:
+    try:
+        verification_fd = _open_absolute_directory(directory, label, create=False)
+    except ValueError as exc:
+        raise ValueError(f"Managed {label} identity changed: {directory}") from exc
+    try:
+        try:
+            current = os.fstat(verification_fd)
+        except OSError as exc:
+            raise ValueError(
+                f"Managed {label} identity cannot be verified: {directory}"
+            ) from exc
+        if (current.st_dev, current.st_ino) != expected_identity:
+            raise ValueError(f"Managed {label} identity changed: {directory}")
+    finally:
+        _close_quietly(verification_fd)
 
 
 @contextmanager
@@ -185,20 +224,23 @@ def _managed_directory_beneath(
         root_label,
         create=create if create_root is None else create_root,
     )
-    if expected_root_identity is not None:
-        try:
-            root_info = os.fstat(root_fd)
-        except OSError as exc:
-            os.close(root_fd)
-            raise ValueError(
-                f"Managed {root_label} cannot be inspected safely: {root}"
-            ) from exc
-        actual_root_identity = (root_info.st_dev, root_info.st_ino)
-        if actual_root_identity != expected_root_identity:
-            os.close(root_fd)
-            raise ValueError(f"Managed {root_label} identity changed: {root}")
+    try:
+        root_info = os.fstat(root_fd)
+    except OSError as exc:
+        os.close(root_fd)
+        raise ValueError(
+            f"Managed {root_label} cannot be inspected safely: {root}"
+        ) from exc
+    pinned_root_identity = (root_info.st_dev, root_info.st_ino)
+    if (
+        expected_root_identity is not None
+        and pinned_root_identity != expected_root_identity
+    ):
+        os.close(root_fd)
+        raise ValueError(f"Managed {root_label} identity changed: {root}")
     current_fd = root_fd
     current_path = root
+    completed = False
     try:
         for component in directory.relative_to(root).parts:
             next_fd = _open_directory_component(
@@ -213,8 +255,17 @@ def _managed_directory_beneath(
             os.close(previous_fd)
             current_path /= component
         yield directory, current_fd
+        completed = True
     finally:
-        os.close(current_fd)
+        try:
+            if completed:
+                _verify_absolute_directory_identity(
+                    root,
+                    root_label,
+                    pinned_root_identity,
+                )
+        finally:
+            _close_quietly(current_fd)
 
 
 class VaultManager:
@@ -245,40 +296,225 @@ class VaultManager:
                 pass
 
     def import_original(self, source: Path) -> Path:
+        return self._import_original_verified(source).path
+
+    def _import_original_verified(self, source: Path) -> ImportedOriginal:
         source_path, source_fd, source_info = self._open_source(source)
+        cleanup_fd: int | None = None
+        published_name: str | None = None
+        published_info: os.stat_result | None = None
+        imported: ImportedOriginal | None = None
         try:
-            with self._managed_directory(
-                self.paths.inbox,
-                "inbox",
-                create=False,
-            ) as (_, inbox_fd):
+            try:
                 with self._managed_directory(
-                    self.paths.originals,
-                    "originals",
+                    self.paths.inbox,
+                    "inbox",
                     create=False,
-                ) as (originals, originals_fd):
-                    temp_name, temp_fd, temp_info = self._reserve_temp(inbox_fd)
-                    try:
-                        self._copy_complete(
-                            source_fd,
-                            source_info,
-                            temp_fd,
-                            source,
-                        )
-                        final_name = self._link_final(
-                            inbox_fd,
-                            temp_name,
-                            originals_fd,
-                            source_path.name,
-                        )
-                        return originals / final_name
-                    finally:
+                ) as (_, inbox_fd):
+                    with self._managed_directory(
+                        self.paths.originals,
+                        "originals",
+                        create=False,
+                    ) as (originals, originals_fd):
+                        cleanup_fd = os.dup(originals_fd)
+                        temp_name, temp_fd, temp_info = self._reserve_temp(inbox_fd)
                         try:
-                            os.close(temp_fd)
+                            self._copy_complete(
+                                source_fd,
+                                source_info,
+                                temp_fd,
+                                source,
+                            )
+                            hash_fd = os.open(
+                                temp_name,
+                                _secure_source_open_flags(),
+                                dir_fd=inbox_fd,
+                            )
+                            try:
+                                hash_info = os.fstat(hash_fd)
+                                if (
+                                    hash_info.st_dev,
+                                    hash_info.st_ino,
+                                ) != (temp_info.st_dev, temp_info.st_ino):
+                                    raise ValueError(
+                                        "Import temp identity changed before hashing"
+                                    )
+                                copied_hash = self._hash_descriptor(hash_fd)
+                            finally:
+                                os.close(hash_fd)
+                            published_name = self._link_final(
+                                inbox_fd,
+                                temp_name,
+                                originals_fd,
+                                source_path.name,
+                            )
+                            published_info = os.stat(
+                                published_name,
+                                dir_fd=originals_fd,
+                                follow_symlinks=False,
+                            )
+                            if (
+                                published_info.st_dev,
+                                published_info.st_ino,
+                            ) != (temp_info.st_dev, temp_info.st_ino):
+                                raise ValueError(
+                                    "Published original identity differs from "
+                                    "import temp"
+                                )
+                            imported = ImportedOriginal(
+                                path=originals / published_name,
+                                content_sha256=copied_hash,
+                                identity=(
+                                    published_info.st_dev,
+                                    published_info.st_ino,
+                                ),
+                            )
                         finally:
-                            self._unlink_if_same(inbox_fd, temp_name, temp_info)
+                            try:
+                                os.close(temp_fd)
+                            finally:
+                                self._unlink_if_same(inbox_fd, temp_name, temp_info)
+            except BaseException:
+                if (
+                    cleanup_fd is not None
+                    and published_name is not None
+                    and published_info is not None
+                ):
+                    self._unlink_if_same(
+                        cleanup_fd,
+                        published_name,
+                        published_info,
+                    )
+                raise
         finally:
-            os.close(source_fd)
+            try:
+                if cleanup_fd is not None:
+                    _close_quietly(cleanup_fd)
+            finally:
+                _close_quietly(source_fd)
+        if imported is None:
+            raise AssertionError("verified original import did not publish a file")
+        return imported
+
+    def _inspect_original(
+        self,
+        original: Path,
+        *,
+        hasher: Callable[[int], str] | None = None,
+        remove_on_hash_error: bool = False,
+    ) -> ImportedOriginal:
+        original = self._validated_original_path(original)
+        with self._managed_directory(
+            self.paths.originals,
+            "originals",
+            create=False,
+        ) as (_, originals_fd):
+            try:
+                file_fd = os.open(
+                    original.name,
+                    _secure_source_open_flags(),
+                    dir_fd=originals_fd,
+                )
+            except OSError as exc:
+                raise ValueError(
+                    f"Managed original cannot be opened safely: {original}"
+                ) from exc
+            try:
+                file_info = os.fstat(file_fd)
+                if not stat.S_ISREG(file_info.st_mode):
+                    raise ValueError(
+                        f"Managed original is not a regular file: {original}"
+                    )
+                try:
+                    content_hash = (hasher or self._hash_descriptor)(file_fd)
+                except BaseException:
+                    if remove_on_hash_error:
+                        self._unlink_if_same(
+                            originals_fd,
+                            original.name,
+                            file_info,
+                        )
+                    raise
+            finally:
+                os.close(file_fd)
+        return ImportedOriginal(
+            path=original,
+            content_sha256=content_hash,
+            identity=(file_info.st_dev, file_info.st_ino),
+        )
+
+    def _remove_original(self, original: Path, identity: tuple[int, int]) -> None:
+        original = self._validated_original_path(original)
+        with self._managed_directory(
+            self.paths.originals,
+            "originals",
+            create=False,
+        ) as (_, originals_fd):
+            try:
+                current = os.stat(
+                    original.name,
+                    dir_fd=originals_fd,
+                    follow_symlinks=False,
+                )
+            except OSError as exc:
+                raise RuntimeError(
+                    f"受管原书不可安全检查：{original}"
+                ) from exc
+            if stat.S_ISLNK(current.st_mode) or not stat.S_ISREG(current.st_mode):
+                raise RuntimeError(f"拒绝删除非普通原书文件：{original}")
+            if (current.st_dev, current.st_ino) != identity:
+                raise RuntimeError(
+                    f"拒绝删除身份已变化的原书文件：{original}"
+                )
+            self._unlink_if_same(originals_fd, original.name, current)
+
+    def _validate_original_identity(
+        self,
+        original: Path,
+        identity: tuple[int, int],
+    ) -> None:
+        original = self._validated_original_path(original)
+        with self._managed_directory(
+            self.paths.originals,
+            "originals",
+            create=False,
+        ) as (_, originals_fd):
+            try:
+                file_fd = os.open(
+                    original.name,
+                    _secure_source_open_flags(),
+                    dir_fd=originals_fd,
+                )
+            except OSError as exc:
+                raise ValueError(
+                    f"Managed original cannot be opened safely: {original}"
+                ) from exc
+            try:
+                current = os.fstat(file_fd)
+            finally:
+                os.close(file_fd)
+            if not stat.S_ISREG(current.st_mode):
+                raise ValueError(f"Managed original is not a regular file: {original}")
+            if (current.st_dev, current.st_ino) != identity:
+                raise ValueError(f"Managed original identity changed: {original}")
+
+    def _validated_original_path(self, original: Path) -> Path:
+        original = _absolute_path(Path(original), "managed original")
+        originals = _absolute_path(self.paths.originals, "originals")
+        if original.parent != originals:
+            raise ValueError(
+                f"Managed original is outside originals directory: {original}"
+            )
+        return original
+
+    @staticmethod
+    def _hash_descriptor(file_descriptor: int) -> str:
+        digest = hashlib.sha256()
+        offset = 0
+        while block := os.pread(file_descriptor, _HASH_BLOCK_SIZE, offset):
+            digest.update(block)
+            offset += len(block)
+        return digest.hexdigest()
 
     def _open_source(self, source: Path) -> tuple[Path, int, os.stat_result]:
         try:

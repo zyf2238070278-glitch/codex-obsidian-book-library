@@ -236,6 +236,87 @@ def test_render_rejects_replaced_managed_root_identity(tmp_path: Path) -> None:
     assert list(displaced_root.iterdir()) == []
 
 
+def test_render_root_swap_after_replace_rolls_back_without_returning_stale_path(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    managed_root = tmp_path / "managed-root"
+    managed_root.mkdir()
+    root_info = os.lstat(managed_root)
+    expected_identity = (root_info.st_dev, root_info.st_ino)
+    displaced_root = tmp_path / "displaced-root"
+    destination = managed_root / "nested" / "book.md"
+    sentinel_payload = b"replacement render sentinel"
+    real_replace = rendering.os.replace
+
+    def replace_then_replace_root(*args: object, **kwargs: object) -> None:
+        real_replace(*args, **kwargs)
+        managed_root.rename(displaced_root)
+        replacement_directory = managed_root / "nested"
+        replacement_directory.mkdir(parents=True)
+        (replacement_directory / "sentinel.md").write_bytes(sentinel_payload)
+
+    monkeypatch.setattr(rendering.os, "replace", replace_then_replace_root)
+
+    with pytest.raises(ValueError, match=r"managed root.*identity"):
+        rendering.render_parsed_book(
+            destination,
+            "book-1",
+            _parsed(),
+            "source.pdf",
+            [_passage(0, "不得返回失真的路径。")],
+            managed_root=managed_root,
+            expected_root_identity=expected_identity,
+        )
+
+    replacement_directory = managed_root / "nested"
+    assert (replacement_directory / "sentinel.md").read_bytes() == sentinel_payload
+    assert list(replacement_directory.iterdir()) == [
+        replacement_directory / "sentinel.md"
+    ]
+    assert list((displaced_root / "nested").iterdir()) == []
+
+
+def test_render_root_symlink_swap_after_replace_never_writes_to_target(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    managed_root = tmp_path / "managed-root"
+    managed_root.mkdir()
+    root_info = os.lstat(managed_root)
+    expected_identity = (root_info.st_dev, root_info.st_ino)
+    displaced_root = tmp_path / "displaced-root"
+    symlink_target = tmp_path / "symlink-target"
+    target_directory = symlink_target / "nested"
+    target_directory.mkdir(parents=True)
+    sentinel = target_directory / "sentinel.md"
+    sentinel.write_bytes(b"symlink target sentinel")
+    destination = managed_root / "nested" / "book.md"
+    real_replace = rendering.os.replace
+
+    def replace_then_symlink_root(*args: object, **kwargs: object) -> None:
+        real_replace(*args, **kwargs)
+        managed_root.rename(displaced_root)
+        managed_root.symlink_to(symlink_target, target_is_directory=True)
+
+    monkeypatch.setattr(rendering.os, "replace", replace_then_symlink_root)
+
+    with pytest.raises(ValueError, match=r"managed root.*identity"):
+        rendering.render_parsed_book(
+            destination,
+            "book-1",
+            _parsed(),
+            "source.pdf",
+            [_passage(0, "不得写入符号链接目标。")],
+            managed_root=managed_root,
+            expected_root_identity=expected_identity,
+        )
+
+    assert sentinel.read_bytes() == b"symlink target sentinel"
+    assert list(target_directory.iterdir()) == [sentinel]
+    assert list((displaced_root / "nested").iterdir()) == []
+
+
 def test_replace_failure_preserves_old_file_and_cleans_unique_temp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

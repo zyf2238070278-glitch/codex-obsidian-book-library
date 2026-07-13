@@ -2,7 +2,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import ebooklib
-from bs4 import BeautifulSoup
+from bs4 import BeautifulSoup, Comment, Declaration, Doctype, ProcessingInstruction
 from ebooklib import epub
 
 from book_agent.models import ParsedBook, SourceUnit
@@ -23,6 +23,8 @@ _BODY_BLOCK_TAGS = (
     "body",
 )
 _HEADING_TAGS = ("h1", "h2", "h3", "h4", "h5", "h6")
+_NON_RENDERED_TAGS = ("head", "script", "style", "nav", "template", "noscript")
+_NON_TEXT_NODES = (Comment, Declaration, Doctype, ProcessingInstruction)
 
 
 def _metadata_text(book: epub.EpubBook, name: str) -> Optional[str]:
@@ -55,6 +57,8 @@ def _body_blocks(soup: BeautifulSoup) -> list[str]:
             current_parts = []
 
     for text_node in soup.find_all(string=True):
+        if isinstance(text_node, _NON_TEXT_NODES):
+            continue
         if text_node.find_parent(_HEADING_TAGS) is not None:
             continue
         block = text_node.find_parent(_BODY_BLOCK_TAGS)
@@ -81,7 +85,7 @@ def _source_unit(item: Any) -> Optional[SourceUnit]:
         return None
 
     soup = BeautifulSoup(item.get_content(), "html.parser")
-    for unwanted in soup.find_all(["script", "style", "nav"]):
+    for unwanted in soup.find_all(_NON_RENDERED_TAGS):
         unwanted.decompose()
 
     section = None

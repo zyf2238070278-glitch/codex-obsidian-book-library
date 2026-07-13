@@ -1,3 +1,4 @@
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Self
@@ -6,6 +7,10 @@ from typing import Self
 MAX_PREVIEWS = 10
 MAX_FULL_PASSAGES = 6
 MAX_EVIDENCE_TOKENS = 8000
+
+
+def _absolute_without_following_symlinks(path: Path) -> Path:
+    return Path(os.path.abspath(os.fspath(path.expanduser())))
 
 
 @dataclass(frozen=True)
@@ -21,9 +26,13 @@ class AppPaths:
     models: Path
 
     @classmethod
-    def from_root(cls, root: Path) -> Self:
-        resolved_root = root.resolve()
-        vault = resolved_root / "vault"
+    def from_root(cls, root: Path, vault_root: Path | None = None) -> Self:
+        resolved_root = root.expanduser().resolve()
+        vault = (
+            resolved_root / "vault"
+            if vault_root is None
+            else _absolute_without_following_symlinks(vault_root)
+        )
         library = vault / "书库"
 
         return cls(

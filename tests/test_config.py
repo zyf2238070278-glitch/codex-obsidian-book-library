@@ -20,3 +20,39 @@ def test_app_paths_are_rooted_under_project(tmp_path: Path) -> None:
         database=resolved_root / "data" / "library.sqlite3",
         models=resolved_root / "data" / "models",
     )
+
+
+def test_app_paths_keep_external_obsidian_files_separate_from_project_data(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "project"
+    obsidian_vault = tmp_path / "current-obsidian"
+
+    paths = AppPaths.from_root(project_root, vault_root=obsidian_vault)
+
+    resolved_root = project_root.resolve()
+    absolute_vault = obsidian_vault.absolute()
+    assert paths == AppPaths(
+        root=resolved_root,
+        vault=absolute_vault,
+        library=absolute_vault / "书库",
+        inbox=absolute_vault / "书库" / "00-待导入",
+        originals=absolute_vault / "书库" / "10-原始书籍",
+        parsed=absolute_vault / "书库" / "20-解析文本",
+        notes=absolute_vault / "书库" / "30-AI读书笔记",
+        database=resolved_root / "data" / "library.sqlite3",
+        models=resolved_root / "data" / "models",
+    )
+
+
+def test_app_paths_do_not_follow_an_external_vault_symlink(tmp_path: Path) -> None:
+    project_root = tmp_path / "project"
+    target = tmp_path / "target"
+    alias = tmp_path / "alias"
+    target.mkdir()
+    alias.symlink_to(target, target_is_directory=True)
+
+    paths = AppPaths.from_root(project_root, vault_root=alias)
+
+    assert paths.vault == alias.absolute()
+    assert paths.vault != target.resolve()

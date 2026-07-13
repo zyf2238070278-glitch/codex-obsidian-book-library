@@ -94,10 +94,77 @@ def test_semantic_paraphrase_finds_the_intended_passage_without_keyword_overlap(
     hybrid = Retriever(db, provider).search(query, mode="auto")
     quote_fallback = Retriever(db, provider).search(query, mode="quote")
 
-    assert [hit.passage_id for hit in hybrid] == ["cycle", "marketing"]
+    assert [hit.passage_id for hit in hybrid] == ["cycle"]
     assert hybrid[0].score == pytest.approx(1 / 61)
-    assert [hit.passage_id for hit in quote_fallback] == ["cycle", "marketing"]
+    assert [hit.passage_id for hit in quote_fallback] == ["cycle"]
     assert quote_fallback[0].score == pytest.approx(1.0)
+
+
+def test_semantic_search_drops_weak_orthogonal_and_negative_evidence(
+    db: Database,
+) -> None:
+    query = "行业为何缺货"
+    _add_book(
+        db,
+        "irrelevant",
+        [
+            _passage(
+                "weak-positive",
+                "irrelevant",
+                0,
+                "一段几乎无关的内容。",
+                _vector([0.1, np.sqrt(0.99)]),
+            ),
+            _passage(
+                "orthogonal",
+                "irrelevant",
+                1,
+                "另一段正交内容。",
+                _vector([0.0, 1.0]),
+            ),
+            _passage(
+                "negative",
+                "irrelevant",
+                2,
+                "语义方向相反。",
+                _vector([-1.0, 0.0]),
+            ),
+        ],
+    )
+    provider = DeterministicEmbeddingProvider({query: [1.0, 0.0]})
+
+    assert Retriever(db, provider).search(query, mode="quote") == []
+
+
+def test_zero_score_semantic_candidate_cannot_tie_a_keyword_hit_in_rrf(
+    db: Database,
+) -> None:
+    query = "库存周期"
+    _add_book(
+        db,
+        "hybrid-threshold",
+        [
+            _passage(
+                "z-keyword",
+                "hybrid-threshold",
+                0,
+                "库存周期会影响企业利润。",
+            ),
+            _passage(
+                "a-unrelated",
+                "hybrid-threshold",
+                1,
+                "广告预算通常会影响品牌认知。",
+                _vector([0.0, 1.0]),
+            ),
+        ],
+    )
+    provider = DeterministicEmbeddingProvider({query: [1.0, 0.0]})
+
+    hits = Retriever(db, provider).search(query, mode="auto")
+
+    assert [hit.passage_id for hit in hits] == ["z-keyword"]
+    assert hits[0].score == pytest.approx(1 / 61)
 
 
 def test_quote_mode_returns_exact_keyword_order_and_scores_without_encoding(

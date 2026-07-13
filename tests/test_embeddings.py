@@ -1,4 +1,5 @@
 import builtins
+import json
 import sys
 import types
 from pathlib import Path
@@ -9,10 +10,62 @@ import pytest
 from book_agent.embeddings import E5EmbeddingProvider
 
 
-def _complete_model(path: Path) -> Path:
+def _modules() -> list[dict[str, object]]:
+    return [
+        {
+            "idx": 0,
+            "name": "0",
+            "path": "",
+            "type": "sentence_transformers.models.Transformer",
+        },
+        {
+            "idx": 1,
+            "name": "1",
+            "path": "1_Pooling",
+            "type": "sentence_transformers.models.Pooling",
+        },
+        {
+            "idx": 2,
+            "name": "2",
+            "path": "2_Normalize",
+            "type": "sentence_transformers.models.Normalize",
+        },
+    ]
+
+
+def _write_json(path: Path, value: object) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(value), encoding="utf-8")
+
+
+def _complete_model(path: Path, *, sharded: bool = False) -> Path:
     path.mkdir(parents=True, exist_ok=True)
-    (path / "modules.json").write_text("[]", encoding="utf-8")
-    (path / "config.json").write_text("{}", encoding="utf-8")
+    _write_json(path / "modules.json", _modules())
+    _write_json(path / "config.json", {"model_type": "bert"})
+    _write_json(path / "tokenizer_config.json", {"model_max_length": 512})
+    _write_json(path / "tokenizer.json", {"version": "1.0"})
+    _write_json(path / "1_Pooling" / "config.json", {"word_embedding_dimension": 384})
+    if sharded:
+        _write_json(
+            path / "model.safetensors.index.json",
+            {
+                "weight_map": {
+                    "encoder.layer.0": "model-00001-of-00002.safetensors",
+                    "encoder.layer.1": "model-00002-of-00002.safetensors",
+                }
+            },
+        )
+        (path / "model-00001-of-00002.safetensors").write_bytes(b"shard-one")
+        (path / "model-00002-of-00002.safetensors").write_bytes(b"shard-two")
+    else:
+        (path / "model.safetensors").write_bytes(b"weights")
+    return path
+
+
+def _two_file_partial(path: Path) -> Path:
+    path.mkdir(parents=True, exist_ok=True)
+    _write_json(path / "modules.json", _modules())
+    _write_json(path / "config.json", {"model_type": "bert"})
     return path
 
 
@@ -77,16 +130,56 @@ def test_available_recognizes_a_direct_complete_model_lazily(
     assert attempted_imports == []
 
 
-def test_load_uses_the_first_complete_sorted_hf_snapshot_and_e5_prompts(
+def test_two_file_model_marker_is_not_a_complete_local_model(tmp_path: Path) -> None:
+    _two_file_partial(tmp_path)
+
+    assert E5EmbeddingProvider(tmp_path).available is False
+
+
+@pytest.mark.parametrize(
+    "missing",
+    [
+        "invalid-modules-json",
+        "weight",
+        "tokenizer-config",
+        "tokenizer-artifact",
+        "pooling-config",
+    ],
+)
+def test_required_sentence_transformer_assets_must_be_complete(
+    tmp_path: Path, missing: str
+) -> None:
+    _complete_model(tmp_path)
+    if missing == "invalid-modules-json":
+        (tmp_path / "modules.json").write_text("{broken", encoding="utf-8")
+    elif missing == "weight":
+        (tmp_path / "model.safetensors").unlink()
+    elif missing == "tokenizer-config":
+        (tmp_path / "tokenizer_config.json").unlink()
+    elif missing == "tokenizer-artifact":
+        (tmp_path / "tokenizer.json").unlink()
+    elif missing == "pooling-config":
+        (tmp_path / "1_Pooling" / "config.json").unlink()
+
+    assert E5EmbeddingProvider(tmp_path).available is False
+
+
+def test_sharded_weights_require_every_indexed_shard(tmp_path: Path) -> None:
+    _complete_model(tmp_path, sharded=True)
+    (tmp_path / "model-00002-of-00002.safetensors").unlink()
+
+    assert E5EmbeddingProvider(tmp_path).available is False
+
+
+def test_load_prefers_the_valid_refs_main_snapshot_and_uses_e5_prompts(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    snapshots = (
-        tmp_path
-        / "models--intfloat--multilingual-e5-small"
-        / "snapshots"
-    )
-    selected = _complete_model(snapshots / "a-revision")
-    _complete_model(snapshots / "z-revision")
+    model_cache = tmp_path / "models--intfloat--multilingual-e5-small"
+    snapshots = model_cache / "snapshots"
+    _two_file_partial(snapshots / "a-old-partial")
+    selected = _complete_model(snapshots / "z-main-revision")
+    (model_cache / "refs").mkdir(parents=True)
+    (model_cache / "refs" / "main").write_text("z-main-revision\n", encoding="utf-8")
     constructed: list[tuple[object, dict[str, object]]] = []
     encoded: list[tuple[object, bool]] = []
 
@@ -121,6 +214,19 @@ def test_load_uses_the_first_complete_sorted_hf_snapshot_and_e5_prompts(
     assert passages.dtype == np.float32
     assert passages.shape == (2, 3)
     assert passages.flags.c_contiguous
+
+
+def test_invalid_refs_main_falls_back_to_another_complete_snapshot(
+    tmp_path: Path,
+) -> None:
+    model_cache = tmp_path / "models--intfloat--multilingual-e5-small"
+    snapshots = model_cache / "snapshots"
+    _two_file_partial(snapshots / "a-main-partial")
+    selected = _complete_model(snapshots / "z-valid-fallback")
+    (model_cache / "refs").mkdir(parents=True)
+    (model_cache / "refs" / "main").write_text("a-main-partial", encoding="utf-8")
+
+    assert E5EmbeddingProvider(model_cache)._find_local_model() == selected
 
 
 def test_complete_cache_reports_a_clear_missing_optional_dependency(

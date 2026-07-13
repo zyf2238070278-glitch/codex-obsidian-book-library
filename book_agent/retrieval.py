@@ -12,6 +12,7 @@ from book_agent.storage import Database
 _VALID_MODES = {"auto", "quote", "explain", "compare"}
 _CANDIDATE_LIMIT = 20
 _RRF_K = 60
+MIN_SEMANTIC_SCORE = 0.20
 
 
 class Retriever:
@@ -91,7 +92,7 @@ class Retriever:
                 score = float(
                     np.dot(query64, passage64) / (query_norm * passage_norm)
                 )
-                if not np.isfinite(score):
+                if not np.isfinite(score) or score < MIN_SEMANTIC_SCORE:
                     continue
             except Exception:
                 continue

@@ -392,10 +392,14 @@ class VaultManager:
                                     published_name is not None
                                     and published_info is not None
                                 ):
+                                    rollback_name = published_name
+                                    rollback_info = published_info
+                                    published_name = None
+                                    published_info = None
                                     self._unlink_if_same(
                                         cleanup_fd,
-                                        published_name,
-                                        published_info,
+                                        rollback_name,
+                                        rollback_info,
                                     )
                                 else:
                                     self._unlink_all_if_same(cleanup_fd, temp_info)

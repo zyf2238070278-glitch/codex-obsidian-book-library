@@ -232,7 +232,9 @@ def test_import_post_link_stat_failure_removes_unregistered_original(
     manager.ensure_layout()
     source = _source(tmp_path, "source", "book.txt", "stat failure import")
     real_stat = vault_module.os.stat
+    real_unlink_if_same = manager._unlink_if_same
     failed = False
+    published_cleanup_calls = 0
 
     def fail_published_stat_once(
         path: object,
@@ -245,13 +247,25 @@ def test_import_post_link_stat_failure_removes_unregistered_original(
             raise OSError("published original stat unavailable")
         return real_stat(path, *args, **kwargs)
 
+    def count_published_cleanup(
+        directory_fd: int,
+        name: str,
+        expected: os.stat_result,
+    ) -> None:
+        nonlocal published_cleanup_calls
+        if name == "book.txt":
+            published_cleanup_calls += 1
+        real_unlink_if_same(directory_fd, name, expected)
+
     monkeypatch.setattr(vault_module.os, "stat", fail_published_stat_once)
+    monkeypatch.setattr(manager, "_unlink_if_same", count_published_cleanup)
 
     with pytest.raises(OSError, match="original stat unavailable"):
         manager.import_original(source)
 
     assert list(paths.originals.iterdir()) == []
     assert list(paths.inbox.iterdir()) == []
+    assert published_cleanup_calls == 1
 
 
 def test_concurrent_imports_preserve_24_same_basename_payloads(

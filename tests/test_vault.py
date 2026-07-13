@@ -182,6 +182,8 @@ def test_import_post_link_interruption_removes_unregistered_original(
     manager.ensure_layout()
     source = _source(tmp_path, "source", "book.txt", "interrupted import")
     real_link_final = manager._link_final
+    real_unlink_all = manager._unlink_all_if_same
+    cleanup_saw_live_temp = False
 
     def link_then_interrupt(
         inbox_fd: int,
@@ -197,13 +199,28 @@ def test_import_post_link_interruption_removes_unregistered_original(
         )
         raise KeyboardInterrupt("interrupted after original link")
 
+    def unlink_while_temp_is_live(
+        directory_fd: int,
+        expected: os.stat_result,
+    ) -> None:
+        nonlocal cleanup_saw_live_temp
+        cleanup_saw_live_temp = any(
+            (entry.lstat().st_dev, entry.lstat().st_ino)
+            == (expected.st_dev, expected.st_ino)
+            for entry in paths.inbox.iterdir()
+        )
+        assert cleanup_saw_live_temp
+        real_unlink_all(directory_fd, expected)
+
     monkeypatch.setattr(manager, "_link_final", link_then_interrupt)
+    monkeypatch.setattr(manager, "_unlink_all_if_same", unlink_while_temp_is_live)
 
     with pytest.raises(KeyboardInterrupt, match="after original link"):
         manager.import_original(source)
 
     assert list(paths.originals.iterdir()) == []
     assert list(paths.inbox.iterdir()) == []
+    assert cleanup_saw_live_temp is True
 
 
 def test_import_post_link_stat_failure_removes_unregistered_original(

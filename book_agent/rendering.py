@@ -91,6 +91,63 @@ def _remove_temp(directory_fd: int, name: str | None) -> None:
         pass
 
 
+def _rollback_publication(
+    directory_fd: int,
+    destination_name: str,
+    published_info: os.stat_result | None,
+    backup_name: str | None,
+    backup_info: os.stat_result | None,
+) -> None:
+    if backup_name is None or backup_info is None:
+        if published_info is not None:
+            VaultManager._unlink_if_same(
+                directory_fd,
+                destination_name,
+                published_info,
+            )
+        return
+
+    try:
+        current = os.stat(
+            destination_name,
+            dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except FileNotFoundError:
+        current = None
+
+    if current is not None and (
+        current.st_dev,
+        current.st_ino,
+    ) == (backup_info.st_dev, backup_info.st_ino):
+        VaultManager._unlink_if_same(directory_fd, backup_name, backup_info)
+        return
+
+    if published_info is not None and current is not None and (
+        current.st_dev,
+        current.st_ino,
+    ) == (published_info.st_dev, published_info.st_ino):
+        VaultManager._unlink_if_same(
+            directory_fd,
+            destination_name,
+            published_info,
+        )
+
+    try:
+        os.link(
+            backup_name,
+            destination_name,
+            src_dir_fd=directory_fd,
+            dst_dir_fd=directory_fd,
+            follow_symlinks=False,
+        )
+    except FileExistsError:
+        return
+    except OSError:
+        return
+    VaultManager._unlink_if_same(directory_fd, backup_name, backup_info)
+
+
 def _write_complete(file_descriptor: int, payload: bytes) -> None:
     offset = 0
     while offset < len(payload):
@@ -117,6 +174,8 @@ def render_parsed_book(
 
     cleanup_fd: int | None = None
     published_info: os.stat_result | None = None
+    backup_name: str | None = None
+    backup_info: os.stat_result | None = None
     try:
         with _managed_directory_beneath(
             root,
@@ -141,6 +200,30 @@ def render_parsed_book(
                     raise ValueError(
                         "Parsed Markdown destination must not be a symlink"
                     )
+                if not stat.S_ISREG(destination_info.st_mode):
+                    raise ValueError(
+                        "Parsed Markdown destination must be a regular file"
+                    )
+                backup_name = f".render-backup-{secrets.token_hex(12)}"
+                os.link(
+                    destination.name,
+                    backup_name,
+                    src_dir_fd=directory_fd,
+                    dst_dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                backup_info = os.stat(
+                    backup_name,
+                    dir_fd=directory_fd,
+                    follow_symlinks=False,
+                )
+                if (
+                    backup_info.st_dev,
+                    backup_info.st_ino,
+                ) != (destination_info.st_dev, destination_info.st_ino):
+                    raise ValueError(
+                        "Parsed Markdown backup identity differs from destination"
+                    )
 
             temp_name = f".render-{secrets.token_hex(12)}"
             temp_fd = os.open(
@@ -152,6 +235,7 @@ def render_parsed_book(
             try:
                 try:
                     _write_complete(temp_fd, content.encode("utf-8"))
+                    temp_info = os.fstat(temp_fd)
                 finally:
                     os.close(temp_fd)
                 try:
@@ -167,21 +251,42 @@ def render_parsed_book(
                         "by directory FD"
                     ) from exc
                 temp_name = None
+                published_info = temp_info
                 published_info = os.stat(
                     destination.name,
                     dir_fd=directory_fd,
                     follow_symlinks=False,
                 )
+                if (
+                    published_info.st_dev,
+                    published_info.st_ino,
+                ) != (temp_info.st_dev, temp_info.st_ino):
+                    raise ValueError(
+                        "Published Markdown identity differs from render temp"
+                    )
             finally:
                 _remove_temp(directory_fd, temp_name)
     except BaseException:
-        if cleanup_fd is not None and published_info is not None:
-            VaultManager._unlink_if_same(
+        if cleanup_fd is not None:
+            _rollback_publication(
                 cleanup_fd,
                 destination.name,
                 published_info,
+                backup_name,
+                backup_info,
             )
         raise
+    else:
+        if (
+            cleanup_fd is not None
+            and backup_name is not None
+            and backup_info is not None
+        ):
+            VaultManager._unlink_if_same(
+                cleanup_fd,
+                backup_name,
+                backup_info,
+            )
     finally:
         if cleanup_fd is not None:
             try:

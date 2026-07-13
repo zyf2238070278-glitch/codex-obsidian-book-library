@@ -6,6 +6,7 @@ from typing import Any
 
 import pytest
 
+import book_agent.importer as importer_module
 import book_agent.notes as notes_module
 from book_agent.config import MAX_PREVIEWS
 from book_agent.embeddings import NullEmbeddingProvider
@@ -337,6 +338,48 @@ def test_note_root_swap_after_link_never_returns_or_touches_replacement(
     assert (replacement_notes / "sentinel.md").read_bytes() == sentinel_payload
     assert list(replacement_notes.iterdir()) == [replacement_notes / "sentinel.md"]
     assert list((displaced_vault / "书库" / "30-AI读书笔记").iterdir()) == []
+
+
+@pytest.mark.parametrize("replacement_kind", ["directory", "symlink"])
+def test_parse_failure_still_reports_a_mid_parse_vault_root_swap(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_kind: str,
+) -> None:
+    project = tmp_path / "project"
+    obsidian_vault = tmp_path / "Obsidian_workspace"
+    obsidian_vault.mkdir()
+    tools = build_tools(
+        project,
+        NullEmbeddingProvider(),
+        vault_root=obsidian_vault,
+    )
+    source = _write_chinese_book(tmp_path / f"解析中换根-{replacement_kind}.txt")
+    displaced_vault = tmp_path / "displaced-vault"
+    symlink_target = tmp_path / "symlink-target"
+
+    def replace_root_then_fail(*args: object, **kwargs: object) -> None:
+        obsidian_vault.rename(displaced_vault)
+        if replacement_kind == "directory":
+            obsidian_vault.mkdir()
+        else:
+            symlink_target.mkdir()
+            obsidian_vault.symlink_to(symlink_target, target_is_directory=True)
+        raise ValueError("parser exploded")
+
+    monkeypatch.setattr(importer_module, "parse_document", replace_root_then_fail)
+
+    imported = tools.importer.import_book(source)
+    book = tools.database.get_book(imported.book_id)
+
+    assert imported.status == "failed"
+    assert "vault root" in imported.message
+    assert book is not None
+    assert "vault root" in str(book["error"])
+    if replacement_kind == "directory":
+        assert list(obsidian_vault.iterdir()) == []
+    else:
+        assert list(symlink_target.iterdir()) == []
 
 
 def test_real_txt_workflow_is_json_safe_and_preserves_content_boundaries(

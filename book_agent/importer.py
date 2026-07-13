@@ -304,8 +304,13 @@ class ImportService:
         passage_count = 0
         try:
             self.vault._validate_original_identity(original.path, original.identity)
-            parsed = parse_document(original.path, title=title, author=author)
-            self.vault._validate_original_identity(original.path, original.identity)
+            try:
+                parsed = parse_document(original.path, title=title, author=author)
+            finally:
+                self.vault._validate_original_identity(
+                    original.path,
+                    original.identity,
+                )
             self.database.update_book_metadata(book_id, parsed.title, parsed.author)
             destination = self.paths.parsed / book_id / "正文.md"
             markdown_path = destination.relative_to(self.paths.vault).as_posix()

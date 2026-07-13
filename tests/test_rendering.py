@@ -317,6 +317,59 @@ def test_render_root_symlink_swap_after_replace_never_writes_to_target(
     assert list((displaced_root / "nested").iterdir()) == []
 
 
+@pytest.mark.parametrize("replacement_kind", ["directory", "symlink"])
+def test_render_root_swap_restores_a_preexisting_destination(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    replacement_kind: str,
+) -> None:
+    managed_root = tmp_path / "managed-root"
+    original_directory = managed_root / "nested"
+    original_directory.mkdir(parents=True)
+    destination = original_directory / "book.md"
+    destination.write_text("必须恢复的旧解析内容", encoding="utf-8")
+    root_info = os.lstat(managed_root)
+    expected_identity = (root_info.st_dev, root_info.st_ino)
+    displaced_root = tmp_path / "displaced-root"
+    symlink_target = tmp_path / "symlink-target"
+    replacement_root = managed_root if replacement_kind == "directory" else symlink_target
+    replacement_directory = replacement_root / "nested"
+    sentinel = replacement_directory / "sentinel.md"
+    real_replace = rendering.os.replace
+    swapped = False
+
+    def replace_then_swap_root(*args: object, **kwargs: object) -> None:
+        nonlocal swapped
+        real_replace(*args, **kwargs)
+        if swapped:
+            return
+        swapped = True
+        managed_root.rename(displaced_root)
+        replacement_directory.mkdir(parents=True)
+        sentinel.write_bytes(b"replacement sentinel")
+        if replacement_kind == "symlink":
+            managed_root.symlink_to(symlink_target, target_is_directory=True)
+
+    monkeypatch.setattr(rendering.os, "replace", replace_then_swap_root)
+
+    with pytest.raises(ValueError, match=r"managed root.*identity"):
+        rendering.render_parsed_book(
+            destination,
+            "book-1",
+            _parsed(),
+            "source.pdf",
+            [_passage(0, "不应覆盖旧解析内容。")],
+            managed_root=managed_root,
+            expected_root_identity=expected_identity,
+        )
+
+    restored = displaced_root / "nested" / "book.md"
+    assert restored.read_text(encoding="utf-8") == "必须恢复的旧解析内容"
+    assert sentinel.read_bytes() == b"replacement sentinel"
+    assert list(replacement_directory.iterdir()) == [sentinel]
+    assert not list((displaced_root / "nested").glob(".render-backup-*"))
+
+
 def test_replace_failure_preserves_old_file_and_cleans_unique_temp(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:

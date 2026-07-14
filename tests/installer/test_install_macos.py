@@ -232,6 +232,8 @@ def test_sync_prefers_bundled_uv_over_path_uv(tmp_path: Path) -> None:
                 "--frozen",
                 "--extra",
                 "semantic",
+                "--extra",
+                "ocr",
                 "--python",
                 "3.12",
             ],
@@ -272,6 +274,8 @@ def test_sync_falls_back_to_uv_on_path(tmp_path: Path) -> None:
             "--frozen",
             "--extra",
             "semantic",
+            "--extra",
+            "ocr",
             "--python",
             "3.12",
         ]

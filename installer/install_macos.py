@@ -37,6 +37,7 @@ VAULT_DIRECTORIES = (
     Path("书库/10-原始书籍"),
     Path("书库/20-解析文本"),
     Path("书库/30-AI读书笔记"),
+    Path("书库/40-OCR报告"),
 )
 
 
@@ -173,6 +174,8 @@ def _sync_environment(
         "--frozen",
         "--extra",
         "semantic",
+        "--extra",
+        "ocr",
         "--python",
         "3.12",
     ]
@@ -310,6 +313,7 @@ def _create_runtime_directories(project_root: Path, vault: Path) -> None:
             (vault / relative).mkdir(parents=True, exist_ok=True)
         (project_root / "data").mkdir(parents=True, exist_ok=True)
         (project_root / "data" / "models").mkdir(parents=True, exist_ok=True)
+        (project_root / "data" / "ocr-models").mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise InstallError("无法创建书库目录：%s" % exc) from exc
 

@@ -164,8 +164,9 @@ def test_claim_next_ocr_job_is_atomic_and_respects_live_lease(db: Database) -> N
 def test_page_checkpoint_is_idempotent_and_updates_completed_count(db: Database) -> None:
     _queued_job(db, "book-a", total_pages=3)
 
-    db.save_ocr_page("book-a", 1, None, "第一页", "sha", 0.92, 840)
-    db.save_ocr_page("book-a", 1, None, "第一页", "sha", 0.92, 840)
+    db.claim_next_ocr_job("worker-a", lease_seconds=60)
+    db.save_ocr_page("book-a", "worker-a", 1, None, "第一页", "sha", 0.92, 840)
+    db.save_ocr_page("book-a", "worker-a", 1, None, "第一页", "sha", 0.92, 840)
 
     assert db.get_ocr_job("book-a")["completed_pages"] == 1
     assert db.list_ocr_pages("book-a")[0]["page_number"] == 1
@@ -219,7 +220,7 @@ ON ocr_jobs(status, created_at, book_id);
 
 - [ ] **Step 4: Implement validated database operations**
 
-Add `queue_ocr_job`, `claim_next_ocr_job`, `renew_ocr_lease`, `save_ocr_page`, `list_ocr_pages`, `get_ocr_job`, `list_ocr_jobs`, `request_ocr_pause`, `pause_ocr_job`, `fail_ocr_job`, `complete_ocr_job`, and `delete_ocr_page_checkpoints`. Store `duration_ms` with every page checkpoint so `ocr_status` can compute a rolling estimate from the most recent completed pages. `claim_next_ocr_job` must use `BEGIN IMMEDIATE` and one connection so two workers cannot claim the same job.
+Add `queue_ocr_job`, `claim_next_ocr_job`, `renew_ocr_lease`, `save_ocr_page`, `list_ocr_pages`, `get_ocr_job`, `list_ocr_jobs`, `request_ocr_pause`, `pause_ocr_job`, `fail_ocr_job`, `complete_ocr_job`, and `delete_ocr_page_checkpoints`. Every owner mutation requires the current `worker_id` and a lease that is still live at an injectable `now`, atomically rejecting expired or replaced workers. Store `duration_ms` with every page checkpoint so `ocr_status` can compute a rolling estimate from the most recent completed pages. `claim_next_ocr_job` must use `BEGIN IMMEDIATE` and one connection so two workers cannot claim the same job. Persist every OCR timestamp in the same UTC ISO-8601 `Z` format; do not mix SQLite `CURRENT_TIMESTAMP` strings with aware timestamps.
 
 - [ ] **Step 5: Run storage tests and verify GREEN**
 
@@ -492,7 +493,8 @@ Cover FIFO processing, one worker claim, page-by-page checkpoints, blank page co
 def test_worker_resumes_at_first_missing_page_and_indexes_only_after_completion(app) -> None:
     worker, db, engine, retriever = app
     _queued_job(db, "c" * 24, total_pages=3)
-    db.save_ocr_page("c" * 24, 1, "1", "已有第一页", "sha", 0.95)
+    db.claim_next_ocr_job("worker-a", lease_seconds=60)
+    db.save_ocr_page("c" * 24, "worker-a", 1, "1", "已有第一页", "sha", 0.95, 800)
     engine.results = {2: "第二页", 3: "第三页"}
 
     worker.run_once()

@@ -465,6 +465,15 @@ Expected: missing service failure.
 
 `OcrService.start_ocr`, `start_pending_ocr`, `status`, and `pause` must validate IDs and book state, obtain page count without extracting text, persist the job, and ensure the worker process is alive. Launch with current `sys.executable`, `start_new_session=True`, closed stdin, append-only local log, project cwd, and only required book-library environment variables. Never interpolate paths into shell commands.
 
+macOS does not permit `subprocess.Popen(cwd="/dev/fd/<directory-fd>")` for a
+directory descriptor (`chdir` returns `ENOTDIR`). The detached launcher therefore
+uses an absolute Python executable with `-I -c` and a constant stdlib-only bootstrap.
+The bootstrap validates numeric descriptor and project identity arguments, calls
+`fchdir` on the inherited verified project-root descriptor, marks that descriptor
+close-on-exec, and then executes exactly
+`[sys.executable, "-m", "book_agent.ocr_worker"]`. It does not use a shell,
+`preexec_fn`, cwd imports, or `PYTHONPATH`.
+
 - [ ] **Step 4: Run tests and verify GREEN**
 
 Run: `.venv/bin/python -m pytest -q tests/ocr/test_service.py`

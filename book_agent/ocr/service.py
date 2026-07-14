@@ -5,6 +5,7 @@ import hashlib
 import json
 import os
 import re
+import secrets
 import stat
 import subprocess
 import sys
@@ -38,6 +39,33 @@ _MARKER_NAME = "worker.json"
 _LOG_NAME = "worker.log"
 _MAXIMUM_MARKER_BYTES = 4096
 _HASH_BLOCK_BYTES = 1024 * 1024
+_TOKEN_PATTERN = re.compile(r"[0-9a-f]{32}")
+
+# Darwin's fdesc filesystem rejects a directory descriptor as Popen(cwd=...)
+# with ENOTDIR.  This isolated, constant bootstrap binds cwd with fchdir, verifies
+# the pinned identity, marks the descriptor close-on-next-exec, then execs only
+# the fixed worker module with the already allowlisted environment.
+_BOUND_WORKER_BOOTSTRAP = """\
+import fcntl, os, sys
+if len(sys.argv) != 5:
+    raise SystemExit(64)
+fd_text, device_text, inode_text, python = sys.argv[1:]
+if not all(value.isascii() and value.isdigit() for value in (fd_text, device_text, inode_text)):
+    raise SystemExit(64)
+fd, expected_device, expected_inode = map(int, (fd_text, device_text, inode_text))
+if not os.path.isabs(python) or python != sys.executable:
+    raise SystemExit(64)
+os.fchdir(fd)
+current = os.stat('.')
+if (current.st_dev, current.st_ino) != (expected_device, expected_inode):
+    raise SystemExit(74)
+fcntl.fcntl(fd, fcntl.F_SETFD, fcntl.fcntl(fd, fcntl.F_GETFD) | fcntl.FD_CLOEXEC)
+allowed = ('PATH', 'LANG', 'LC_ALL', 'BOOK_LIBRARY_ROOT', 'BOOK_LIBRARY_OBSIDIAN_VAULT')
+environment = {key: os.environ[key] for key in allowed if key in os.environ}
+if set(environment) != set(allowed):
+    raise SystemExit(78)
+os.execve(python, [python, '-m', 'book_agent.ocr_worker'], environment)
+"""
 
 
 class _Process(Protocol):
@@ -124,6 +152,7 @@ class OcrService:
         popen_factory: _PopenFactory | None = None,
         now_factory: Callable[[], datetime] = _utc_now,
         pid_probe: Callable[[int], bool] = _pid_exists,
+        token_factory: Callable[[], str] | None = None,
     ) -> None:
         if type(paths) is not AppPaths:
             raise ValueError("paths must be an AppPaths value")
@@ -133,11 +162,19 @@ class OcrService:
             raise ValueError("popen_factory must be callable")
         if not callable(now_factory) or not callable(pid_probe):
             raise ValueError("now_factory and pid_probe must be callable")
+        if token_factory is not None and not callable(token_factory):
+            raise ValueError("token_factory must be callable")
+        if type(sys.executable) is not str or not os.path.isabs(sys.executable):
+            raise RuntimeError("OCR worker launch requires an absolute Python executable")
         self.paths = paths
         self.database = database
         self._popen = subprocess.Popen if popen_factory is None else popen_factory
         self._now_factory = now_factory
         self._pid_probe = pid_probe
+        self._token_factory = (
+            (lambda: secrets.token_hex(16)) if token_factory is None else token_factory
+        )
+        self._root_identity = self._directory_identity(paths.root, "project root")
 
     def start_ocr(self, book_id: str) -> OcrJobSummary:
         """Explicitly queue or resume one book, then ensure a detached worker exists."""
@@ -385,7 +422,8 @@ class OcrService:
                     raise ValueError(
                         "Managed PDF must be a regular non-symlink file without aliases"
                     )
-                if self._hash_descriptor(descriptor) != expected_hash:
+                digest_before = self._hash_descriptor(descriptor)
+                if digest_before != expected_hash:
                     raise ValueError("Managed PDF content hash no longer matches the book record")
                 try:
                     document = fitz.open(f"/dev/fd/{descriptor}")
@@ -396,6 +434,16 @@ class OcrService:
                 page_count = document.page_count
                 if type(page_count) is not int or page_count <= 0:
                     raise ValueError("Managed PDF has zero pages")
+                document.close()
+                document = None
+                digest_after = self._hash_descriptor(descriptor)
+                final_descriptor_info = os.fstat(descriptor)
+                if digest_after != expected_hash or digest_after != digest_before:
+                    raise ValueError("Managed PDF content hash changed during validation")
+                if self._file_snapshot(final_descriptor_info) != self._file_snapshot(
+                    before
+                ):
+                    raise ValueError("Managed PDF changed during validation")
                 after = os.stat(
                     original.name,
                     dir_fd=originals_fd,
@@ -404,7 +452,7 @@ class OcrService:
                 if (
                     stat.S_ISLNK(after.st_mode)
                     or not stat.S_ISREG(after.st_mode)
-                    or (after.st_dev, after.st_ino) != (before.st_dev, before.st_ino)
+                    or self._file_snapshot(after) != self._file_snapshot(before)
                 ):
                     raise ValueError("Managed PDF identity changed during validation")
                 return page_count
@@ -421,6 +469,20 @@ class OcrService:
             digest.update(block)
             offset += len(block)
         return digest.hexdigest()
+
+    @staticmethod
+    def _file_snapshot(info: os.stat_result) -> tuple[int, ...]:
+        return (
+            info.st_dev,
+            info.st_ino,
+            info.st_mode,
+            info.st_nlink,
+            info.st_uid,
+            info.st_gid,
+            info.st_size,
+            info.st_mtime_ns,
+            info.st_ctime_ns,
+        )
 
     def _summary_for(self, book_id: str) -> OcrJobSummary:
         rows = self._select(
@@ -594,12 +656,19 @@ class OcrService:
         return [dict(row) for row in rows]
 
     def _ensure_worker_started(self) -> bool:
-        with _managed_directory_beneath(
+        root_fd = self._open_bound_directory(
             self.paths.root,
-            self.paths.ocr,
-            "OCR runtime",
-            create=True,
-        ) as (_, ocr_fd):
+            self._root_identity,
+            "project root",
+        )
+        ocr_fd: int | None = None
+        try:
+            ocr_fd = self._open_project_directory(
+                root_fd,
+                self.paths.ocr,
+                "OCR runtime",
+                create=True,
+            )
             lock_fd = self._open_private_file(
                 ocr_fd,
                 _LOCK_NAME,
@@ -613,50 +682,78 @@ class OcrService:
                     return False
                 if self._marker_is_live(ocr_fd, now):
                     return False
-                log_fd = self._open_worker_log()
+                log_fd = self._open_worker_log(root_fd)
                 try:
                     environment = self._worker_environment()
-                    argv = [sys.executable, "-m", "book_agent.ocr_worker"]
+                    token = self._new_token()
+                    self._atomic_write_marker(
+                        ocr_fd,
+                        token=token,
+                        state="launching",
+                        pid=None,
+                        now=now,
+                    )
+                    argv = self._bound_worker_argv(root_fd)
                     try:
                         process = self._popen(
                             argv,
                             shell=False,
-                            cwd=str(self.paths.root.absolute()),
+                            cwd="/",
                             start_new_session=True,
                             stdin=subprocess.DEVNULL,
                             stdout=log_fd,
                             stderr=log_fd,
                             close_fds=True,
+                            pass_fds=(root_fd,),
                             env=environment,
                         )
-                    except (KeyboardInterrupt, SystemExit):
+                    except (KeyboardInterrupt, SystemExit) as exc:
+                        self._cleanup_failed_launch(ocr_fd, token, exc)
                         raise
                     except Exception as exc:
+                        self._cleanup_failed_launch(ocr_fd, token, exc)
                         raise RuntimeError(
                             f"Unable to start detached OCR worker: {exc}"
                         ) from exc
                     if type(process.pid) is not int or process.pid <= 0:
-                        raise RuntimeError("Detached OCR worker returned an invalid pid")
-                    self._write_marker(ocr_fd, process.pid, now)
+                        invalid_pid = RuntimeError(
+                            "Detached OCR worker returned an invalid pid"
+                        )
+                        self._cleanup_failed_launch(ocr_fd, token, invalid_pid)
+                        raise invalid_pid
+                    self._atomic_write_marker(
+                        ocr_fd,
+                        token=token,
+                        state="running",
+                        pid=process.pid,
+                        now=now,
+                    )
                 finally:
                     os.close(log_fd)
                 return True
             finally:
                 os.close(lock_fd)
+        finally:
+            if ocr_fd is not None:
+                os.close(ocr_fd)
+            os.close(root_fd)
 
-    def _open_worker_log(self) -> int:
-        with _managed_directory_beneath(
-            self.paths.root,
+    def _open_worker_log(self, root_fd: int) -> int:
+        logs_fd = self._open_project_directory(
+            root_fd,
             self.paths.ocr_logs,
             "OCR logs",
             create=True,
-        ) as (_, logs_fd):
+        )
+        try:
             return self._open_private_file(
                 logs_fd,
                 _LOG_NAME,
                 os.O_CREAT | os.O_WRONLY | os.O_APPEND,
                 "OCR worker log (non-symlink)",
             )
+        finally:
+            os.close(logs_fd)
 
     @staticmethod
     def _open_private_file(
@@ -692,9 +789,107 @@ class OcrService:
             "PATH": SAFE_PATH,
             "LANG": "C.UTF-8",
             "LC_ALL": "C.UTF-8",
-            "BOOK_LIBRARY_ROOT": str(self.paths.root.absolute()),
+            "BOOK_LIBRARY_ROOT": ".",
             "BOOK_LIBRARY_OBSIDIAN_VAULT": str(self.paths.vault.absolute()),
         }
+
+    def _bound_worker_argv(self, root_fd: int) -> list[str]:
+        device, inode = self._root_identity
+        return [
+            sys.executable,
+            "-I",
+            "-c",
+            _BOUND_WORKER_BOOTSTRAP,
+            str(root_fd),
+            str(device),
+            str(inode),
+            sys.executable,
+        ]
+
+    @staticmethod
+    def _directory_identity(path: Path, label: str) -> tuple[int, int]:
+        descriptor = OcrService._open_directory(path, label)
+        try:
+            info = os.fstat(descriptor)
+            return info.st_dev, info.st_ino
+        finally:
+            os.close(descriptor)
+
+    @staticmethod
+    def _open_directory(path: Path, label: str) -> int:
+        if not isinstance(path, Path) or not path.is_absolute():
+            raise ValueError(f"{label} must be an absolute directory")
+        nofollow = getattr(os, "O_NOFOLLOW", None)
+        directory_flag = getattr(os, "O_DIRECTORY", None)
+        if type(nofollow) is not int or type(directory_flag) is not int:
+            raise RuntimeError(f"This platform lacks secure flags for {label}")
+        try:
+            descriptor = os.open(
+                path,
+                os.O_RDONLY | nofollow | directory_flag | getattr(os, "O_CLOEXEC", 0),
+            )
+        except OSError as exc:
+            raise ValueError(f"{label} cannot be opened safely") from exc
+        try:
+            if not stat.S_ISDIR(os.fstat(descriptor).st_mode):
+                raise ValueError(f"{label} must be a directory")
+            return descriptor
+        except BaseException:
+            os.close(descriptor)
+            raise
+
+    @staticmethod
+    def _open_bound_directory(
+        path: Path,
+        expected_identity: tuple[int, int],
+        label: str,
+    ) -> int:
+        descriptor = OcrService._open_directory(path, label)
+        info = os.fstat(descriptor)
+        if (info.st_dev, info.st_ino) != expected_identity:
+            os.close(descriptor)
+            raise ValueError(f"{label} identity changed before worker launch")
+        return descriptor
+
+    def _open_project_directory(
+        self,
+        root_fd: int,
+        configured: Path,
+        label: str,
+        *,
+        create: bool,
+    ) -> int:
+        try:
+            relative = configured.absolute().relative_to(self.paths.root.absolute())
+        except (OSError, RuntimeError, ValueError) as exc:
+            raise ValueError(f"{label} must be beneath project root") from exc
+        current_fd = os.dup(root_fd)
+        try:
+            for component in relative.parts:
+                if not component or component in (os.curdir, os.pardir):
+                    raise ValueError(f"{label} contains an unsafe path component")
+                if create:
+                    try:
+                        os.mkdir(component, 0o700, dir_fd=current_fd)
+                    except FileExistsError:
+                        pass
+                info = os.stat(component, dir_fd=current_fd, follow_symlinks=False)
+                if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+                    raise ValueError(f"{label} contains a non-directory or symlink")
+                next_fd = os.open(
+                    component,
+                    os.O_RDONLY
+                    | os.O_DIRECTORY
+                    | os.O_NOFOLLOW
+                    | getattr(os, "O_CLOEXEC", 0),
+                    dir_fd=current_fd,
+                )
+                os.close(current_fd)
+                current_fd = next_fd
+            return current_fd
+        except BaseException:
+            os.close(current_fd)
+            raise
 
     def _marker_is_live(self, ocr_fd: int, now: datetime) -> bool:
         try:
@@ -717,6 +912,7 @@ class OcrService:
                 raise ValueError("OCR worker marker must not be a symlink") from exc
             raise
         try:
+            marker_identity = os.fstat(descriptor)
             raw = os.read(descriptor, _MAXIMUM_MARKER_BYTES + 1)
         finally:
             os.close(descriptor)
@@ -726,50 +922,89 @@ class OcrService:
                 raise ValueError("marker is too large")
             payload = json.loads(raw.decode("utf-8"))
             if type(payload) is not dict or set(payload) != {
+                "schema_version",
+                "state",
+                "token",
                 "pid",
                 "root_device",
                 "root_inode",
                 "launched_at",
             }:
                 raise ValueError("marker schema is invalid")
+            if payload["schema_version"] != 1:
+                raise ValueError("marker schema version is invalid")
+            state = payload["state"]
+            token = payload["token"]
             pid = payload["pid"]
             root_device = payload["root_device"]
             root_inode = payload["root_inode"]
             if (
-                type(pid) is not int
-                or pid <= 0
+                state not in ("launching", "running")
+                or type(token) is not str
+                or _TOKEN_PATTERN.fullmatch(token) is None
                 or type(root_device) is not int
                 or type(root_inode) is not int
             ):
                 raise ValueError("marker identity is invalid")
-            root_info = self.paths.root.stat(follow_symlinks=False)
             launched_at = _parse_timestamp(payload["launched_at"], "launched_at")
             age = now.astimezone(timezone.utc) - launched_at
-            live = (
-                (root_info.st_dev, root_info.st_ino) == (root_device, root_inode)
-                and timedelta(0) <= age <= timedelta(seconds=WORKER_STARTUP_GRACE_SECONDS)
-                and bool(self._pid_probe(pid))
+            identity_matches = self._root_identity == (root_device, root_inode)
+            within_grace = timedelta(0) <= age <= timedelta(
+                seconds=WORKER_STARTUP_GRACE_SECONDS
             )
+            if state == "launching":
+                if pid is not None:
+                    raise ValueError("launching marker pid must be null")
+                live = identity_matches and within_grace
+            else:
+                if type(pid) is not int or pid <= 0:
+                    raise ValueError("running marker pid is invalid")
+                live = identity_matches and within_grace and bool(self._pid_probe(pid))
         except (json.JSONDecodeError, UnicodeDecodeError, OSError, ValueError, TypeError):
             live = False
         if not live:
-            self._unlink_marker_if_regular(ocr_fd)
+            if self._unlink_if_same(
+                ocr_fd,
+                _MARKER_NAME,
+                marker_identity,
+            ):
+                os.fsync(ocr_fd)
         return live
 
-    def _write_marker(self, ocr_fd: int, pid: int, now: datetime) -> None:
+    def _atomic_write_marker(
+        self,
+        ocr_fd: int,
+        *,
+        token: str,
+        state: str,
+        pid: int | None,
+        now: datetime,
+    ) -> None:
+        if _TOKEN_PATTERN.fullmatch(token) is None:
+            raise ValueError("OCR worker marker token is invalid")
+        if state not in ("launching", "running"):
+            raise ValueError("OCR worker marker state is invalid")
+        if state == "launching" and pid is not None:
+            raise ValueError("launching marker pid must be null")
+        if state == "running" and (type(pid) is not int or pid <= 0):
+            raise ValueError("running marker pid must be a positive integer")
+        temp_name = f".worker-marker-{token}.tmp"
         descriptor = self._open_private_file(
             ocr_fd,
-            _MARKER_NAME,
-            os.O_CREAT | os.O_WRONLY | os.O_TRUNC,
-            "OCR worker marker",
+            temp_name,
+            os.O_CREAT | os.O_EXCL | os.O_WRONLY,
+            "OCR temporary marker",
         )
+        temp_identity = os.fstat(descriptor)
         try:
-            root_info = self.paths.root.stat(follow_symlinks=False)
             payload = json.dumps(
                 {
+                    "schema_version": 1,
+                    "state": state,
+                    "token": token,
                     "pid": pid,
-                    "root_device": root_info.st_dev,
-                    "root_inode": root_info.st_ino,
+                    "root_device": self._root_identity[0],
+                    "root_inode": self._root_identity[1],
                     "launched_at": _timestamp(now),
                 },
                 ensure_ascii=True,
@@ -780,18 +1015,84 @@ class OcrService:
             while offset < len(payload):
                 offset += os.write(descriptor, payload[offset:])
             os.fsync(descriptor)
+            os.close(descriptor)
+            descriptor = -1
+            os.replace(
+                temp_name,
+                _MARKER_NAME,
+                src_dir_fd=ocr_fd,
+                dst_dir_fd=ocr_fd,
+            )
+            os.fsync(ocr_fd)
+        except BaseException:
+            if descriptor >= 0:
+                os.close(descriptor)
+            self._unlink_if_same(ocr_fd, temp_name, temp_identity)
+            raise
+
+    def _new_token(self) -> str:
+        token = self._token_factory()
+        if type(token) is not str or _TOKEN_PATTERN.fullmatch(token) is None:
+            raise ValueError("token_factory must return exactly 32 lowercase hex chars")
+        return token
+
+    def _remove_marker_for_token(self, ocr_fd: int, token: str) -> None:
+        try:
+            descriptor = self._open_private_file(
+                ocr_fd,
+                _MARKER_NAME,
+                os.O_RDONLY,
+                "OCR worker marker",
+            )
+        except ValueError:
+            return
+        try:
+            identity = os.fstat(descriptor)
+            raw = os.read(descriptor, _MAXIMUM_MARKER_BYTES + 1)
         finally:
             os.close(descriptor)
+        try:
+            payload = json.loads(raw.decode("utf-8"))
+        except (json.JSONDecodeError, UnicodeDecodeError):
+            return
+        if type(payload) is not dict or payload.get("token") != token:
+            return
+        if self._unlink_if_same(ocr_fd, _MARKER_NAME, identity):
+            os.fsync(ocr_fd)
+
+    def _cleanup_failed_launch(
+        self,
+        ocr_fd: int,
+        token: str,
+        original_error: BaseException,
+    ) -> None:
+        try:
+            self._remove_marker_for_token(ocr_fd, token)
+        except Exception as cleanup_error:
+            original_error.add_note(
+                "OCR launch marker cleanup also failed: "
+                f"{str(cleanup_error).strip() or cleanup_error.__class__.__name__}"
+            )
 
     @staticmethod
-    def _unlink_marker_if_regular(ocr_fd: int) -> None:
+    def _unlink_if_same(
+        directory_fd: int,
+        name: str,
+        expected: os.stat_result,
+    ) -> bool:
         try:
-            info = os.stat(_MARKER_NAME, dir_fd=ocr_fd, follow_symlinks=False)
+            current = os.stat(name, dir_fd=directory_fd, follow_symlinks=False)
         except FileNotFoundError:
-            return
-        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-            raise ValueError("OCR worker marker must be a regular non-symlink file")
-        os.unlink(_MARKER_NAME, dir_fd=ocr_fd)
+            return False
+        if (
+            stat.S_ISLNK(current.st_mode)
+            or not stat.S_ISREG(current.st_mode)
+            or current.st_nlink != 1
+            or (current.st_dev, current.st_ino) != (expected.st_dev, expected.st_ino)
+        ):
+            return False
+        os.unlink(name, dir_fd=directory_fd)
+        return True
 
     def _now(self) -> datetime:
         value = self._now_factory()

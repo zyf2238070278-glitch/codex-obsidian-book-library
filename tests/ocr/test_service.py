@@ -7,6 +7,7 @@ import stat
 import subprocess
 import sys
 import threading
+import time
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -138,7 +139,12 @@ def test_start_ocr_persists_job_and_returns_without_running_pages(app) -> None:
         "percent_complete": 0.0,
         "estimated_remaining_seconds": None,
     }
-    assert launcher.calls[0][0] == [sys.executable, "-m", "book_agent.ocr_worker"]
+    assert launcher.calls[0][0][:4] == [
+        sys.executable,
+        "-I",
+        "-c",
+        service_module._BOUND_WORKER_BOOTSTRAP,
+    ]
     assert database.list_ocr_pages(BOOK_A) == []
     assert original.read_bytes() == before
 
@@ -254,6 +260,94 @@ def test_start_rejects_corrupt_pdf(app) -> None:
     )
     with pytest.raises(ValueError, match="invalid or damaged"):
         service.start_ocr(BOOK_A)
+
+
+def test_pdf_changed_in_place_during_page_count_is_rejected_even_if_mtime_restored(
+    app, monkeypatch
+) -> None:
+    service, database, launcher, paths = app
+    original = _book(database, paths, BOOK_A, pages=2)
+    original_bytes = original.read_bytes()
+    original_stat = original.stat()
+    actual_open = service_module.fitz.open
+
+    class MutatingDocument:
+        def __init__(self, document: fitz.Document) -> None:
+            self.document = document
+            self.needs_pass = document.needs_pass
+
+        @property
+        def page_count(self) -> int:
+            count = self.document.page_count
+            changed = bytearray(original_bytes)
+            changed[-2] ^= 1
+            original.write_bytes(changed)
+            os.utime(
+                original,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+            )
+            return count
+
+        def close(self) -> None:
+            self.document.close()
+
+    monkeypatch.setattr(
+        service_module.fitz,
+        "open",
+        lambda *args, **kwargs: MutatingDocument(actual_open(*args, **kwargs)),
+    )
+
+    with pytest.raises(ValueError, match="changed during validation|content hash"):
+        service.start_ocr(BOOK_A)
+
+    assert database.list_ocr_jobs() == []
+    assert launcher.calls == []
+    assert original.read_bytes() != original_bytes
+
+
+def test_transient_pdf_change_and_byte_restore_is_detected_by_fd_metadata(
+    app, monkeypatch
+) -> None:
+    service, database, launcher, paths = app
+    original = _book(database, paths, BOOK_A, pages=2)
+    original_bytes = original.read_bytes()
+    original_stat = original.stat()
+    actual_open = service_module.fitz.open
+
+    class TransientDocument:
+        def __init__(self, document: fitz.Document) -> None:
+            self.document = document
+            self.needs_pass = document.needs_pass
+
+        @property
+        def page_count(self) -> int:
+            count = self.document.page_count
+            changed = bytearray(original_bytes)
+            changed[-2] ^= 1
+            original.write_bytes(changed)
+            time.sleep(0.001)
+            original.write_bytes(original_bytes)
+            os.utime(
+                original,
+                ns=(original_stat.st_atime_ns, original_stat.st_mtime_ns),
+            )
+            return count
+
+        def close(self) -> None:
+            self.document.close()
+
+    monkeypatch.setattr(
+        service_module.fitz,
+        "open",
+        lambda *args, **kwargs: TransientDocument(actual_open(*args, **kwargs)),
+    )
+
+    with pytest.raises(ValueError, match="changed during validation"):
+        service.start_ocr(BOOK_A)
+
+    assert database.list_ocr_jobs() == []
+    assert launcher.calls == []
+    assert original.read_bytes() == original_bytes
 
 
 
@@ -567,24 +661,128 @@ def test_detached_launcher_uses_exact_safe_process_contract(app) -> None:
     service.start_ocr(BOOK_A)
 
     argv, kwargs = launcher.calls[0]
-    assert argv == [sys.executable, "-m", "book_agent.ocr_worker"]
+    assert argv[:4] == [
+        sys.executable,
+        "-I",
+        "-c",
+        service_module._BOUND_WORKER_BOOTSTRAP,
+    ]
+    assert argv[-1] == sys.executable
     assert kwargs["shell"] is False
-    assert kwargs["cwd"] == str(paths.root.absolute())
+    assert kwargs["cwd"] == "/"
     assert kwargs["start_new_session"] is True
     assert kwargs["stdin"] == subprocess.DEVNULL
     assert kwargs["close_fds"] is True
+    assert len(kwargs["pass_fds"]) == 1
+    assert argv[4] == str(kwargs["pass_fds"][0])
     assert isinstance(kwargs["stdout"], int)
     assert kwargs["stderr"] == kwargs["stdout"]
     assert kwargs["env"] == {
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "LANG": "C.UTF-8",
         "LC_ALL": "C.UTF-8",
-        "BOOK_LIBRARY_ROOT": str(paths.root.absolute()),
+        "BOOK_LIBRARY_ROOT": ".",
         "BOOK_LIBRARY_OBSIDIAN_VAULT": str(paths.vault.absolute()),
     }
     log = paths.ocr_logs / "worker.log"
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
     assert log.is_file() and not log.is_symlink()
+
+
+@pytest.mark.skipif(sys.platform != "darwin", reason="requires macOS fchdir/exec")
+def test_macos_bootstrap_executes_worker_from_renamed_original_root(
+    tmp_path: Path,
+) -> None:
+    original = tmp_path / "project"
+    original_worker = original / "book_agent" / "ocr_worker.py"
+    original_worker.parent.mkdir(parents=True)
+    (original_worker.parent / "__init__.py").write_text("", encoding="utf-8")
+    original_worker.write_text(
+        "import json, os, sys\n"
+        "print(json.dumps({'source':'original','inode':os.stat('.').st_ino,"
+        "'orig_argv':sys.orig_argv}))\n",
+        encoding="utf-8",
+    )
+    descriptor = os.open(original, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW)
+    identity = os.fstat(descriptor)
+    moved = tmp_path / "moved-original"
+    original.rename(moved)
+    replacement_worker = original / "book_agent" / "ocr_worker.py"
+    replacement_worker.parent.mkdir(parents=True)
+    (replacement_worker.parent / "__init__.py").write_text("", encoding="utf-8")
+    replacement_worker.write_text("print('replacement')\n", encoding="utf-8")
+    environment = {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "LANG": "C.UTF-8",
+        "LC_ALL": "C.UTF-8",
+        "BOOK_LIBRARY_ROOT": ".",
+        "BOOK_LIBRARY_OBSIDIAN_VAULT": str(tmp_path / "vault"),
+    }
+    try:
+        completed = subprocess.run(
+            [
+                sys.executable,
+                "-I",
+                "-c",
+                service_module._BOUND_WORKER_BOOTSTRAP,
+                str(descriptor),
+                str(identity.st_dev),
+                str(identity.st_ino),
+                sys.executable,
+            ],
+            cwd="/",
+            pass_fds=(descriptor,),
+            check=True,
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+    finally:
+        os.close(descriptor)
+    payload = json.loads(completed.stdout)
+    assert payload["source"] == "original"
+    assert payload["inode"] == identity.st_ino
+    assert payload["orig_argv"][-3:] == [sys.executable, "-m", "book_agent.ocr_worker"]
+
+
+def test_launcher_cwd_fd_stays_on_original_root_during_path_replacement(
+    tmp_path: Path,
+) -> None:
+    paths = AppPaths.from_root(tmp_path / "project", tmp_path / "vault")
+    paths.root.mkdir(parents=True)
+    paths.originals.mkdir(parents=True)
+    database = Database(paths.database, root=paths.root)
+    database.initialize()
+    _book(database, paths, BOOK_A)
+    database.queue_ocr_job(BOOK_A, 2, ("zh-Hans", "en-US"))
+    original_identity = (paths.root.stat().st_dev, paths.root.stat().st_ino)
+    moved = tmp_path / "original-project"
+    observed: dict[str, object] = {}
+
+    class ReplacingPopen:
+        def __call__(self, argv: list[str], **kwargs: Any) -> FakeProcess:
+            root_info = os.fstat(kwargs["pass_fds"][0])
+            observed["root_identity"] = (root_info.st_dev, root_info.st_ino)
+            observed["cwd"] = kwargs["cwd"]
+            observed["env_root"] = kwargs["env"]["BOOK_LIBRARY_ROOT"]
+            paths.root.rename(moved)
+            paths.root.mkdir()
+            return FakeProcess()
+
+    service = OcrService(
+        paths,
+        database,
+        popen_factory=ReplacingPopen(),
+        pid_probe=lambda _: True,
+    )
+    try:
+        assert service._ensure_worker_started() is True
+        assert observed["root_identity"] == original_identity
+        assert observed["cwd"] == "/"
+        assert observed["env_root"] == "."
+    finally:
+        paths.root.rmdir()
+        moved.rename(paths.root)
 
 
 def test_worker_log_is_append_only_and_launch_descriptors_are_closed(app) -> None:
@@ -617,6 +815,200 @@ def test_launcher_failure_keeps_job_queued_and_does_not_claim_success(tmp_path: 
 
     assert database.get_ocr_job(BOOK_A)["status"] == "queued"
     assert database.list_ocr_pages(BOOK_A) == []
+    assert not (paths.ocr / "worker.json").exists()
+    assert not list(paths.ocr.glob(".worker-marker-*.tmp"))
+
+
+@pytest.mark.parametrize("failure", [OSError("post marker failed"), KeyboardInterrupt()])
+def test_post_spawn_atomic_replace_failure_keeps_complete_pre_marker(
+    app, monkeypatch, failure: BaseException
+) -> None:
+    service, database, launcher, paths = app
+    _book(database, paths, BOOK_A)
+    actual_replace = service_module.os.replace
+    replace_calls = 0
+
+    def fail_second_replace(*args: Any, **kwargs: Any) -> None:
+        nonlocal replace_calls
+        replace_calls += 1
+        if replace_calls == 2:
+            raise failure
+        actual_replace(*args, **kwargs)
+
+    monkeypatch.setattr(service_module.os, "replace", fail_second_replace)
+
+    with pytest.raises(type(failure), match="post marker failed" if isinstance(failure, OSError) else None):
+        service.start_ocr(BOOK_A)
+
+    marker = json.loads((paths.ocr / "worker.json").read_text(encoding="utf-8"))
+    assert marker["state"] == "launching"
+    assert marker["pid"] is None
+    assert marker["token"]
+    assert stat.S_IMODE((paths.ocr / "worker.json").stat().st_mode) == 0o600
+    assert not list(paths.ocr.glob(".worker-marker-*.tmp"))
+    monkeypatch.setattr(service_module.os, "replace", actual_replace)
+    service.start_ocr(BOOK_A)
+    assert len(launcher.calls) == 1
+    assert database.get_ocr_job(BOOK_A)["status"] == "queued"
+
+
+def test_pre_spawn_marker_write_failure_never_spawns_and_cleans_temp(
+    app, monkeypatch
+) -> None:
+    service, database, launcher, paths = app
+    _book(database, paths, BOOK_A)
+    actual_write = service_module.os.write
+    failed = False
+
+    def fail_first_write(descriptor: int, data: bytes) -> int:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise OSError("pre marker write failed")
+        return actual_write(descriptor, data)
+
+    monkeypatch.setattr(service_module.os, "write", fail_first_write)
+
+    with pytest.raises(OSError, match="pre marker write failed"):
+        service.start_ocr(BOOK_A)
+
+    assert launcher.calls == []
+    assert not (paths.ocr / "worker.json").exists()
+    assert not list(paths.ocr.glob(".worker-marker-*.tmp"))
+    assert database.get_ocr_job(BOOK_A)["status"] == "queued"
+
+
+@pytest.mark.parametrize("operation", ["fsync", "replace"])
+def test_pre_spawn_atomic_marker_failure_cleans_temp_and_never_spawns(
+    app, monkeypatch, operation: str
+) -> None:
+    service, database, launcher, paths = app
+    _book(database, paths, BOOK_A)
+    actual = getattr(service_module.os, operation)
+    calls = 0
+
+    def fail_first(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise OSError(f"pre marker {operation} failed")
+        return actual(*args, **kwargs)
+
+    monkeypatch.setattr(service_module.os, operation, fail_first)
+
+    with pytest.raises(OSError, match=f"pre marker {operation} failed"):
+        service.start_ocr(BOOK_A)
+
+    assert launcher.calls == []
+    assert not (paths.ocr / "worker.json").exists()
+    assert not list(paths.ocr.glob(".worker-marker-*.tmp"))
+    assert database.get_ocr_job(BOOK_A)["status"] == "queued"
+
+
+@pytest.mark.parametrize(("operation", "failure_call"), [("write", 2), ("fsync", 3)])
+def test_post_spawn_atomic_marker_failure_preserves_pre_marker_and_blocks_retry(
+    app, monkeypatch, operation: str, failure_call: int
+) -> None:
+    service, database, launcher, paths = app
+    _book(database, paths, BOOK_A)
+    actual = getattr(service_module.os, operation)
+    calls = 0
+
+    def fail_post(*args: Any, **kwargs: Any) -> Any:
+        nonlocal calls
+        calls += 1
+        if calls == failure_call:
+            raise OSError(f"post marker {operation} failed")
+        return actual(*args, **kwargs)
+
+    monkeypatch.setattr(service_module.os, operation, fail_post)
+
+    with pytest.raises(OSError, match=f"post marker {operation} failed"):
+        service.start_ocr(BOOK_A)
+
+    marker = json.loads((paths.ocr / "worker.json").read_text(encoding="utf-8"))
+    assert marker["state"] == "launching"
+    assert marker["pid"] is None
+    assert not list(paths.ocr.glob(".worker-marker-*.tmp"))
+    monkeypatch.setattr(service_module.os, operation, actual)
+    service.start_ocr(BOOK_A)
+    assert len(launcher.calls) == 1
+    assert database.get_ocr_job(BOOK_A)["status"] == "queued"
+
+
+@pytest.mark.parametrize(
+    ("failure_call", "expected_state", "expected_spawn_count"),
+    [(2, "launching", 0), (4, "running", 1)],
+)
+def test_directory_fsync_failure_leaves_a_complete_recovery_marker(
+    app,
+    monkeypatch,
+    failure_call: int,
+    expected_state: str,
+    expected_spawn_count: int,
+) -> None:
+    service, database, launcher, paths = app
+    _book(database, paths, BOOK_A)
+    actual_fsync = service_module.os.fsync
+    calls = 0
+
+    def fail_directory_sync(descriptor: int) -> None:
+        nonlocal calls
+        calls += 1
+        if calls == failure_call:
+            raise OSError("directory marker fsync failed")
+        actual_fsync(descriptor)
+
+    monkeypatch.setattr(service_module.os, "fsync", fail_directory_sync)
+
+    with pytest.raises(OSError, match="directory marker fsync failed"):
+        service.start_ocr(BOOK_A)
+
+    marker = json.loads((paths.ocr / "worker.json").read_text(encoding="utf-8"))
+    assert marker["state"] == expected_state
+    assert len(launcher.calls) == expected_spawn_count
+    assert not list(paths.ocr.glob(".worker-marker-*.tmp"))
+    monkeypatch.setattr(service_module.os, "fsync", actual_fsync)
+    service.start_ocr(BOOK_A)
+    assert len(launcher.calls) == expected_spawn_count
+    assert database.get_ocr_job(BOOK_A)["status"] == "queued"
+
+
+@pytest.mark.parametrize("collision_kind", ["symlink", "hardlink"])
+def test_marker_temp_collision_is_not_followed_or_deleted(
+    tmp_path: Path, collision_kind: str
+) -> None:
+    paths = AppPaths.from_root(tmp_path / "project", tmp_path / "vault")
+    paths.root.mkdir(parents=True)
+    paths.originals.mkdir(parents=True)
+    database = Database(paths.database, root=paths.root)
+    database.initialize()
+    launcher = RecordingPopen()
+    token = "1" * 32
+    service = OcrService(
+        paths,
+        database,
+        popen_factory=launcher,
+        token_factory=lambda: token,
+    )
+    _book(database, paths, BOOK_A)
+    paths.ocr.mkdir(parents=True)
+    target = paths.ocr / "target"
+    target.write_text("keep", encoding="utf-8")
+    collision = paths.ocr / f".worker-marker-{token}.tmp"
+    if collision_kind == "symlink":
+        collision.symlink_to(target)
+    else:
+        os.link(target, collision)
+
+    with pytest.raises(ValueError, match="temporary marker"):
+        service.start_ocr(BOOK_A)
+
+    assert collision.exists() or collision.is_symlink()
+    assert target.read_text(encoding="utf-8") == "keep"
+    if collision_kind == "hardlink":
+        assert collision.stat().st_ino == target.stat().st_ino
+    assert launcher.calls == []
 
 
 def test_launcher_rejects_log_symlink_and_recovers_stale_marker(app) -> None:

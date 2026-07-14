@@ -149,7 +149,7 @@ class OcrJobSummary:
             raise ValueError("book_id must not be blank")
         if not isinstance(self.title, str) or not self.title.strip():
             raise ValueError("title must not be blank")
-        if self.status not in _OCR_STATUSES:
+        if type(self.status) is not str or self.status not in _OCR_STATUSES:
             raise ValueError("status is not a supported OCR job state")
         if not _is_int(self.total_pages) or self.total_pages <= 0:
             raise ValueError("total_pages must be greater than zero")

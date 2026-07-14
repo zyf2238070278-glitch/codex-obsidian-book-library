@@ -1,4 +1,5 @@
 import json
+from collections import UserString
 from dataclasses import FrozenInstanceError, asdict
 from math import inf, nan
 
@@ -223,6 +224,11 @@ def test_ocr_job_summary_computes_deterministic_percent_complete() -> None:
 )
 def test_ocr_job_summary_accepts_supported_statuses(status: str) -> None:
     assert _summary(status=status).status == status
+
+
+def test_ocr_job_summary_rejects_string_like_status() -> None:
+    with pytest.raises(ValueError, match="status"):
+        _summary(status=UserString("queued"))
 
 
 def test_ocr_models_are_immutable_and_json_safe() -> None:

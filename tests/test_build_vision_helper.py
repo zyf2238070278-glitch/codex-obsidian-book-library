@@ -5,6 +5,7 @@ import os
 import stat
 import subprocess
 from pathlib import Path
+from typing import Mapping
 
 import pytest
 
@@ -27,6 +28,7 @@ class FakeRunner:
         capabilities: object | None = None,
         failures: dict[str, tuple[int, str]] | None = None,
         make_output: bool = True,
+        mutate_on_capabilities: bytes | None = None,
     ) -> None:
         self.binary = binary
         self.architectures = architectures
@@ -40,27 +42,42 @@ class FakeRunner:
         )
         self.failures = failures or {}
         self.make_output = make_output
+        self.mutate_on_capabilities = mutate_on_capabilities
         self.calls: list[list[str]] = []
+        self.environments: list[dict[str, str]] = []
+        self.timeouts: list[float] = []
 
-    def __call__(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
+    def __call__(
+        self,
+        argv: list[str],
+        *,
+        environment: Mapping[str, str],
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]:
         assert type(argv) is list
         assert all(type(item) is str for item in argv)
+        assert type(environment) is dict
+        assert type(timeout) in (int, float) and not isinstance(timeout, bool)
         self.calls.append(list(argv))
+        self.environments.append(dict(environment))
+        self.timeouts.append(float(timeout))
         command = (
             Path(argv[1]).name
-            if argv[:1] == ["xcrun"]
+            if Path(argv[0]).name == "xcrun"
             else Path(argv[0]).name
         )
         failure = self.failures.get(command)
         if failure is not None:
             return subprocess.CompletedProcess(argv, failure[0], "", failure[1])
-        if argv[:2] == ["xcrun", "swiftc"]:
+        if Path(argv[0]).name == "xcrun" and argv[1:2] == ["swiftc"]:
             if self.make_output:
                 Path(argv[argv.index("-o") + 1]).write_bytes(self.binary)
             return subprocess.CompletedProcess(argv, 0, "", "")
         if command == "lipo":
             return subprocess.CompletedProcess(argv, 0, self.architectures, "")
         if argv[-1:] == ["--capabilities"]:
+            if self.mutate_on_capabilities is not None:
+                Path(argv[0]).write_bytes(self.mutate_on_capabilities)
             return subprocess.CompletedProcess(
                 argv,
                 0,
@@ -79,6 +96,7 @@ def _source(tmp_path: Path) -> Path:
 
 def test_default_runner_is_non_shell_and_uses_writable_module_caches(
     monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
 ) -> None:
     captured: dict[str, object] = {}
 
@@ -89,21 +107,28 @@ def test_default_runner_is_non_shell_and_uses_writable_module_caches(
 
     monkeypatch.setattr(vision_builder.subprocess, "run", fake_run)
 
-    result = vision_builder._default_run_command(["xcrun", "swiftc", "--version"])
+    environment = {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "LANG": "en_US.UTF-8",
+        "TMPDIR": str(tmp_path),
+        "CLANG_MODULE_CACHE_PATH": str(tmp_path / "module-cache"),
+        "SWIFT_MODULECACHE_PATH": str(tmp_path / "module-cache"),
+    }
+    result = vision_builder._default_run_command(
+        ["/usr/bin/xcrun", "swiftc", "--version"],
+        environment=environment,
+        timeout=17,
+    )
 
     assert result.returncode == 0
-    assert captured["argv"] == ["xcrun", "swiftc", "--version"]
+    assert captured["argv"] == ["/usr/bin/xcrun", "swiftc", "--version"]
     assert captured["shell"] is False
     assert captured["check"] is False
-    assert captured["capture_output"] is True
-    assert captured["text"] is True
-    environment = captured["env"]
-    assert type(environment) is dict
-    clang_cache = Path(environment["CLANG_MODULE_CACHE_PATH"])
-    swift_cache = Path(environment["SWIFT_MODULECACHE_PATH"])
-    assert clang_cache == swift_cache
-    assert clang_cache.is_absolute()
-    assert clang_cache.is_dir()
+    assert captured["timeout"] == 17
+    assert captured["env"] == environment
+    assert "capture_output" not in captured
+    assert captured["stdout"] is not None
+    assert captured["stderr"] is not None
 
 
 def test_builder_uses_exact_non_shell_arm64_pipeline_and_atomically_installs(
@@ -118,11 +143,11 @@ def test_builder_uses_exact_non_shell_arm64_pipeline_and_atomically_installs(
     assert result == output.resolve()
     assert output.read_bytes() == MACHO_ARM64
     assert stat.S_IMODE(output.stat().st_mode) == 0o755
-    assert len(runner.calls) == 5
+    assert len(runner.calls) == 7
     compile_command = runner.calls[0]
     temporary_output = Path(compile_command[-1])
     assert compile_command == [
-        "xcrun",
+        "/usr/bin/xcrun",
         "swiftc",
         "-O",
         "-target",
@@ -133,20 +158,52 @@ def test_builder_uses_exact_non_shell_arm64_pipeline_and_atomically_installs(
     ]
     assert temporary_output != output
     assert runner.calls[1] == [
-        "codesign",
+        "/usr/bin/codesign",
         "--force",
         "--sign",
         "-",
         str(temporary_output),
     ]
-    assert runner.calls[2] == ["lipo", "-archs", str(temporary_output)]
+    assert runner.calls[2] == ["/usr/bin/lipo", "-archs", str(temporary_output)]
     assert runner.calls[3] == [
-        "codesign",
+        "/usr/bin/codesign",
         "--verify",
         "--strict",
         str(temporary_output),
     ]
     assert runner.calls[4] == [str(temporary_output), "--capabilities"]
+    assert runner.calls[5] == [
+        "/usr/bin/lipo",
+        "-archs",
+        str(temporary_output),
+    ]
+    assert runner.calls[6] == [
+        "/usr/bin/codesign",
+        "--verify",
+        "--strict",
+        str(temporary_output),
+    ]
+    assert len(runner.environments) == len(runner.calls)
+    assert all(
+        environment == runner.environments[0]
+        for environment in runner.environments
+    )
+    environment = runner.environments[0]
+    assert set(environment) == {
+        "PATH",
+        "LANG",
+        "TMPDIR",
+        "CLANG_MODULE_CACHE_PATH",
+        "SWIFT_MODULECACHE_PATH",
+    }
+    assert environment["PATH"] == "/usr/bin:/bin:/usr/sbin:/sbin"
+    assert not any(key.startswith("DYLD_") for key in environment)
+    assert "DEVELOPER_DIR" not in environment
+    assert "SDKROOT" not in environment
+    module_cache = Path(environment["CLANG_MODULE_CACHE_PATH"])
+    assert module_cache == Path(environment["SWIFT_MODULECACHE_PATH"])
+    assert module_cache.parent == temporary_output.parent
+    assert runner.timeouts[0] > runner.timeouts[1]
 
 
 def test_builder_rejects_existing_symlink_without_running_commands(tmp_path: Path) -> None:
@@ -186,6 +243,35 @@ def test_builder_reports_failed_command_without_installing_partial_output(
     ):
         build_vision_helper(source=source, output=output, run_command=runner)
 
+    assert not output.exists()
+
+
+def test_builder_reports_timeout_without_installing_partial_output(
+    tmp_path: Path,
+) -> None:
+    class TimeoutRunner(FakeRunner):
+        def __call__(
+            self,
+            argv: list[str],
+            *,
+            environment: Mapping[str, str],
+            timeout: float,
+        ) -> subprocess.CompletedProcess[str]:
+            if argv[:2] == ["/usr/bin/xcrun", "swiftc"]:
+                raise subprocess.TimeoutExpired(argv, timeout)
+            return super().__call__(
+                argv,
+                environment=environment,
+                timeout=timeout,
+            )
+
+    output = tmp_path / "book-vision-ocr"
+    with pytest.raises(VisionHelperBuildError, match="timed out"):
+        build_vision_helper(
+            source=_source(tmp_path),
+            output=output,
+            run_command=TimeoutRunner(),
+        )
     assert not output.exists()
 
 
@@ -264,8 +350,18 @@ def test_builder_strictly_validates_capabilities(
 
 def test_builder_rejects_non_json_capabilities(tmp_path: Path) -> None:
     class BadJsonRunner(FakeRunner):
-        def __call__(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
-            result = super().__call__(argv)
+        def __call__(
+            self,
+            argv: list[str],
+            *,
+            environment: Mapping[str, str],
+            timeout: float,
+        ) -> subprocess.CompletedProcess[str]:
+            result = super().__call__(
+                argv,
+                environment=environment,
+                timeout=timeout,
+            )
             if argv[-1:] == ["--capabilities"]:
                 return subprocess.CompletedProcess(argv, 0, "not-json", "")
             return result
@@ -280,8 +376,18 @@ def test_builder_rejects_non_json_capabilities(tmp_path: Path) -> None:
 
 def test_builder_rejects_successful_capabilities_with_stderr(tmp_path: Path) -> None:
     class NoisyRunner(FakeRunner):
-        def __call__(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
-            result = super().__call__(argv)
+        def __call__(
+            self,
+            argv: list[str],
+            *,
+            environment: Mapping[str, str],
+            timeout: float,
+        ) -> subprocess.CompletedProcess[str]:
+            result = super().__call__(
+                argv,
+                environment=environment,
+                timeout=timeout,
+            )
             if argv[-1:] == ["--capabilities"]:
                 return subprocess.CompletedProcess(
                     argv,
@@ -301,8 +407,18 @@ def test_builder_rejects_successful_capabilities_with_stderr(tmp_path: Path) -> 
 
 def test_builder_rejects_non_finite_json_constant(tmp_path: Path) -> None:
     class NanRunner(FakeRunner):
-        def __call__(self, argv: list[str]) -> subprocess.CompletedProcess[str]:
-            result = super().__call__(argv)
+        def __call__(
+            self,
+            argv: list[str],
+            *,
+            environment: Mapping[str, str],
+            timeout: float,
+        ) -> subprocess.CompletedProcess[str]:
+            result = super().__call__(
+                argv,
+                environment=environment,
+                timeout=timeout,
+            )
             if argv[-1:] == ["--capabilities"]:
                 return subprocess.CompletedProcess(
                     argv,
@@ -352,3 +468,35 @@ def test_builder_preserves_existing_output_when_validation_fails(tmp_path: Path)
 
     assert output.read_bytes() == b"previous helper"
     assert stat.S_IMODE(output.stat().st_mode) == 0o755
+
+
+def test_builder_rejects_helper_that_replaces_itself_during_capabilities(
+    tmp_path: Path,
+) -> None:
+    source = _source(tmp_path)
+    output = tmp_path / "book-vision-ocr"
+
+    with pytest.raises(VisionHelperBuildError, match="changed during capabilities"):
+        build_vision_helper(
+            source=source,
+            output=output,
+            run_command=FakeRunner(
+                mutate_on_capabilities=MACHO_ARM64 + b"mutated"
+            ),
+        )
+
+    assert not output.exists()
+
+
+def test_builder_truncates_untrusted_command_diagnostics(tmp_path: Path) -> None:
+    runner = FakeRunner(failures={"swiftc": (1, "x" * 200_000)})
+
+    with pytest.raises(VisionHelperBuildError) as error:
+        build_vision_helper(
+            source=_source(tmp_path),
+            output=tmp_path / "book-vision-ocr",
+            run_command=runner,
+        )
+
+    assert len(str(error.value)) < 10_000
+    assert "truncated" in str(error.value)

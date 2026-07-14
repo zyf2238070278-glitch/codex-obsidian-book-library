@@ -1,14 +1,16 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
 import stat
 import subprocess
 import sys
 import tempfile
+from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable
+from typing import BinaryIO, Mapping, Protocol
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -17,37 +19,85 @@ DEFAULT_OUTPUT = PROJECT_ROOT / "bin" / "book-vision-ocr"
 TARGET = "arm64-apple-macos13.0"
 REQUIRED_LANGUAGES = frozenset({"zh-Hans", "en-US"})
 MACHO_64_MAGICS = frozenset({b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"})
+XCRUN = "/usr/bin/xcrun"
+CODESIGN = "/usr/bin/codesign"
+LIPO = "/usr/bin/lipo"
+SAFE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+COMPILE_TIMEOUT_SECONDS = 180.0
+TOOL_TIMEOUT_SECONDS = 30.0
+HELPER_TIMEOUT_SECONDS = 30.0
+MAXIMUM_COMMAND_OUTPUT_BYTES = 64 * 1024
+MAXIMUM_DIAGNOSTIC_BYTES = 4 * 1024
+MAXIMUM_HELPER_BYTES = 256 * 1024 * 1024
 
 
 class VisionHelperBuildError(ValueError):
     """The native Apple Vision helper could not be built safely."""
 
 
-CommandRunner = Callable[[list[str]], subprocess.CompletedProcess[str]]
+class CommandRunner(Protocol):
+    def __call__(
+        self,
+        argv: list[str],
+        *,
+        environment: Mapping[str, str],
+        timeout: float,
+    ) -> subprocess.CompletedProcess[str]: ...
 
 
-def _default_run_command(argv: list[str]) -> subprocess.CompletedProcess[str]:
-    module_cache = (
-        Path(tempfile.gettempdir())
-        / f"book-vision-module-cache-{os.getuid()}"
+@dataclass(frozen=True)
+class _ArtifactFingerprint:
+    device: int
+    inode: int
+    size: int
+    mode: int
+    modified_ns: int
+    sha256: str
+
+
+def _read_bounded(stream: BinaryIO) -> str:
+    stream.seek(0)
+    value = stream.read(MAXIMUM_COMMAND_OUTPUT_BYTES + 1)
+    truncated = len(value) > MAXIMUM_COMMAND_OUTPUT_BYTES
+    value = value[:MAXIMUM_COMMAND_OUTPUT_BYTES]
+    rendered = value.decode("utf-8", errors="replace")
+    if truncated:
+        rendered += "\n...[truncated]"
+    return rendered
+
+
+def _truncate_text(value: str, maximum_bytes: int) -> str:
+    encoded = value.encode("utf-8", errors="replace")
+    if len(encoded) <= maximum_bytes:
+        return value
+    return (
+        encoded[:maximum_bytes].decode("utf-8", errors="ignore")
+        + "\n...[truncated]"
     )
-    if module_cache.is_symlink():
-        raise OSError(f"module cache must not be a symlink: {module_cache}")
-    module_cache.mkdir(mode=0o700, parents=False, exist_ok=True)
-    if not module_cache.is_dir():
-        raise OSError(f"module cache is not a directory: {module_cache}")
-    module_cache.chmod(0o700)
-    environment = os.environ.copy()
-    environment["CLANG_MODULE_CACHE_PATH"] = str(module_cache)
-    environment["SWIFT_MODULECACHE_PATH"] = str(module_cache)
-    return subprocess.run(
-        argv,
-        check=False,
-        capture_output=True,
-        text=True,
-        shell=False,
-        env=environment,
-    )
+
+
+def _default_run_command(
+    argv: list[str],
+    *,
+    environment: Mapping[str, str],
+    timeout: float,
+) -> subprocess.CompletedProcess[str]:
+    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
+        completed = subprocess.run(
+            argv,
+            check=False,
+            stdout=stdout,
+            stderr=stderr,
+            shell=False,
+            env=dict(environment),
+            timeout=timeout,
+        )
+        return subprocess.CompletedProcess(
+            argv,
+            completed.returncode,
+            _read_bounded(stdout),
+            _read_bounded(stderr),
+        )
 
 
 def _validate_runner_result(
@@ -67,30 +117,46 @@ def _validate_runner_result(
         raise VisionHelperBuildError(
             f"command runner returned non-text output for {command[0]}"
         )
-    return result
+    return subprocess.CompletedProcess(
+        command,
+        result.returncode,
+        _truncate_text(result.stdout, MAXIMUM_COMMAND_OUTPUT_BYTES),
+        _truncate_text(result.stderr, MAXIMUM_COMMAND_OUTPUT_BYTES),
+    )
 
 
 def _run_checked(
     command: list[str],
     *,
     run_command: CommandRunner,
+    environment: Mapping[str, str],
+    timeout: float,
 ) -> subprocess.CompletedProcess[str]:
     if type(command) is not list or not command or not all(
         type(argument) is str and argument for argument in command
     ):
         raise VisionHelperBuildError("internal command arguments are invalid")
     try:
-        raw_result = run_command(list(command))
-    except (OSError, subprocess.SubprocessError) as exc:
+        raw_result = run_command(
+            list(command),
+            environment=environment,
+            timeout=timeout,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise VisionHelperBuildError(
+            f"{command[0]} timed out after {timeout:g} seconds"
+        ) from exc
+    except (OSError, subprocess.SubprocessError, TypeError) as exc:
         raise VisionHelperBuildError(
             f"failed to run {command[0]}: {exc}"
         ) from exc
     result = _validate_runner_result(raw_result, command=command)
     if result.returncode != 0:
-        diagnostic = (
+        diagnostic = _truncate_text(
             result.stderr.strip()
             or result.stdout.strip()
-            or "no diagnostic output"
+            or "no diagnostic output",
+            MAXIMUM_DIAGNOSTIC_BYTES,
         )
         display_command = " ".join(command[:2])
         raise VisionHelperBuildError(
@@ -122,26 +188,116 @@ def _validate_existing_output(output: Path) -> None:
         raise VisionHelperBuildError(f"output must be a regular file: {output}")
 
 
-def _validate_compiled_file(path: Path) -> None:
+def _open_compiled_file(path: Path) -> int:
     try:
-        metadata = path.lstat()
+        descriptor = os.open(
+            path,
+            os.O_RDONLY | os.O_NOFOLLOW | os.O_CLOEXEC,
+        )
     except FileNotFoundError as exc:
         raise VisionHelperBuildError(
             "swiftc did not create the requested helper output"
         ) from exc
+    except OSError as exc:
+        raise VisionHelperBuildError(
+            "swiftc output must be a regular file, not a symlink"
+        ) from exc
+    metadata = os.fstat(descriptor)
     if stat.S_ISLNK(metadata.st_mode) or not stat.S_ISREG(metadata.st_mode):
+        os.close(descriptor)
         raise VisionHelperBuildError(
             "swiftc output must be a regular file, not a symlink"
         )
+    if metadata.st_size <= 0 or metadata.st_size > MAXIMUM_HELPER_BYTES:
+        os.close(descriptor)
+        raise VisionHelperBuildError("swiftc output has an unsafe file size")
+    return descriptor
+
+
+def _validate_compiled_file(path: Path) -> None:
+    descriptor = _open_compiled_file(path)
     try:
-        with path.open("rb") as compiled:
-            magic = compiled.read(4)
+        magic = os.read(descriptor, 4)
     except OSError as exc:
         raise VisionHelperBuildError(
             f"could not inspect swiftc output: {exc}"
         ) from exc
+    finally:
+        os.close(descriptor)
     if magic not in MACHO_64_MAGICS:
         raise VisionHelperBuildError("swiftc output is not a 64-bit Mach-O executable")
+
+
+def _artifact_fingerprint(path: Path) -> _ArtifactFingerprint:
+    descriptor = _open_compiled_file(path)
+    try:
+        before = os.fstat(descriptor)
+        digest = hashlib.sha256()
+        while True:
+            chunk = os.read(descriptor, 1024 * 1024)
+            if not chunk:
+                break
+            digest.update(chunk)
+        after = os.fstat(descriptor)
+        if (
+            before.st_dev,
+            before.st_ino,
+            before.st_size,
+            stat.S_IMODE(before.st_mode),
+            before.st_mtime_ns,
+        ) != (
+            after.st_dev,
+            after.st_ino,
+            after.st_size,
+            stat.S_IMODE(after.st_mode),
+            after.st_mtime_ns,
+        ):
+            raise VisionHelperBuildError(
+                "helper changed while its fingerprint was calculated"
+            )
+        return _ArtifactFingerprint(
+            device=after.st_dev,
+            inode=after.st_ino,
+            size=after.st_size,
+            mode=stat.S_IMODE(after.st_mode),
+            modified_ns=after.st_mtime_ns,
+            sha256=digest.hexdigest(),
+        )
+    finally:
+        os.close(descriptor)
+
+
+def _validate_architecture(
+    path: Path,
+    *,
+    run_command: CommandRunner,
+    environment: Mapping[str, str],
+) -> None:
+    architectures = _run_checked(
+        [LIPO, "-archs", str(path)],
+        run_command=run_command,
+        environment=environment,
+        timeout=TOOL_TIMEOUT_SECONDS,
+    ).stdout.split()
+    if architectures != ["arm64"]:
+        rendered = " ".join(architectures) or "none"
+        raise VisionHelperBuildError(
+            f"helper must be a thin arm64 binary; lipo reported: {rendered}"
+        )
+
+
+def _verify_signature(
+    path: Path,
+    *,
+    run_command: CommandRunner,
+    environment: Mapping[str, str],
+) -> None:
+    _run_checked(
+        [CODESIGN, "--verify", "--strict", str(path)],
+        run_command=run_command,
+        environment=environment,
+        timeout=TOOL_TIMEOUT_SECONDS,
+    )
 
 
 def _reject_nonfinite_json(value: str) -> object:
@@ -207,10 +363,23 @@ def build_vision_helper(
         prefix=".book-vision-ocr-build-",
         dir=output_path.parent,
     ) as temporary_directory:
-        temporary_output = Path(temporary_directory) / output_path.name
+        temporary_root = Path(temporary_directory)
+        temporary_output = temporary_root / output_path.name
+        module_cache = temporary_root / "module-cache"
+        module_cache.mkdir(mode=0o700)
+        # Intentionally omit inherited DEVELOPER_DIR, SDKROOT, and DYLD_*.
+        # Absolute /usr/bin/xcrun therefore uses the administrator-selected
+        # Xcode toolchain, while every compiler cache stays private to this build.
+        environment = {
+            "PATH": SAFE_PATH,
+            "LANG": "en_US.UTF-8",
+            "TMPDIR": str(temporary_root),
+            "CLANG_MODULE_CACHE_PATH": str(module_cache),
+            "SWIFT_MODULECACHE_PATH": str(module_cache),
+        }
         _run_checked(
             [
-                "xcrun",
+                XCRUN,
                 "swiftc",
                 "-O",
                 "-target",
@@ -220,43 +389,65 @@ def build_vision_helper(
                 str(temporary_output),
             ],
             run_command=run_command,
+            environment=environment,
+            timeout=COMPILE_TIMEOUT_SECONDS,
         )
         _validate_compiled_file(temporary_output)
         temporary_output.chmod(0o755)
 
         _run_checked(
             [
-                "codesign",
+                CODESIGN,
                 "--force",
                 "--sign",
                 "-",
                 str(temporary_output),
             ],
             run_command=run_command,
+            environment=environment,
+            timeout=TOOL_TIMEOUT_SECONDS,
         )
-        architectures = _run_checked(
-            ["lipo", "-archs", str(temporary_output)],
+        _validate_architecture(
+            temporary_output,
             run_command=run_command,
-        ).stdout.split()
-        if architectures != ["arm64"]:
-            rendered = " ".join(architectures) or "none"
-            raise VisionHelperBuildError(
-                f"helper must be a thin arm64 binary; lipo reported: {rendered}"
-            )
-        _run_checked(
-            ["codesign", "--verify", "--strict", str(temporary_output)],
-            run_command=run_command,
+            environment=environment,
         )
+        _verify_signature(
+            temporary_output,
+            run_command=run_command,
+            environment=environment,
+        )
+        fingerprint_before_capabilities = _artifact_fingerprint(temporary_output)
         capabilities = _run_checked(
             [str(temporary_output), "--capabilities"],
             run_command=run_command,
+            environment=environment,
+            timeout=HELPER_TIMEOUT_SECONDS,
         )
         if capabilities.stderr:
             raise VisionHelperBuildError(
                 "capabilities command wrote unexpected stderr output"
             )
         _validate_capabilities(capabilities.stdout)
-        _validate_compiled_file(temporary_output)
+        fingerprint_after_capabilities = _artifact_fingerprint(temporary_output)
+        if fingerprint_after_capabilities != fingerprint_before_capabilities:
+            raise VisionHelperBuildError(
+                "helper changed during capabilities validation"
+            )
+        _validate_architecture(
+            temporary_output,
+            run_command=run_command,
+            environment=environment,
+        )
+        _verify_signature(
+            temporary_output,
+            run_command=run_command,
+            environment=environment,
+        )
+        if _artifact_fingerprint(temporary_output) != fingerprint_before_capabilities:
+            raise VisionHelperBuildError(
+                "helper changed during final architecture/signature verification"
+            )
         if stat.S_IMODE(temporary_output.stat().st_mode) != 0o755:
             raise VisionHelperBuildError("helper executable mode must be exactly 0755")
 

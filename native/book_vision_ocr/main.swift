@@ -1,4 +1,5 @@
 import CoreGraphics
+import CoreFoundation
 import Darwin
 import Foundation
 import ImageIO
@@ -6,7 +7,11 @@ import Vision
 
 private let schemaVersion = 1
 private let helperVersion = "0.1.0"
-private let maximumRecognizedCharacters = 100_000
+private let maximumRecognizedUnicodeScalars = 100_000
+private let maximumRecognizedUTF8Bytes = 400_000
+private let maximumImageFileBytes = 64 * 1024 * 1024
+private let maximumImageDimension = 12_000
+private let maximumImagePixels = 40_000_000
 
 private enum HelperError: Error, CustomStringConvertible {
     case invalidArguments(String)
@@ -167,7 +172,17 @@ private func parseArguments(_ arguments: [String]) throws -> Operation {
     return .recognize(imagePath: imagePath, languages: languages)
 }
 
-private func validatedImage(at path: String) throws -> CGImage {
+private func fileMetadataMatches(_ left: stat, _ right: stat) -> Bool {
+    return left.st_dev == right.st_dev
+        && left.st_ino == right.st_ino
+        && left.st_size == right.st_size
+        && left.st_mtimespec.tv_sec == right.st_mtimespec.tv_sec
+        && left.st_mtimespec.tv_nsec == right.st_mtimespec.tv_nsec
+        && left.st_ctimespec.tv_sec == right.st_ctimespec.tv_sec
+        && left.st_ctimespec.tv_nsec == right.st_ctimespec.tv_nsec
+}
+
+private func readImageData(at path: String) throws -> Data {
     guard !path.isEmpty, path.utf8.count <= 32_768,
           NSString(string: path).isAbsolutePath else {
         throw HelperError.invalidImage("--image must be an absolute filesystem path")
@@ -176,26 +191,155 @@ private func validatedImage(at path: String) throws -> CGImage {
         throw HelperError.invalidImage("--image must be a filesystem path, not a URL")
     }
 
-    var fileInformation = stat()
-    let status = path.withCString { pointer in
-        lstat(pointer, &fileInformation)
+    let descriptor = path.withCString { pointer in
+        Darwin.open(pointer, O_RDONLY | O_NOFOLLOW | O_CLOEXEC)
     }
-    guard status == 0 else {
-        throw HelperError.invalidImage("image does not exist or cannot be inspected")
+    guard descriptor >= 0 else {
+        if errno == ELOOP {
+            throw HelperError.invalidImage("image must not be a symbolic link")
+        }
+        throw HelperError.invalidImage("image could not be opened safely")
+    }
+    defer {
+        Darwin.close(descriptor)
+    }
+
+    var fileInformation = stat()
+    guard fstat(descriptor, &fileInformation) == 0 else {
+        throw HelperError.invalidImage("opened image could not be inspected")
     }
     let fileType = fileInformation.st_mode & mode_t(S_IFMT)
-    guard fileType != mode_t(S_IFLNK) else {
-        throw HelperError.invalidImage("image must not be a symbolic link")
-    }
     guard fileType == mode_t(S_IFREG) else {
         throw HelperError.invalidImage("image must be a regular file")
     }
+    guard fileInformation.st_size > 0,
+          fileInformation.st_size <= off_t(maximumImageFileBytes) else {
+        throw HelperError.invalidImage(
+            "image file size must be between 1 byte and 64 MiB"
+        )
+    }
 
-    let fileURL = URL(fileURLWithPath: path, isDirectory: false) as CFURL
-    guard let source = CGImageSourceCreateWithURL(fileURL, nil),
-          let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
+    let expectedSize = Int(fileInformation.st_size)
+    var data = Data(count: expectedSize)
+    try data.withUnsafeMutableBytes { rawBuffer in
+        guard let baseAddress = rawBuffer.baseAddress else {
+            throw HelperError.invalidImage("image data buffer could not be allocated")
+        }
+        var offset = 0
+        while offset < expectedSize {
+            let count = Darwin.read(
+                descriptor,
+                baseAddress.advanced(by: offset),
+                expectedSize - offset
+            )
+            if count < 0 {
+                if errno == EINTR {
+                    continue
+                }
+                throw HelperError.invalidImage("opened image could not be read")
+            }
+            guard count > 0 else {
+                throw HelperError.invalidImage("image changed while it was being read")
+            }
+            offset += count
+        }
+    }
+
+    var extraByte: UInt8 = 0
+    while true {
+        let extraCount = Darwin.read(descriptor, &extraByte, 1)
+        if extraCount < 0 && errno == EINTR {
+            continue
+        }
+        guard extraCount == 0 else {
+            if extraCount < 0 {
+                throw HelperError.invalidImage("opened image could not be read")
+            }
+            throw HelperError.invalidImage("image changed while it was being read")
+        }
+        break
+    }
+    var finalInformation = stat()
+    guard fstat(descriptor, &finalInformation) == 0,
+          fileMetadataMatches(fileInformation, finalInformation) else {
+        throw HelperError.invalidImage("image changed while it was being read")
+    }
+    return data
+}
+
+private func imageDimension(
+    _ rawValue: Any?,
+    name: String
+) throws -> UInt64 {
+    guard let rawValue else {
+        throw HelperError.invalidImage("image source is missing \(name)")
+    }
+    let coreValue = rawValue as CFTypeRef
+    guard CFGetTypeID(coreValue) != CFBooleanGetTypeID(),
+          let number = rawValue as? NSNumber else {
+        throw HelperError.invalidImage("image \(name) must be a native number")
+    }
+    let value = number.doubleValue
+    guard value.isFinite, value >= 1, value.rounded(.towardZero) == value else {
+        throw HelperError.invalidImage(
+            "image \(name) must be a finite positive integer"
+        )
+    }
+    guard value <= Double(maximumImageDimension) else {
+        throw HelperError.invalidImage(
+            "image dimension exceeds the 12,000 pixel side limit"
+        )
+    }
+    return UInt64(value)
+}
+
+private func validateImageDimensions(
+    width: UInt64,
+    height: UInt64
+) throws {
+    guard width <= UInt64(maximumImageDimension),
+          height <= UInt64(maximumImageDimension) else {
+        throw HelperError.invalidImage(
+            "image dimension exceeds the 12,000 pixel side limit"
+        )
+    }
+    let (pixels, overflow) = width.multipliedReportingOverflow(by: height)
+    guard !overflow, pixels <= UInt64(maximumImagePixels) else {
+        throw HelperError.invalidImage(
+            "image pixel count exceeds the 40,000,000 pixel limit"
+        )
+    }
+}
+
+private func validatedImage(at path: String) throws -> CGImage {
+    let data = try readImageData(at: path)
+    guard let source = CGImageSourceCreateWithData(data as CFData, nil) else {
+        throw HelperError.invalidImage("image source could not be created")
+    }
+    guard let properties = CGImageSourceCopyPropertiesAtIndex(
+        source,
+        0,
+        nil
+    ) as? [CFString: Any] else {
+        throw HelperError.invalidImage("image source properties are malformed")
+    }
+    let width = try imageDimension(
+        properties[kCGImagePropertyPixelWidth],
+        name: "pixel width"
+    )
+    let height = try imageDimension(
+        properties[kCGImagePropertyPixelHeight],
+        name: "pixel height"
+    )
+    try validateImageDimensions(width: width, height: height)
+
+    guard let image = CGImageSourceCreateImageAtIndex(source, 0, nil) else {
         throw HelperError.invalidImage("image could not be decoded")
     }
+    try validateImageDimensions(
+        width: UInt64(image.width),
+        height: UInt64(image.height)
+    )
     return image
 }
 
@@ -261,7 +405,8 @@ private func recognize(imagePath: String, languages: [String]) throws -> OCRPayl
         throw HelperError.recognition("Vision recognition failed: \(error.localizedDescription)")
     }
 
-    var totalCharacters = 0
+    var totalUnicodeScalars = 0
+    var totalUTF8Bytes = 0
     var indexedLines: [IndexedLine] = []
     for (index, observation) in (request.results ?? []).enumerated() {
         guard let candidate = observation.topCandidates(1).first else {
@@ -271,10 +416,19 @@ private func recognize(imagePath: String, languages: [String]) throws -> OCRPayl
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             continue
         }
-        totalCharacters += text.count
-        guard totalCharacters <= maximumRecognizedCharacters else {
-            throw HelperError.recognition("recognized text exceeds 100,000 characters")
+        let (unicodeScalars, scalarOverflow) = totalUnicodeScalars
+            .addingReportingOverflow(text.unicodeScalars.count)
+        let (utf8Bytes, byteOverflow) = totalUTF8Bytes
+            .addingReportingOverflow(text.utf8.count)
+        guard !scalarOverflow, !byteOverflow,
+              unicodeScalars <= maximumRecognizedUnicodeScalars,
+              utf8Bytes <= maximumRecognizedUTF8Bytes else {
+            throw HelperError.recognition(
+                "recognized text exceeds 100,000 Unicode scalars or 400,000 UTF-8 bytes"
+            )
         }
+        totalUnicodeScalars = unicodeScalars
+        totalUTF8Bytes = utf8Bytes
         let confidence = Double(candidate.confidence)
         guard confidence.isFinite, confidence >= 0, confidence <= 1 else {
             throw HelperError.recognition("Vision returned invalid confidence")

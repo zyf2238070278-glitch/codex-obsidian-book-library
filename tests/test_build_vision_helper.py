@@ -91,22 +91,16 @@ def _source(tmp_path: Path) -> Path:
     source = tmp_path / "native" / "main.swift"
     source.parent.mkdir(parents=True)
     source.write_text("// source fixture\n", encoding="utf-8")
+    (source.parent / "TextBudget.swift").write_text(
+        "// text budget fixture\n",
+        encoding="utf-8",
+    )
     return source
 
 
-def test_default_runner_is_non_shell_and_uses_writable_module_caches(
-    monkeypatch: pytest.MonkeyPatch,
+def test_default_runner_is_non_shell_and_uses_only_supplied_environment(
     tmp_path: Path,
 ) -> None:
-    captured: dict[str, object] = {}
-
-    def fake_run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
-        captured["argv"] = argv
-        captured.update(kwargs)
-        return subprocess.CompletedProcess(argv, 0, "", "")
-
-    monkeypatch.setattr(vision_builder.subprocess, "run", fake_run)
-
     environment = {
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "LANG": "en_US.UTF-8",
@@ -115,20 +109,44 @@ def test_default_runner_is_non_shell_and_uses_writable_module_caches(
         "SWIFT_MODULECACHE_PATH": str(tmp_path / "module-cache"),
     }
     result = vision_builder._default_run_command(
-        ["/usr/bin/xcrun", "swiftc", "--version"],
+        ["/usr/bin/env"],
         environment=environment,
         timeout=17,
     )
 
     assert result.returncode == 0
-    assert captured["argv"] == ["/usr/bin/xcrun", "swiftc", "--version"]
-    assert captured["shell"] is False
-    assert captured["check"] is False
-    assert captured["timeout"] == 17
-    assert captured["env"] == environment
-    assert "capture_output" not in captured
-    assert captured["stdout"] is not None
-    assert captured["stderr"] is not None
+    assert result.stderr == ""
+    assert set(result.stdout.splitlines()) == {
+        f"{key}={value}" for key, value in environment.items()
+    }
+
+
+def test_default_runner_terminates_process_group_at_output_limit(
+    tmp_path: Path,
+) -> None:
+    environment = {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "LANG": "en_US.UTF-8",
+        "TMPDIR": str(tmp_path),
+        "CLANG_MODULE_CACHE_PATH": str(tmp_path / "module-cache"),
+        "SWIFT_MODULECACHE_PATH": str(tmp_path / "module-cache"),
+    }
+
+    started = __import__("time").monotonic()
+    result = vision_builder._default_run_command(
+        [
+            "/bin/sh",
+            "-c",
+            "/usr/bin/yes bounded-output | /usr/bin/head -c 70000; /bin/sleep 5",
+        ],
+        environment=environment,
+        timeout=0.5,
+    )
+
+    assert __import__("time").monotonic() - started < 3
+    assert result.returncode != 0
+    assert "truncated" in result.stdout
+    assert len(result.stdout.encode("utf-8")) < 70_000
 
 
 def test_builder_uses_exact_non_shell_arm64_pipeline_and_atomically_installs(
@@ -152,6 +170,7 @@ def test_builder_uses_exact_non_shell_arm64_pipeline_and_atomically_installs(
         "-O",
         "-target",
         "arm64-apple-macos13.0",
+        str((source.parent / "TextBudget.swift").resolve()),
         str(source.resolve()),
         "-o",
         str(temporary_output),
@@ -500,3 +519,30 @@ def test_builder_truncates_untrusted_command_diagnostics(tmp_path: Path) -> None
 
     assert len(str(error.value)) < 10_000
     assert "truncated" in str(error.value)
+
+
+def test_runtime_output_limit_preserves_old_helper_and_cleans_build_directory(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source(tmp_path)
+    output = tmp_path / "bin" / "book-vision-ocr"
+    output.parent.mkdir()
+    output.write_bytes(b"previous helper")
+    output.chmod(0o755)
+    noisy_tool = tmp_path / "noisy-tool"
+    noisy_tool.write_text(
+        "#!/bin/sh\n"
+        "/usr/bin/yes bounded-output | /usr/bin/head -c 70000\n"
+        "/bin/sleep 5\n",
+        encoding="utf-8",
+    )
+    noisy_tool.chmod(0o755)
+    monkeypatch.setattr(vision_builder, "XCRUN", str(noisy_tool))
+    monkeypatch.setattr(vision_builder, "COMPILE_TIMEOUT_SECONDS", 0.5)
+
+    with pytest.raises(VisionHelperBuildError, match="truncated"):
+        build_vision_helper(source=source, output=output)
+
+    assert output.read_bytes() == b"previous helper"
+    assert list(output.parent.glob(".book-vision-ocr-build-*")) == []

@@ -15,6 +15,7 @@ from scripts.build_vision_helper import build_vision_helper
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 SOURCE = PROJECT_ROOT / "native" / "book_vision_ocr" / "main.swift"
+TEXT_BUDGET_SOURCE = SOURCE.with_name("TextBudget.swift")
 MAXIMUM_IMAGE_FILE_BYTES = 64 * 1024 * 1024
 MAXIMUM_IMAGE_DIMENSION = 12_000
 
@@ -100,6 +101,7 @@ def _write_synthetic_image(tmp_path: Path) -> Path:
 
 def test_swift_source_uses_required_vision_and_imageio_contract() -> None:
     source = SOURCE.read_text(encoding="utf-8")
+    text_budget_source = TEXT_BUDGET_SOURCE.read_text(encoding="utf-8")
 
     for required in (
         "O_NOFOLLOW",
@@ -113,14 +115,22 @@ def test_swift_source_uses_required_vision_and_imageio_contract() -> None:
         "usesLanguageCorrection = true",
         "supportedRecognitionLanguages",
         "JSONEncoder",
-        "maximumRecognizedUnicodeScalars = 100_000",
-        "maximumRecognizedUTF8Bytes = 400_000",
         "maximumImageFileBytes = 64 * 1024 * 1024",
         "maximumImageDimension = 12_000",
         "maximumImagePixels = 40_000_000",
     ):
         assert required in source
+    assert "maximumUnicodeScalars: Int = 100_000" in text_budget_source
+    assert "maximumUTF8Bytes: Int = 400_000" in text_budget_source
     assert "CGImageSourceCreateWithURL" not in source
+
+
+def test_macos_vision_marker_describes_live_source_build() -> None:
+    configuration = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
+    assert (
+        "macos_vision: requires macOS, Xcode command-line tools, and Apple Vision; "
+        "builds helper from source during the test session"
+    ) in configuration
 
 
 @pytest.mark.macos_vision

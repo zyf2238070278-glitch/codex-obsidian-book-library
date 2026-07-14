@@ -7,8 +7,6 @@ import Vision
 
 private let schemaVersion = 1
 private let helperVersion = "0.1.0"
-private let maximumRecognizedUnicodeScalars = 100_000
-private let maximumRecognizedUTF8Bytes = 400_000
 private let maximumImageFileBytes = 64 * 1024 * 1024
 private let maximumImageDimension = 12_000
 private let maximumImagePixels = 40_000_000
@@ -405,8 +403,7 @@ private func recognize(imagePath: String, languages: [String]) throws -> OCRPayl
         throw HelperError.recognition("Vision recognition failed: \(error.localizedDescription)")
     }
 
-    var totalUnicodeScalars = 0
-    var totalUTF8Bytes = 0
+    var textBudget = RecognizedTextBudget()
     var indexedLines: [IndexedLine] = []
     for (index, observation) in (request.results ?? []).enumerated() {
         guard let candidate = observation.topCandidates(1).first else {
@@ -416,19 +413,11 @@ private func recognize(imagePath: String, languages: [String]) throws -> OCRPayl
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             continue
         }
-        let (unicodeScalars, scalarOverflow) = totalUnicodeScalars
-            .addingReportingOverflow(text.unicodeScalars.count)
-        let (utf8Bytes, byteOverflow) = totalUTF8Bytes
-            .addingReportingOverflow(text.utf8.count)
-        guard !scalarOverflow, !byteOverflow,
-              unicodeScalars <= maximumRecognizedUnicodeScalars,
-              utf8Bytes <= maximumRecognizedUTF8Bytes else {
-            throw HelperError.recognition(
-                "recognized text exceeds 100,000 Unicode scalars or 400,000 UTF-8 bytes"
-            )
+        do {
+            try textBudget.add(text)
+        } catch let error as RecognizedTextBudgetError {
+            throw HelperError.recognition(error.description)
         }
-        totalUnicodeScalars = unicodeScalars
-        totalUTF8Bytes = utf8Bytes
         let confidence = Double(candidate.confidence)
         guard confidence.isFinite, confidence >= 0, confidence <= 1 else {
             throw HelperError.recognition("Vision returned invalid confidence")

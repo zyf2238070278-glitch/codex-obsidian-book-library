@@ -4,13 +4,16 @@ import argparse
 import hashlib
 import json
 import os
+import selectors
+import signal
 import stat
 import subprocess
 import sys
 import tempfile
+import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import BinaryIO, Mapping, Protocol
+from typing import Mapping, Protocol
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -29,6 +32,8 @@ HELPER_TIMEOUT_SECONDS = 30.0
 MAXIMUM_COMMAND_OUTPUT_BYTES = 64 * 1024
 MAXIMUM_DIAGNOSTIC_BYTES = 4 * 1024
 MAXIMUM_HELPER_BYTES = 256 * 1024 * 1024
+OUTPUT_LIMIT_EXIT_CODE = 125
+PIPE_READ_CHUNK_BYTES = 16 * 1024
 
 
 class VisionHelperBuildError(ValueError):
@@ -55,12 +60,8 @@ class _ArtifactFingerprint:
     sha256: str
 
 
-def _read_bounded(stream: BinaryIO) -> str:
-    stream.seek(0)
-    value = stream.read(MAXIMUM_COMMAND_OUTPUT_BYTES + 1)
-    truncated = len(value) > MAXIMUM_COMMAND_OUTPUT_BYTES
-    value = value[:MAXIMUM_COMMAND_OUTPUT_BYTES]
-    rendered = value.decode("utf-8", errors="replace")
+def _render_output(value: bytearray, *, truncated: bool) -> str:
+    rendered = bytes(value).decode("utf-8", errors="replace")
     if truncated:
         rendered += "\n...[truncated]"
     return rendered
@@ -82,22 +83,97 @@ def _default_run_command(
     environment: Mapping[str, str],
     timeout: float,
 ) -> subprocess.CompletedProcess[str]:
-    with tempfile.TemporaryFile() as stdout, tempfile.TemporaryFile() as stderr:
-        completed = subprocess.run(
-            argv,
-            check=False,
-            stdout=stdout,
-            stderr=stderr,
-            shell=False,
-            env=dict(environment),
-            timeout=timeout,
-        )
+    process = subprocess.Popen(
+        argv,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        shell=False,
+        env=dict(environment),
+        start_new_session=True,
+    )
+    assert process.stdout is not None
+    assert process.stderr is not None
+    selector = selectors.DefaultSelector()
+    streams = {"stdout": process.stdout, "stderr": process.stderr}
+    buffers = {"stdout": bytearray(), "stderr": bytearray()}
+    truncated_stream: str | None = None
+    deadline = time.monotonic() + timeout
+
+    for name, stream in streams.items():
+        os.set_blocking(stream.fileno(), False)
+        selector.register(stream, selectors.EVENT_READ, name)
+
+    def terminate_process_group() -> None:
+        try:
+            os.killpg(process.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        try:
+            process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=5)
+
+    try:
+        while selector.get_map():
+            remaining = deadline - time.monotonic()
+            if remaining <= 0:
+                terminate_process_group()
+                raise subprocess.TimeoutExpired(argv, timeout)
+            events = selector.select(timeout=min(remaining, 0.1))
+            for key, _ in events:
+                try:
+                    chunk = os.read(key.fd, PIPE_READ_CHUNK_BYTES)
+                except BlockingIOError:
+                    continue
+                if not chunk:
+                    selector.unregister(key.fileobj)
+                    continue
+                captured = sum(len(buffer) for buffer in buffers.values())
+                available = MAXIMUM_COMMAND_OUTPUT_BYTES - captured
+                if len(chunk) > available:
+                    if available > 0:
+                        buffers[key.data].extend(chunk[:available])
+                    truncated_stream = key.data
+                    terminate_process_group()
+                    break
+                buffers[key.data].extend(chunk)
+            if truncated_stream is not None:
+                break
+
+        if truncated_stream is not None:
+            return subprocess.CompletedProcess(
+                argv,
+                OUTPUT_LIMIT_EXIT_CODE,
+                _render_output(
+                    buffers["stdout"],
+                    truncated=truncated_stream == "stdout",
+                ),
+                _render_output(
+                    buffers["stderr"],
+                    truncated=truncated_stream == "stderr",
+                ),
+            )
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            terminate_process_group()
+            raise subprocess.TimeoutExpired(argv, timeout)
+        return_code = process.wait(timeout=remaining)
         return subprocess.CompletedProcess(
             argv,
-            completed.returncode,
-            _read_bounded(stdout),
-            _read_bounded(stderr),
+            return_code,
+            _render_output(buffers["stdout"], truncated=False),
+            _render_output(buffers["stderr"], truncated=False),
         )
+    except subprocess.TimeoutExpired:
+        terminate_process_group()
+        raise
+    finally:
+        selector.close()
+        for stream in streams.values():
+            stream.close()
 
 
 def _validate_runner_result(
@@ -353,6 +429,7 @@ def build_vision_helper(
     if not callable(run_command):
         raise TypeError("run_command must be callable")
     source_path = _validate_source(source)
+    text_budget_source = _validate_source(source_path.with_name("TextBudget.swift"))
     output_path = _absolute_output(output)
     _validate_existing_output(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -384,6 +461,7 @@ def build_vision_helper(
                 "-O",
                 "-target",
                 TARGET,
+                str(text_budget_source),
                 str(source_path),
                 "-o",
                 str(temporary_output),

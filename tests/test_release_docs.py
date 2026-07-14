@@ -47,6 +47,7 @@ def test_release_document_and_license_set_is_complete() -> None:
 
 def test_readme_gives_the_complete_shortest_macos_path() -> None:
     readme = _read("README.md")
+    manual = readme[readme.index("## 手动下载 ZIP") :]
 
     steps = (
         "解压到一个稳定位置",
@@ -57,7 +58,7 @@ def test_readme_gives_the_complete_shortest_macos_path() -> None:
         "导入这本书",
     )
     _assert_contains(
-        readme,
+        manual,
         (
             *steps,
             "Apple Silicon",
@@ -82,8 +83,31 @@ def test_readme_gives_the_complete_shortest_macos_path() -> None:
             "重新运行安装器",
         ),
     )
-    assert [readme.index(step) for step in steps] == sorted(
-        readme.index(step) for step in steps
+    assert [manual.index(step) for step in steps] == sorted(
+        manual.index(step) for step in steps
+    )
+
+
+def test_readme_gives_copyable_git_clone_install_command() -> None:
+    readme = _read("README.md")
+    install = _read("docs/安装说明.md")
+    command = (
+        "git clone https://github.com/zyf2238070278-glitch/"
+        "codex-obsidian-book-library.git && "
+        "cd codex-obsidian-book-library && ./install-from-github.command"
+    )
+
+    assert command in readme
+    assert command in install
+    _assert_contains(
+        readme + "\n" + install,
+        (
+            "~/CodexBookLibrary",
+            "自动下载",
+            "SHA-256",
+            "完全退出并重启 Codex",
+            "打开并信任",
+        ),
     )
 
 

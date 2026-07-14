@@ -10,6 +10,7 @@ from pathlib import Path
 import pytest
 
 from book_agent.models import Passage
+from book_agent.ocr import OcrPageOutcome
 from book_agent.storage import Database
 
 
@@ -125,6 +126,113 @@ def test_initialize_migrates_without_changing_existing_book_or_passages(
         }
     assert {"ocr_jobs", "ocr_pages"} <= tables
     assert "ocr_jobs_queue_idx" in indexes
+
+
+def test_initialize_migrates_existing_ocr_pages_without_losing_text(
+    tmp_path: Path,
+) -> None:
+    database = Database(tmp_path / "state" / "books.sqlite3")
+    database.initialize()
+    _claim(database, total_pages=1)
+    with database._connection() as connection:
+        connection.execute("DROP TABLE ocr_pages")
+        connection.execute(
+            """
+            CREATE TABLE ocr_pages (
+                book_id TEXT NOT NULL REFERENCES ocr_jobs(book_id) ON DELETE CASCADE,
+                page_number INTEGER NOT NULL CHECK(page_number > 0),
+                page_label TEXT,
+                text TEXT NOT NULL,
+                text_sha256 TEXT NOT NULL,
+                mean_confidence REAL,
+                duration_ms INTEGER NOT NULL CHECK(duration_ms >= 0),
+                completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                PRIMARY KEY(book_id, page_number)
+            )
+            """
+        )
+        connection.execute(
+            """
+            INSERT INTO ocr_pages (
+                book_id, page_number, page_label, text, text_sha256,
+                mean_confidence, duration_ms
+            ) VALUES (?, ?, ?, ?, ?, ?, ?)
+            """,
+            (BOOK_A, 1, "1", "原有 OCR 文本", "ocr-hash", 0.91, 12),
+        )
+
+    database.initialize()
+
+    row = database.list_ocr_pages(BOOK_A)[0]
+    assert row["text"] == "原有 OCR 文本"
+    assert row["outcome"] == "recognized"
+    assert row["engine"] == "apple_vision"
+    assert row["strategy"] == "legacy"
+    assert row["detail"] is None
+
+
+def test_page_outcomes_are_checkpointed_counted_and_skips_are_bounded(
+    db: Database,
+) -> None:
+    _claim(db, total_pages=3)
+
+    recognized = db.save_ocr_page_result(
+        BOOK_A,
+        "worker-a",
+        1,
+        "i",
+        OcrPageOutcome("recognized", "apple_vision", "standard"),
+        "可检索文字",
+        "recognized-hash",
+        0.95,
+        12,
+        now=NOW,
+    )
+    blank = db.save_ocr_page_result(
+        BOOK_A,
+        "worker-a",
+        2,
+        "ii",
+        OcrPageOutcome("blank", None, "blank_page"),
+        None,
+        None,
+        None,
+        9,
+        now=NOW,
+    )
+    skipped = db.save_ocr_page_result(
+        BOOK_A,
+        "worker-a",
+        3,
+        "iii",
+        OcrPageOutcome(
+            "skipped",
+            None,
+            "all_local_engines_failed",
+            "unrenderable after tiling",
+        ),
+        None,
+        None,
+        None,
+        22,
+        now=NOW,
+    )
+
+    assert recognized["text"] == "可检索文字"
+    assert blank["text"] == skipped["text"] == ""
+    assert db.ocr_page_outcome_counts(BOOK_A) == {
+        "recognized": 1,
+        "blank": 1,
+        "skipped": 1,
+    }
+    assert db.list_skipped_ocr_pages(BOOK_A) == [
+        {
+            "page_number": 3,
+            "page_label": "iii",
+            "strategy": "all_local_engines_failed",
+            "detail": "unrenderable after tiling",
+        }
+    ]
 
 
 def test_queue_requires_existing_needs_ocr_pdf_and_serializes_languages(db: Database) -> None:

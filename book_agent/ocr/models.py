@@ -9,6 +9,8 @@ OCR_SCHEMA_VERSION = 1
 _READING_ORDER_VERTICAL_TOLERANCE = 0.0125
 _OcrStatus = Literal["queued", "running", "paused", "failed", "completed"]
 _OCR_STATUSES = ("queued", "running", "paused", "failed", "completed")
+_PageOutcomeStatus = Literal["recognized", "blank", "skipped"]
+_PAGE_OUTCOMES = ("recognized", "blank", "skipped")
 
 
 def _is_int(value: object) -> bool:
@@ -129,6 +131,32 @@ class VisionPageResult:
         if not self.lines:
             return 0.0
         return sum(line.confidence for line in self.lines) / len(self.lines)
+
+
+@dataclass(frozen=True)
+class OcrPageOutcome:
+    """The terminal, engine-neutral result for one physical PDF page."""
+
+    status: _PageOutcomeStatus
+    engine: str | None
+    strategy: str
+    detail: str | None = None
+
+    def __post_init__(self) -> None:
+        if type(self.status) is not str or self.status not in _PAGE_OUTCOMES:
+            raise ValueError("unsupported OCR page outcome")
+        if self.status == "recognized" and (
+            not isinstance(self.engine, str) or not self.engine.strip()
+        ):
+            raise ValueError("recognized pages require an engine")
+        if self.status != "recognized" and self.engine is not None:
+            raise ValueError("non-recognized pages must not name an engine")
+        for name in ("strategy", "detail"):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise ValueError(f"{name} must be a nonblank string or None")
 
 
 @dataclass(frozen=True)

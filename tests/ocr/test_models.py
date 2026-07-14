@@ -8,6 +8,7 @@ import pytest
 from book_agent.ocr import (
     BoundingBox,
     OcrJobSummary,
+    OcrPageOutcome,
     VisionLine,
     VisionPageResult,
 )
@@ -68,6 +69,25 @@ def _summary(**overrides: object) -> OcrJobSummary:
     }
     values.update(overrides)
     return OcrJobSummary(**values)  # type: ignore[arg-type]
+
+
+def test_ocr_page_outcome_accepts_recognized_blank_and_skipped_pages() -> None:
+    assert OcrPageOutcome(
+        status="recognized",
+        engine="apple_vision",
+        strategy="standard",
+    ).status == "recognized"
+    assert OcrPageOutcome(
+        status="blank",
+        engine=None,
+        strategy="blank_page",
+    ).status == "blank"
+    assert OcrPageOutcome(
+        status="skipped",
+        engine=None,
+        strategy="all_local_engines_failed",
+        detail="all local OCR engines failed",
+    ).status == "skipped"
 
 
 def test_vision_page_result_orders_top_to_bottom_then_left_to_right() -> None:

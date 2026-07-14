@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any
 
 from book_agent.models import Passage, SearchHit
+from book_agent.ocr.models import OcrPageOutcome
 from book_agent.vault import _managed_directory_beneath
 
 
@@ -80,6 +81,10 @@ CREATE TABLE IF NOT EXISTS ocr_pages (
     page_label TEXT,
     text TEXT NOT NULL,
     text_sha256 TEXT NOT NULL,
+    outcome TEXT NOT NULL DEFAULT 'recognized',
+    engine TEXT,
+    strategy TEXT NOT NULL DEFAULT 'legacy',
+    detail TEXT,
     mean_confidence REAL,
     duration_ms INTEGER NOT NULL CHECK(duration_ms >= 0),
     completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -287,6 +292,7 @@ class Database:
         try:
             with self._connection() as connection:
                 connection.executescript(_SCHEMA)
+                self._migrate_ocr_page_schema(connection)
         except sqlite3.OperationalError as exc:
             message = str(exc).lower()
             if "trigram" in message or "fts5" in message:
@@ -294,6 +300,31 @@ class Database:
                     "SQLite FTS5 with the trigram tokenizer is required to initialize the book index"
                 ) from exc
             raise
+
+    @staticmethod
+    def _migrate_ocr_page_schema(connection: sqlite3.Connection) -> None:
+        """Add OCR result metadata to databases created by earlier releases."""
+
+        columns = {
+            row[1]
+            for row in connection.execute("PRAGMA table_info(ocr_pages)")
+        }
+        migrations = (
+            ("outcome", "ALTER TABLE ocr_pages ADD COLUMN outcome TEXT NOT NULL DEFAULT 'recognized'"),
+            ("engine", "ALTER TABLE ocr_pages ADD COLUMN engine TEXT"),
+            ("strategy", "ALTER TABLE ocr_pages ADD COLUMN strategy TEXT NOT NULL DEFAULT 'legacy'"),
+            ("detail", "ALTER TABLE ocr_pages ADD COLUMN detail TEXT"),
+        )
+        for column, statement in migrations:
+            if column not in columns:
+                connection.execute(statement)
+        connection.execute(
+            """
+            UPDATE ocr_pages
+            SET engine = 'apple_vision'
+            WHERE engine IS NULL AND outcome = 'recognized' AND strategy = 'legacy'
+            """
+        )
 
     def create_book(
         self,
@@ -586,14 +617,15 @@ class Database:
         assert row is not None
         return dict(row)
 
-    def save_ocr_page(
+    def save_ocr_page_result(
         self,
         book_id: str,
         worker_id: str,
         page_number: int,
         page_label: str | None,
-        text: str,
-        text_sha256: str,
+        outcome: OcrPageOutcome,
+        text: str | None,
+        text_sha256: str | None,
         mean_confidence: float | None,
         duration_ms: int,
         *,
@@ -603,9 +635,18 @@ class Database:
         validated_worker_id = _validate_nonblank_string(worker_id, "worker_id")
         validated_page_number = _validate_positive_int(page_number, "page_number")
         validated_page_label = _validate_optional_string(page_label, "page_label")
-        if type(text) is not str:
-            raise ValueError("text must be a native string")
-        validated_hash = _validate_nonblank_string(text_sha256, "text_sha256")
+        if type(outcome) is not OcrPageOutcome:
+            raise ValueError("outcome must be an OcrPageOutcome")
+        if outcome.status == "recognized":
+            if type(text) is not str:
+                raise ValueError("recognized pages require native string text")
+            validated_text = text
+            validated_hash = _validate_nonblank_string(text_sha256, "text_sha256")
+        else:
+            if text is not None or text_sha256 is not None:
+                raise ValueError("blank and skipped pages must not provide text or hashes")
+            validated_text = ""
+            validated_hash = ""
         if mean_confidence is not None and (
             type(mean_confidence) not in (int, float)
             or not 0 <= mean_confidence <= 1
@@ -641,12 +682,17 @@ class Database:
                 """
                 INSERT INTO ocr_pages (
                     book_id, page_number, page_label, text, text_sha256,
-                    mean_confidence, duration_ms, completed_at
-                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+                    outcome, engine, strategy, detail, mean_confidence,
+                    duration_ms, completed_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                 ON CONFLICT(book_id, page_number) DO UPDATE SET
                     page_label = excluded.page_label,
                     text = excluded.text,
                     text_sha256 = excluded.text_sha256,
+                    outcome = excluded.outcome,
+                    engine = excluded.engine,
+                    strategy = excluded.strategy,
+                    detail = excluded.detail,
                     mean_confidence = excluded.mean_confidence,
                     duration_ms = excluded.duration_ms,
                     completed_at = excluded.completed_at
@@ -655,8 +701,12 @@ class Database:
                     validated_book_id,
                     validated_page_number,
                     validated_page_label,
-                    text,
+                    validated_text,
                     validated_hash,
+                    outcome.status,
+                    outcome.engine,
+                    outcome.strategy,
+                    outcome.detail,
                     mean_confidence,
                     validated_duration,
                     now_text,
@@ -687,6 +737,69 @@ class Database:
             ).fetchone()
         assert row is not None
         return dict(row)
+
+    def save_ocr_page(
+        self,
+        book_id: str,
+        worker_id: str,
+        page_number: int,
+        page_label: str | None,
+        text: str,
+        text_sha256: str,
+        mean_confidence: float | None,
+        duration_ms: int,
+        *,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        """Persist a legacy Apple Vision page checkpoint.
+
+        New callers must use :meth:`save_ocr_page_result` so every non-standard
+        page records its terminal outcome explicitly.
+        """
+
+        return self.save_ocr_page_result(
+            book_id,
+            worker_id,
+            page_number,
+            page_label,
+            OcrPageOutcome("recognized", "apple_vision", "legacy"),
+            text,
+            text_sha256,
+            mean_confidence,
+            duration_ms,
+            now=now,
+        )
+
+    def ocr_page_outcome_counts(self, book_id: str) -> dict[str, int]:
+        validated_book_id = _validate_book_id(book_id)
+        counts = {outcome: 0 for outcome in ("recognized", "blank", "skipped")}
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT outcome, COUNT(*) AS count
+                FROM ocr_pages
+                WHERE book_id = ?
+                GROUP BY outcome
+                """,
+                (validated_book_id,),
+            ).fetchall()
+        for row in rows:
+            counts[row["outcome"]] = row["count"]
+        return counts
+
+    def list_skipped_ocr_pages(self, book_id: str) -> list[dict[str, Any]]:
+        validated_book_id = _validate_book_id(book_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                """
+                SELECT page_number, page_label, strategy, detail
+                FROM ocr_pages
+                WHERE book_id = ? AND outcome = 'skipped'
+                ORDER BY page_number
+                """,
+                (validated_book_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
 
     def list_ocr_pages(self, book_id: str) -> list[dict[str, Any]]:
         validated_book_id = _validate_book_id(book_id)

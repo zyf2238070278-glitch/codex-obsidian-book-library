@@ -1,6 +1,7 @@
 from book_agent.ocr.models import (
     BoundingBox,
     OcrJobSummary,
+    OcrPageOutcome,
     VisionLine,
     VisionPageResult,
 )
@@ -9,6 +10,7 @@ from book_agent.ocr.models import (
 __all__ = [
     "BoundingBox",
     "OcrJobSummary",
+    "OcrPageOutcome",
     "VisionLine",
     "VisionPageResult",
 ]

@@ -12,6 +12,10 @@ TOOL_ALLOWLIST = [
     "search_books",
     "get_passages",
     "save_reading_note",
+    "start_ocr",
+    "start_pending_ocr",
+    "ocr_status",
+    "pause_ocr",
 ]
 
 

@@ -760,8 +760,8 @@ def _validate_vision_capabilities(stdout: str, metadata: Mapping[str, str]) -> N
         raise ReleaseBuildError("vision helper capabilities schema is invalid")
     if (
         type(payload["schema_version"]) is not int
-        or payload["schema_version"] != 1
-        or str(metadata["vision_schema_version"]) != "1"
+        or payload["schema_version"] != 2
+        or str(metadata["vision_schema_version"]) != "2"
     ):
         raise ReleaseBuildError("vision helper schema version is unsupported")
     languages = payload["languages"]

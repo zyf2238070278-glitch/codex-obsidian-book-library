@@ -145,6 +145,14 @@ def test_swift_source_uses_required_vision_and_imageio_contract() -> None:
     assert "CGImageSourceCreateWithURL" not in source
 
 
+def test_swift_source_discards_an_invalid_box_without_aborting_the_page() -> None:
+    source = SOURCE.read_text(encoding="utf-8")
+
+    assert "normalizedBoxOrNil" in source
+    assert "discardedObservations += 1" in source
+    assert "box: try normalizedBox(observation.boundingBox)" not in source
+
+
 def test_macos_vision_marker_describes_live_source_build() -> None:
     configuration = (PROJECT_ROOT / "pyproject.toml").read_text(encoding="utf-8")
     assert (
@@ -163,14 +171,14 @@ def test_native_helper_reports_version_and_required_capabilities(
     assert version.returncode == 0
     assert version.stderr == ""
     version_payload = _strict_json(version.stdout)
-    assert version_payload == {"schema_version": 1, "version": "0.1.0"}
+    assert version_payload == {"schema_version": 2, "version": "0.2.0"}
     assert capabilities.returncode == 0
     assert capabilities.stderr == ""
     payload = _strict_json(capabilities.stdout)
     assert type(payload) is dict
     assert set(payload) == {"schema_version", "languages"}
     assert type(payload["schema_version"]) is int
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert type(payload["languages"]) is list
     assert all(type(language) is str for language in payload["languages"])
     assert {"zh-Hans", "en-US"}.issubset(payload["languages"])
@@ -195,9 +203,11 @@ def test_native_helper_recognizes_synthetic_image_with_normalized_native_json(
     assert completed.stderr == ""
     payload = _strict_json(completed.stdout)
     assert type(payload) is dict
-    assert set(payload) == {"schema_version", "lines"}
+    assert set(payload) == {"schema_version", "lines", "discarded_observations"}
     assert type(payload["schema_version"]) is int
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
+    assert type(payload["discarded_observations"]) is int
+    assert payload["discarded_observations"] >= 0
     assert type(payload["lines"]) is list
     recognized_text = " ".join(line["text"] for line in payload["lines"])
     assert "VISION" in recognized_text.upper()

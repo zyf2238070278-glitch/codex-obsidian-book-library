@@ -5,8 +5,8 @@ import Foundation
 import ImageIO
 import Vision
 
-private let schemaVersion = 1
-private let helperVersion = "0.1.0"
+private let schemaVersion = 2
+private let helperVersion = "0.2.0"
 private let maximumImageFileBytes = 64 * 1024 * 1024
 private let maximumImageDimension = 12_000
 private let maximumImagePixels = 40_000_000
@@ -62,10 +62,12 @@ private struct LinePayload: Encodable {
 private struct OCRPayload: Encodable {
     let schemaVersion: Int
     let lines: [LinePayload]
+    let discardedObservations: Int
 
     enum CodingKeys: String, CodingKey {
         case schemaVersion = "schema_version"
         case lines
+        case discardedObservations = "discarded_observations"
     }
 }
 
@@ -353,7 +355,7 @@ private func supportedLanguages() throws -> [String] {
     }
 }
 
-private func normalizedBox(_ rectangle: CGRect) throws -> BoxPayload {
+private func normalizedBoxOrNil(_ rectangle: CGRect) -> BoxPayload? {
     var x = Double(rectangle.origin.x)
     var y = Double(rectangle.origin.y)
     var width = Double(rectangle.size.width)
@@ -363,16 +365,14 @@ private func normalizedBox(_ rectangle: CGRect) throws -> BoxPayload {
           x >= -0.000_001, y >= -0.000_001,
           x <= 1.000_001, y <= 1.000_001,
           x + width <= 1.000_001, y + height <= 1.000_001 else {
-        throw HelperError.recognition(
-            "Vision returned an invalid normalized bounding box"
-        )
+        return nil
     }
     x = min(max(x, 0), 1)
     y = min(max(y, 0), 1)
     width = min(width, 1 - x)
     height = min(height, 1 - y)
     guard width > 0, height > 0 else {
-        throw HelperError.recognition("Vision returned an empty normalized bounding box")
+        return nil
     }
     return BoxPayload(x: x, y: y, width: width, height: height)
 }
@@ -405,6 +405,7 @@ private func recognize(imagePath: String, languages: [String]) throws -> OCRPayl
 
     var textBudget = RecognizedTextBudget()
     var indexedLines: [IndexedLine] = []
+    var discardedObservations = 0
     for (index, observation) in (request.results ?? []).enumerated() {
         guard let candidate = observation.topCandidates(1).first else {
             continue
@@ -413,19 +414,21 @@ private func recognize(imagePath: String, languages: [String]) throws -> OCRPayl
         guard !text.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
             continue
         }
+        let confidence = Double(candidate.confidence)
+        guard confidence.isFinite, confidence >= 0, confidence <= 1,
+              let box = normalizedBoxOrNil(observation.boundingBox) else {
+            discardedObservations += 1
+            continue
+        }
         do {
             try textBudget.add(text)
         } catch let error as RecognizedTextBudgetError {
             throw HelperError.recognition(error.description)
         }
-        let confidence = Double(candidate.confidence)
-        guard confidence.isFinite, confidence >= 0, confidence <= 1 else {
-            throw HelperError.recognition("Vision returned invalid confidence")
-        }
         let line = LinePayload(
             text: text,
             confidence: confidence,
-            box: try normalizedBox(observation.boundingBox)
+            box: box
         )
         indexedLines.append(IndexedLine(index: index, payload: line))
     }
@@ -443,7 +446,8 @@ private func recognize(imagePath: String, languages: [String]) throws -> OCRPayl
     }
     return OCRPayload(
         schemaVersion: schemaVersion,
-        lines: indexedLines.map(\.payload)
+        lines: indexedLines.map(\.payload),
+        discardedObservations: discardedObservations
     )
 }
 

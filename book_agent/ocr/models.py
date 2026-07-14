@@ -6,6 +6,7 @@ from typing import Literal
 
 
 OCR_SCHEMA_VERSION = 1
+VISION_RESPONSE_SCHEMA_VERSION = 2
 _READING_ORDER_VERTICAL_TOLERANCE = 0.0125
 _OcrStatus = Literal["queued", "running", "paused", "failed", "completed"]
 _OCR_STATUSES = ("queued", "running", "paused", "failed", "completed")
@@ -100,19 +101,25 @@ def _group_lines(
 class VisionPageResult:
     schema_version: int
     lines: tuple[VisionLine, ...]
+    discarded_observations: int = 0
 
     def __post_init__(self) -> None:
         if (
             not _is_int(self.schema_version)
-            or self.schema_version != OCR_SCHEMA_VERSION
+            or self.schema_version != VISION_RESPONSE_SCHEMA_VERSION
         ):
             raise ValueError(
-                f"schema_version must be exactly {OCR_SCHEMA_VERSION}"
+                f"schema_version must be exactly {VISION_RESPONSE_SCHEMA_VERSION}"
             )
         if type(self.lines) is not tuple or not all(
             type(line) is VisionLine for line in self.lines
         ):
             raise ValueError("lines must be a tuple of VisionLine values")
+        if (
+            not _is_int(self.discarded_observations)
+            or self.discarded_observations < 0
+        ):
+            raise ValueError("discarded_observations must be zero or greater")
 
     def ordered_text(self) -> str:
         rows = _group_lines(

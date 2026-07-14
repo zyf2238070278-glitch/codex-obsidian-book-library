@@ -11,6 +11,7 @@ from book_agent.ocr import (
     OcrPageOutcome,
     VisionLine,
     VisionPageResult,
+    VISION_RESPONSE_SCHEMA_VERSION,
 )
 
 
@@ -92,7 +93,7 @@ def test_ocr_page_outcome_accepts_recognized_blank_and_skipped_pages() -> None:
 
 def test_vision_page_result_orders_top_to_bottom_then_left_to_right() -> None:
     result = VisionPageResult(
-        schema_version=1,
+        schema_version=VISION_RESPONSE_SCHEMA_VERSION,
         lines=(
             _line("右", 0.9, x=0.60, y=0.70),
             _line("下一行", 0.8, x=0.10, y=0.50),
@@ -106,7 +107,7 @@ def test_vision_page_result_orders_top_to_bottom_then_left_to_right() -> None:
 
 def test_vision_page_result_groups_lines_within_vertical_tolerance() -> None:
     result = VisionPageResult(
-        schema_version=1,
+        schema_version=VISION_RESPONSE_SCHEMA_VERSION,
         lines=(
             _line("右", x=0.6, y=0.6900),
             _line("左", x=0.1, y=0.7025),
@@ -118,7 +119,7 @@ def test_vision_page_result_groups_lines_within_vertical_tolerance() -> None:
 
 
 def test_empty_vision_page_has_empty_text_and_zero_mean_confidence() -> None:
-    result = VisionPageResult(schema_version=1, lines=())
+    result = VisionPageResult(schema_version=VISION_RESPONSE_SCHEMA_VERSION, lines=())
 
     assert result.ordered_text() == ""
     assert result.mean_confidence == 0.0
@@ -222,9 +223,9 @@ def test_bounding_box_accepts_exact_normalized_image_bounds() -> None:
 
 
 @pytest.mark.parametrize(
-    "schema_version", [0, 2, -1, True, False, 1.0, "1", None]
+    "schema_version", [0, 1, -1, True, False, 2.0, "2", None]
 )
-def test_vision_page_result_requires_schema_version_one(
+def test_vision_page_result_requires_current_schema_version(
     schema_version: object,
 ) -> None:
     with pytest.raises(ValueError, match="schema_version"):
@@ -239,14 +240,14 @@ def test_vision_page_result_rejects_invalid_line_collections(
     lines: object,
 ) -> None:
     with pytest.raises(ValueError, match="lines"):
-        VisionPageResult(schema_version=1, lines=lines)  # type: ignore[arg-type]
+        VisionPageResult(schema_version=VISION_RESPONSE_SCHEMA_VERSION, lines=lines)  # type: ignore[arg-type]
 
 
 def test_vision_page_result_rejects_tuple_subclass_before_asdict() -> None:
     lines = _ReconstructionUnsafeLineTuple((_line(),), object())
 
     with pytest.raises(ValueError, match="lines"):
-        result = VisionPageResult(schema_version=1, lines=lines)
+        result = VisionPageResult(schema_version=VISION_RESPONSE_SCHEMA_VERSION, lines=lines)
         json.dumps(asdict(result), ensure_ascii=False, allow_nan=False)
 
 
@@ -259,7 +260,10 @@ def test_vision_page_result_rejects_extended_line_before_json() -> None:
     )
 
     with pytest.raises(ValueError, match="lines"):
-        result = VisionPageResult(schema_version=1, lines=(line,))
+        result = VisionPageResult(
+            schema_version=VISION_RESPONSE_SCHEMA_VERSION,
+            lines=(line,),
+        )
         json.dumps(asdict(result), ensure_ascii=False, allow_nan=False)
 
 
@@ -340,7 +344,7 @@ def test_ocr_job_summary_rejects_string_like_status() -> None:
 
 def test_ocr_models_are_immutable_and_json_safe() -> None:
     line = _line()
-    result = VisionPageResult(schema_version=1, lines=(line,))
+    result = VisionPageResult(schema_version=VISION_RESPONSE_SCHEMA_VERSION, lines=(line,))
     summary = _summary()
 
     json.dumps(asdict(result), ensure_ascii=False, allow_nan=False)

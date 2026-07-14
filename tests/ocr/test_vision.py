@@ -51,10 +51,36 @@ def _helper(tmp_path: Path) -> Path:
 
 def _payload(lines: list[dict[str, object]] | None = None) -> bytes:
     return json.dumps(
-        {"schema_version": 1, "lines": lines or []},
+        {
+            "schema_version": 2,
+            "lines": lines or [],
+            "discarded_observations": 0,
+        },
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
+
+
+def test_parser_accepts_valid_lines_when_one_native_box_is_discarded() -> None:
+    result = vision_module._parse_helper_output(
+        json.dumps(
+            {
+                "schema_version": 2,
+                "discarded_observations": 1,
+                "lines": [
+                    {
+                        "text": "有效文字",
+                        "confidence": 0.9,
+                        "box": {"x": 0.1, "y": 0.5, "width": 0.2, "height": 0.1},
+                    }
+                ],
+            },
+            ensure_ascii=False,
+        ).encode("utf-8")
+    )
+
+    assert result.ordered_text() == "有效文字"
+    assert result.discarded_observations == 1
 
 
 def _read_process_ids(path: Path) -> tuple[int, int]:

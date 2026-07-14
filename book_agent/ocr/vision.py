@@ -18,7 +18,7 @@ import fitz
 
 from book_agent.ocr.models import (
     BoundingBox,
-    OCR_SCHEMA_VERSION,
+    VISION_RESPONSE_SCHEMA_VERSION,
     VisionLine,
     VisionPageResult,
 )
@@ -594,16 +594,27 @@ def _parse_helper_output(stdout: bytes | str) -> VisionPageResult:
         )
     except (json.JSONDecodeError, ValueError, RecursionError) as exc:
         raise VisionOcrError(f"Vision helper returned invalid JSON: {exc}") from exc
-    if type(payload) is not dict or set(payload) != {"schema_version", "lines"}:
+    if type(payload) is not dict or set(payload) != {
+        "schema_version",
+        "lines",
+        "discarded_observations",
+    }:
         raise VisionOcrError("Vision helper response has an invalid schema")
     if (
         type(payload["schema_version"]) is not int
-        or payload["schema_version"] != OCR_SCHEMA_VERSION
+        or payload["schema_version"] != VISION_RESPONSE_SCHEMA_VERSION
     ):
         raise VisionOcrError("Vision helper response has an unsupported schema version")
     raw_lines = payload["lines"]
     if type(raw_lines) is not list:
         raise VisionOcrError("Vision helper lines must be a list")
+    discarded_observations = payload["discarded_observations"]
+    if (
+        type(discarded_observations) is not int
+        or discarded_observations < 0
+        or discarded_observations > 1_000_000
+    ):
+        raise VisionOcrError("Vision helper discarded_observations is invalid")
 
     lines: list[VisionLine] = []
     total_scalars = 0
@@ -636,8 +647,9 @@ def _parse_helper_output(stdout: bytes | str) -> VisionPageResult:
             )
         )
     return VisionPageResult(
-        schema_version=OCR_SCHEMA_VERSION,
+        schema_version=VISION_RESPONSE_SCHEMA_VERSION,
         lines=_order_lines(lines),
+        discarded_observations=discarded_observations,
     )
 
 

@@ -401,9 +401,9 @@ def _validate_capabilities(stdout: str) -> None:
             "capabilities JSON has missing or extra fields"
         )
     schema_version = payload["schema_version"]
-    if type(schema_version) is not int or schema_version != 1:
+    if type(schema_version) is not int or schema_version != 2:
         raise VisionHelperBuildError(
-            "capabilities schema_version must be integer 1"
+            "capabilities schema_version must be integer 2"
         )
     languages = payload["languages"]
     if type(languages) is not list or not all(

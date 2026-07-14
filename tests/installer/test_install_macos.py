@@ -55,7 +55,7 @@ def _legacy_vision_fixture(
             if argv[-1:] == ["--capabilities"]:
                 return subprocess.CompletedProcess(
                     argv, 0,
-                    '{"schema_version":1,"languages":["zh-Hans","en-US"]}',
+                    '{"schema_version":2,"languages":["zh-Hans","en-US"]}',
                     "",
                 )
             if original_runner is None:

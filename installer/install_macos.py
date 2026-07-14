@@ -45,7 +45,7 @@ class InstallError(RuntimeError):
 
 
 VISION_HELPER_RELATIVE = Path("bin/book-vision-ocr")
-VISION_HELPER_SCHEMA_VERSION = 1
+VISION_HELPER_SCHEMA_VERSION = 2
 VISION_HELPER_LANGUAGES = frozenset({"zh-Hans", "en-US"})
 VISION_HELPER_LIPO = "/usr/bin/lipo"
 VISION_HELPER_CODESIGN = "/usr/bin/codesign"

@@ -36,7 +36,7 @@ class FakeRunner:
         self.architectures = architectures
         self.capabilities = (
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "languages": ["zh-Hans", "en-US"],
             }
             if capabilities is None
@@ -408,22 +408,22 @@ def test_builder_accepts_only_thin_arm64_binary(
     ("capabilities", "message"),
     [
         ({"schema_version": True, "languages": ["zh-Hans", "en-US"]}, "schema"),
-        ({"schema_version": 1.0, "languages": ["zh-Hans", "en-US"]}, "schema"),
-        ({"schema_version": 1, "languages": ["zh-Hans"]}, "en-US"),
-        ({"schema_version": 1, "languages": ["en-US"]}, "zh-Hans"),
-        ({"schema_version": 1, "languages": "zh-Hans,en-US"}, "languages"),
+        ({"schema_version": 2.0, "languages": ["zh-Hans", "en-US"]}, "schema"),
+        ({"schema_version": 2, "languages": ["zh-Hans"]}, "en-US"),
+        ({"schema_version": 2, "languages": ["en-US"]}, "zh-Hans"),
+        ({"schema_version": 2, "languages": "zh-Hans,en-US"}, "languages"),
         (
             {
-                "schema_version": 1,
+                "schema_version": 2,
                 "languages": ["zh-Hans", "en-US"],
                 "extra": False,
             },
             "fields",
         ),
         ({"languages": ["zh-Hans", "en-US"]}, "fields"),
-        ({"schema_version": 1, "languages": ["zh-Hans", 7]}, "languages"),
+        ({"schema_version": 2, "languages": ["zh-Hans", 7]}, "languages"),
         (
-            {"schema_version": 1, "languages": ["zh-Hans", "en-US", "en-US"]},
+            {"schema_version": 2, "languages": ["zh-Hans", "en-US", "en-US"]},
             "duplicate",
         ),
     ],
@@ -518,7 +518,7 @@ def test_builder_rejects_non_finite_json_constant(tmp_path: Path) -> None:
                 return subprocess.CompletedProcess(
                     argv,
                     0,
-                    '{"schema_version":1,"languages":["zh-Hans","en-US"],"x":NaN}',
+                    '{"schema_version":2,"languages":["zh-Hans","en-US"],"x":NaN}',
                     "",
                 )
             return result

@@ -62,8 +62,8 @@ FIXED_METADATA = {
     "python": "3.12",
     "archive": "codex-obsidian-book-library-v0.2.0-beta.1-macos-arm64-all-in-one.zip",
     "top_level_directory": "codex-obsidian-book-library-v0.2.0-beta.1-macos-arm64",
-    "vision_helper_version": "0.1.0",
-    "vision_schema_version": "1",
+    "vision_helper_version": "0.2.0",
+    "vision_schema_version": "2",
 }
 
 FIXED_MODEL_FILES = (
@@ -152,7 +152,7 @@ def _inject_vision_fixture(
             return subprocess.CompletedProcess(
                 argv,
                 0,
-                json.dumps({"schema_version": 1, "languages": ["zh-Hans", "en-US"]}),
+                json.dumps({"schema_version": 2, "languages": ["zh-Hans", "en-US"]}),
                 "",
             )
         raise AssertionError(f"unexpected validation command: {argv}")

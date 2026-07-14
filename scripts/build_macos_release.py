@@ -41,6 +41,8 @@ REQUIRED_SOURCE_FILES = (
     "docs/安装说明.md",
     "docs/常见问题.md",
     "docs/隐私与数据存放.md",
+    "docs/word/安装说明.docx",
+    "docs/word/使用说明.docx",
     "install-macos.command",
     "pyproject.toml",
     "third_party/model/LICENSE-MIT",
@@ -110,6 +112,8 @@ BINARY_PAYLOAD_PATHS = frozenset(
         "bin/book-vision-ocr",
         "data/models/model.safetensors",
         "data/models/sentencepiece.bpe.model",
+        "docs/word/安装说明.docx",
+        "docs/word/使用说明.docx",
     }
 )
 GENERIC_ACCOUNT_NAMES = frozenset(

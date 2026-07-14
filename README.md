@@ -2,7 +2,7 @@
 
 这是一个给 Codex Desktop 使用的本地书库助手。你可以在 Codex 对话中导入书籍、检索原文、获得通俗解释、比较多本书，并在明确要求后把读书笔记保存到 Obsidian。
 
-当前测试版只面向 Apple Silicon Mac。它支持 PDF、EPUB、Markdown 和 TXT；扫描版 PDF 可在用户明确确认后使用本机 Apple Vision OCR。
+当前测试版只面向 Apple Silicon Mac。它支持 PDF、EPUB、Markdown 和 TXT；扫描版 PDF 可在用户明确确认后使用本机 Apple Vision OCR，并在需要时自动切换到本地 RapidOCR。
 
 ## 终端一行安装（推荐）
 
@@ -49,6 +49,6 @@ git clone https://github.com/zyf2238070278-glitch/codex-obsidian-book-library.gi
 - 原书、索引数据库和笔记默认留在本机。你主动附加给 Codex 的文件，以及回答问题时选中的少量短段落，会进入 Codex 对话。
 - 问答会使用 Codex 的上下文和 token，因此这不是完全离线、零 token 或零内容传输的方案。
 - 当前版本不支持 Intel Mac 或 Windows，也不保证每台 Mac 都不会出现 Gatekeeper 确认。
-- OCR 在本机 Apple Vision 上运行，不上传原 PDF，也不需要单独的 OCR token；识别结果会保存页级 checkpoint，可能有错字，引用前应按 PDF 物理页核验。
+- OCR 完全在本机运行：默认使用 Apple Vision，失败或质量不足时会切换 RapidOCR；不上传原 PDF，也不需要单独的 OCR token。识别结果会保存页级 checkpoint，可能有错字，引用前应按 PDF 物理页核验。
 
 更多细节见[隐私与数据存放](docs/隐私与数据存放.md)和[常见问题](docs/常见问题.md)。项目源码采用 [MIT License](LICENSE)，随包组件见[第三方说明](THIRD_PARTY_NOTICES.md)。

@@ -51,6 +51,11 @@ VISION_HELPER_LANGUAGES = frozenset({"zh-Hans", "en-US"})
 VISION_HELPER_LIPO = "/usr/bin/lipo"
 VISION_HELPER_CODESIGN = "/usr/bin/codesign"
 VISION_HELPER_MACHO_MAGICS = frozenset({b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"})
+RAPIDOCR_MODEL_FILES = (
+    "PP-OCRv6_det_small.onnx",
+    "PP-OCRv6_rec_small.onnx",
+    "ch_ppocr_mobile_v2.0_cls_mobile.onnx",
+)
 
 
 @dataclass(frozen=True)
@@ -318,6 +323,35 @@ def _create_runtime_directories(project_root: Path, vault: Path) -> None:
         raise InstallError("无法创建书库目录：%s" % exc) from exc
 
 
+def _install_rapidocr_models(project_root: Path) -> None:
+    """Copy RapidOCR's wheel-bundled models to the stable runtime location."""
+
+    source = (
+        project_root
+        / ".venv"
+        / "lib"
+        / "python3.12"
+        / "site-packages"
+        / "rapidocr"
+        / "models"
+    )
+    destination = project_root / "data" / "ocr-models" / "rapidocr"
+    try:
+        for filename in RAPIDOCR_MODEL_FILES:
+            model = source / filename
+            if not model.is_file() or model.is_symlink():
+                raise InstallError(
+                    "RapidOCR 模型缺失：%s。请重新运行安装脚本。" % filename
+                )
+        destination.mkdir(parents=True, exist_ok=True)
+        for filename in RAPIDOCR_MODEL_FILES:
+            shutil.copy2(source / filename, destination / filename)
+    except InstallError:
+        raise
+    except OSError as exc:
+        raise InstallError("无法准备 RapidOCR 本地模型：%s" % exc) from exc
+
+
 def install(
     *,
     project_root: Path,
@@ -355,6 +389,7 @@ def install(
             run_command=command_runner,
         )
         _validate_python(resolved_python)
+        _install_rapidocr_models(resolved_root)
 
     # Validate the native helper before creating runtime directories or writing
     # Codex configuration.  A failed validation therefore leaves an existing

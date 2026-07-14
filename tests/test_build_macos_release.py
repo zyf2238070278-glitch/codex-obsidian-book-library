@@ -41,6 +41,8 @@ SOURCE_FILES = (
     "docs/安装说明.md",
     "docs/常见问题.md",
     "docs/隐私与数据存放.md",
+    "docs/word/安装说明.docx",
+    "docs/word/使用说明.docx",
     "install-macos.command",
     "installer/__init__.py",
     "installer/install_macos.py",

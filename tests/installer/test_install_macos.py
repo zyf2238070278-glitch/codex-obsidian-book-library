@@ -59,8 +59,23 @@ def _legacy_vision_fixture(
                     "",
                 )
             if original_runner is None:
-                return subprocess.run(argv, **runner_kwargs)
-            return original_runner(argv, **runner_kwargs)  # type: ignore[misc]
+                result = subprocess.run(argv, **runner_kwargs)
+            else:
+                result = original_runner(argv, **runner_kwargs)  # type: ignore[misc]
+            if argv[1:2] == ["sync"]:
+                models = (
+                    project_root
+                    / ".venv"
+                    / "lib"
+                    / "python3.12"
+                    / "site-packages"
+                    / "rapidocr"
+                    / "models"
+                )
+                models.mkdir(parents=True, exist_ok=True)
+                for model in install_macos.RAPIDOCR_MODEL_FILES:
+                    (models / model).write_bytes(b"fixture model")
+            return result
 
         kwargs["run_command"] = runner
         return original(*args, **kwargs)
@@ -72,6 +87,32 @@ def _create_executable(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("#!/bin/sh\n", encoding="utf-8")
     path.chmod(0o755)
+
+
+def test_install_rapidocr_models_copies_pinned_models_from_venv(tmp_path: Path) -> None:
+    project_root = tmp_path / "Book Library Release"
+    source = (
+        project_root
+        / ".venv"
+        / "lib"
+        / "python3.12"
+        / "site-packages"
+        / "rapidocr"
+        / "models"
+    )
+    source.mkdir(parents=True)
+    for model in install_macos.RAPIDOCR_MODEL_FILES:
+        (source / model).write_bytes(model.encode("utf-8"))
+
+    install_macos._install_rapidocr_models(project_root)
+
+    destination = project_root / "data" / "ocr-models" / "rapidocr"
+    assert {
+        path.name: path.read_bytes()
+        for path in destination.iterdir()
+    } == {
+        model: model.encode("utf-8") for model in install_macos.RAPIDOCR_MODEL_FILES
+    }
 
 
 def test_default_project_root_is_distribution_root() -> None:

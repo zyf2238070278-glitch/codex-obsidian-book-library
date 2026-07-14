@@ -22,6 +22,7 @@ from book_agent.ocr.models import (
     VisionLine,
     VisionPageResult,
 )
+from book_agent.ocr.rendering import RenderError, RenderPlanner
 
 
 TARGET_DPI = 300.0
@@ -742,72 +743,17 @@ class VisionOcrEngine:
             raise VisionOcrError("PDF path must be absolute")
         descriptor, identity = _open_regular_nofollow(pdf, description="PDF")
         os.close(descriptor)
-        document: fitz.Document | None = None
         try:
-            document = fitz.open(pdf)
-            if document.needs_pass and not document.authenticate(""):
-                raise VisionOcrError("PDF is encrypted and cannot be opened")
-            if page_index >= len(document):
-                raise VisionOcrError("page_index is outside the PDF page range")
-            page = document.load_page(page_index)
-            width_points = float(page.rect.width)
-            height_points = float(page.rect.height)
-            if (
-                not math.isfinite(width_points)
-                or not math.isfinite(height_points)
-                or width_points <= 0.0
-                or height_points <= 0.0
-            ):
-                raise VisionOcrError("PDF page has invalid dimensions")
-
-            scale = TARGET_DPI / 72.0
-            desired_long_edge = max(width_points, height_points) * scale
-            desired_pixels = width_points * height_points * scale * scale
-            if not math.isfinite(desired_long_edge) or not math.isfinite(desired_pixels):
-                raise VisionOcrError("PDF page dimensions are too large")
-            if desired_long_edge > MAXIMUM_LONG_EDGE_PIXELS:
-                scale *= MAXIMUM_LONG_EDGE_PIXELS / desired_long_edge
-            scaled_pixels = width_points * height_points * scale * scale
-            if scaled_pixels > MAXIMUM_PAGE_PIXELS:
-                scale *= math.sqrt(MAXIMUM_PAGE_PIXELS / scaled_pixels)
-            if not math.isfinite(scale) or scale <= 0.0:
-                raise VisionOcrError("PDF page cannot be rendered at a safe scale")
-
-            pixmap: fitz.Pixmap | None = None
-            for _ in range(4):
-                pixmap = page.get_pixmap(
-                    matrix=fitz.Matrix(scale, scale),
-                    colorspace=fitz.csGRAY,
-                    alpha=False,
-                )
-                if (
-                    pixmap.width > 0
-                    and pixmap.height > 0
-                    and max(pixmap.width, pixmap.height) <= MAXIMUM_LONG_EDGE_PIXELS
-                    and pixmap.width * pixmap.height <= MAXIMUM_PAGE_PIXELS
-                ):
-                    break
-                next_scale = scale * min(
-                    MAXIMUM_LONG_EDGE_PIXELS / max(pixmap.width, pixmap.height),
-                    math.sqrt(MAXIMUM_PAGE_PIXELS / (pixmap.width * pixmap.height)),
-                ) * (1.0 - 1e-9)
-                if next_scale <= 0.0 or next_scale >= scale:
-                    raise VisionOcrError("PDF page render exceeded the safe pixel limits")
-                scale = next_scale
-            else:
-                raise VisionOcrError("PDF page render exceeded the safe pixel limits")
-            assert pixmap is not None
-            pixmap.set_dpi(max(1, round(scale * 72)), max(1, round(scale * 72)))
+            rendered = RenderPlanner().render(pdf, page_index, dpi=round(TARGET_DPI))
             if not _path_has_identity(pdf, identity):
                 raise VisionOcrError("PDF changed while its page was being rendered")
-            return pixmap, round(scale * 72)
+            return rendered.pixmap, rendered.dpi
+        except RenderError as exc:
+            raise VisionOcrError(str(exc)) from exc
         except VisionOcrError:
             raise
         except (fitz.FileDataError, RuntimeError, ValueError, OverflowError, MemoryError) as exc:
             raise VisionOcrError(f"could not render PDF page: {exc}") from exc
-        finally:
-            if document is not None:
-                document.close()
 
     @staticmethod
     def _create_call_directory(temp_root: Path) -> Path:

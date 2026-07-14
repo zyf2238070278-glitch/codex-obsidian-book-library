@@ -1,0 +1,27 @@
+.worktrees/
+.venv/
+dist/
+
+# Python and test caches
+__pycache__/
+*.py[cod]
+.pytest_cache/
+
+# Coverage output
+.coverage
+.coverage.*
+coverage.xml
+htmlcov/
+
+# Local runtime data
+/data/
+
+# Managed Obsidian library contents
+vault/书库/00-待导入/*
+!vault/书库/00-待导入/.gitkeep
+vault/书库/10-原始书籍/*
+!vault/书库/10-原始书籍/.gitkeep
+vault/书库/20-解析文本/*
+!vault/书库/20-解析文本/.gitkeep
+vault/书库/30-AI读书笔记/*
+!vault/书库/30-AI读书笔记/.gitkeep

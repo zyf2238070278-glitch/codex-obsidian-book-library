@@ -25,8 +25,24 @@ class BoundingBox:
     def __post_init__(self) -> None:
         for name in ("x", "y", "width", "height"):
             value = getattr(self, name)
-            if not isinstance(value, (int, float)) or not math.isfinite(value):
+            if (
+                not isinstance(value, (int, float))
+                or isinstance(value, bool)
+                or not math.isfinite(value)
+            ):
                 raise ValueError(f"{name} must be finite")
+        if not 0.0 <= self.x <= 1.0:
+            raise ValueError("x must be between 0 and 1")
+        if not 0.0 <= self.y <= 1.0:
+            raise ValueError("y must be between 0 and 1")
+        if not 0.0 < self.width <= 1.0:
+            raise ValueError("width must be greater than 0 and at most 1")
+        if not 0.0 < self.height <= 1.0:
+            raise ValueError("height must be greater than 0 and at most 1")
+        if self.x + self.width > 1.0:
+            raise ValueError("x + width must not exceed 1")
+        if self.y + self.height > 1.0:
+            raise ValueError("y + height must not exceed 1")
 
 
 @dataclass(frozen=True)
@@ -151,6 +167,12 @@ class OcrJobSummary:
             not _is_int(self.queue_position) or self.queue_position <= 0
         ):
             raise ValueError("queue_position must be greater than zero")
+        for name in ("updated_at", "error"):
+            value = getattr(self, name)
+            if value is not None and (
+                not isinstance(value, str) or not value.strip()
+            ):
+                raise ValueError(f"{name} must be a nonblank string or None")
         if self.estimated_remaining_seconds is not None and (
             not _is_int(self.estimated_remaining_seconds)
             or self.estimated_remaining_seconds < 0

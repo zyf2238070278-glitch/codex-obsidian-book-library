@@ -22,6 +22,17 @@ def _line(
     return VisionLine(text, confidence, BoundingBox(x, y, 0.2, 0.05))
 
 
+def _box(**overrides: object) -> BoundingBox:
+    values: dict[str, object] = {
+        "x": 0.1,
+        "y": 0.2,
+        "width": 0.3,
+        "height": 0.4,
+    }
+    values.update(overrides)
+    return BoundingBox(**values)  # type: ignore[arg-type]
+
+
 def _summary(**overrides: object) -> OcrJobSummary:
     values: dict[str, object] = {
         "book_id": "book-1",
@@ -91,6 +102,71 @@ def test_bounding_box_rejects_nonfinite_coordinates(coordinate: float) -> None:
         BoundingBox(coordinate, 0.1, 0.2, 0.05)
 
 
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("x", True),
+        ("y", False),
+        ("width", True),
+        ("height", False),
+        ("x", "0.1"),
+        ("y", object()),
+        ("width", "0.3"),
+        ("height", object()),
+    ],
+)
+def test_bounding_box_rejects_bool_and_nonnumeric_values(
+    field: str, value: object
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        _box(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("x", -0.01),
+        ("x", 1.01),
+        ("y", -0.01),
+        ("y", 1.01),
+        ("width", 0.0),
+        ("width", -0.01),
+        ("width", 1.01),
+        ("height", 0.0),
+        ("height", -0.01),
+        ("height", 1.01),
+    ],
+)
+def test_bounding_box_rejects_values_outside_normalized_ranges(
+    field: str, value: float
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        _box(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("values", "field"),
+    [
+        ({"x": 0.8, "width": 0.2000000001}, "width"),
+        ({"y": 0.7, "height": 0.3000000001}, "height"),
+    ],
+)
+def test_bounding_box_rejects_extents_beyond_normalized_image(
+    values: dict[str, float], field: str
+) -> None:
+    with pytest.raises(ValueError, match=field):
+        _box(**values)
+
+
+def test_bounding_box_accepts_exact_normalized_image_bounds() -> None:
+    assert BoundingBox(0.0, 0.0, 1.0, 1.0) == BoundingBox(
+        x=0.0,
+        y=0.0,
+        width=1.0,
+        height=1.0,
+    )
+
+
 @pytest.mark.parametrize("schema_version", [0, 2, -1])
 def test_vision_page_result_requires_schema_version_one(schema_version: int) -> None:
     with pytest.raises(ValueError, match="schema_version"):
@@ -113,6 +189,26 @@ def test_vision_page_result_requires_schema_version_one(schema_version: int) -> 
     ],
 )
 def test_ocr_job_summary_rejects_invalid_values(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
+        _summary(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("updated_at", 123),
+        ("updated_at", nan),
+        ("updated_at", ""),
+        ("updated_at", " \t"),
+        ("error", 123),
+        ("error", nan),
+        ("error", ""),
+        ("error", " \n"),
+    ],
+)
+def test_ocr_job_summary_rejects_invalid_optional_text_metadata(
+    field: str, value: object
+) -> None:
     with pytest.raises(ValueError, match=field):
         _summary(**{field: value})
 

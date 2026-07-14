@@ -107,7 +107,7 @@ class VisionPageResult:
             raise ValueError(
                 f"schema_version must be exactly {OCR_SCHEMA_VERSION}"
             )
-        if not isinstance(self.lines, tuple) or not all(
+        if type(self.lines) is not tuple or not all(
             type(line) is VisionLine for line in self.lines
         ):
             raise ValueError("lines must be a tuple of VisionLine values")

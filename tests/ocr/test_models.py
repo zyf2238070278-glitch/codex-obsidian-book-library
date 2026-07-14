@@ -23,6 +23,15 @@ class _ExtendedVisionLine(VisionLine):
     extra: object
 
 
+class _ReconstructionUnsafeLineTuple(tuple[VisionLine, ...]):
+    def __new__(
+        cls,
+        values: tuple[VisionLine, ...],
+        _marker: object,
+    ) -> "_ReconstructionUnsafeLineTuple":
+        return super().__new__(cls, values)
+
+
 def _line(
     text: str = "文字",
     confidence: float = 0.9,
@@ -211,6 +220,14 @@ def test_vision_page_result_rejects_invalid_line_collections(
 ) -> None:
     with pytest.raises(ValueError, match="lines"):
         VisionPageResult(schema_version=1, lines=lines)  # type: ignore[arg-type]
+
+
+def test_vision_page_result_rejects_tuple_subclass_before_asdict() -> None:
+    lines = _ReconstructionUnsafeLineTuple((_line(),), object())
+
+    with pytest.raises(ValueError, match="lines"):
+        result = VisionPageResult(schema_version=1, lines=lines)
+        json.dumps(asdict(result), ensure_ascii=False, allow_nan=False)
 
 
 def test_vision_page_result_rejects_extended_line_before_json() -> None:

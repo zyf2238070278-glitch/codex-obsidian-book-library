@@ -2,9 +2,9 @@
 
 set -eu
 
-TAG="v0.1.0-beta.1"
-ARCHIVE="codex-obsidian-book-library-v0.1.0-beta.1-macos-arm64-all-in-one.zip"
-TOP_LEVEL="codex-obsidian-book-library-v0.1.0-beta.1-macos-arm64"
+TAG="v0.2.0-beta.1"
+ARCHIVE="codex-obsidian-book-library-v0.2.0-beta.1-macos-arm64-all-in-one.zip"
+TOP_LEVEL="codex-obsidian-book-library-v0.2.0-beta.1-macos-arm64"
 INSTALL_DIR="${BOOK_LIBRARY_INSTALL_DIR:-$HOME/CodexBookLibrary}"
 TEMP_DIR=""
 
@@ -31,6 +31,7 @@ fi
 
 if [ -x "$INSTALL_DIR/install-macos.command" ] \
   && [ -x "$INSTALL_DIR/bin/uv" ] \
+  && [ -x "$INSTALL_DIR/bin/book-vision-ocr" ] \
   && [ -f "$INSTALL_DIR/data/models/model.safetensors" ]; then
   printf '检测到已有完整安装，正在检查并更新 Codex 配置……\n'
   run_installer
@@ -97,6 +98,7 @@ BUNDLE_DIR="$EXTRACTED/$TOP_LEVEL"
 if [ ! -d "$BUNDLE_DIR" ] || [ -L "$BUNDLE_DIR" ] \
   || [ ! -x "$BUNDLE_DIR/install-macos.command" ] \
   || [ ! -x "$BUNDLE_DIR/bin/uv" ] \
+  || [ ! -x "$BUNDLE_DIR/bin/book-vision-ocr" ] \
   || [ ! -f "$BUNDLE_DIR/data/models/model.safetensors" ]; then
   fail "安装包结构不完整，已停止安装。"
 fi

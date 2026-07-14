@@ -20,6 +20,50 @@ EXPECTED_TOOLS = [
 ]
 
 
+@pytest.fixture(autouse=True)
+def _legacy_vision_fixture(
+    request: pytest.FixtureRequest, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Keep pre-OCR installer tests focused on their original behavior."""
+
+    # New helper-validation tests deliberately exercise missing/corrupt files;
+    # leave those calls untouched.
+    if any(
+        token in request.node.name.casefold()
+        for token in ("vision", "helper", "ocr", "capabilities", "schema", "language")
+    ):
+        return
+    original = install_macos.install
+
+    def wrapped(*args: object, **kwargs: object) -> install_macos.InstallResult:
+        project_root = Path(kwargs.get("project_root", args[0] if args else "."))
+        helper = project_root / "bin" / "book-vision-ocr"
+        helper.parent.mkdir(parents=True, exist_ok=True)
+        helper.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 64)
+        helper.chmod(0o755)
+        original_runner = kwargs.get("run_command")
+
+        def runner(argv: list[str], **runner_kwargs: object) -> subprocess.CompletedProcess[str]:
+            if Path(argv[0]).name == "lipo":
+                return subprocess.CompletedProcess(argv, 0, "arm64\n", "")
+            if Path(argv[0]).name == "codesign":
+                return subprocess.CompletedProcess(argv, 0, "", "")
+            if argv[-1:] == ["--capabilities"]:
+                return subprocess.CompletedProcess(
+                    argv, 0,
+                    '{"schema_version":1,"languages":["zh-Hans","en-US"]}',
+                    "",
+                )
+            if original_runner is None:
+                return subprocess.run(argv, **runner_kwargs)
+            return original_runner(argv, **runner_kwargs)  # type: ignore[misc]
+
+        kwargs["run_command"] = runner
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(install_macos, "install", wrapped)
+
+
 def _create_executable(path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text("#!/bin/sh\n", encoding="utf-8")

@@ -7,8 +7,8 @@ import subprocess
 
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 LAUNCHER = PROJECT_ROOT / "install-from-github.command"
-ARCHIVE = "codex-obsidian-book-library-v0.1.0-beta.1-macos-arm64-all-in-one.zip"
-TOP_LEVEL = "codex-obsidian-book-library-v0.1.0-beta.1-macos-arm64"
+ARCHIVE = "codex-obsidian-book-library-v0.2.0-beta.1-macos-arm64-all-in-one.zip"
+TOP_LEVEL = "codex-obsidian-book-library-v0.2.0-beta.1-macos-arm64"
 
 
 def _write_executable(path: Path, body: str) -> None:
@@ -75,6 +75,7 @@ def _make_fixture_bundle(tmp_path: Path) -> tuple[Path, Path]:
     (bundle / "bin").mkdir(parents=True)
     (bundle / "data" / "models").mkdir(parents=True)
     _write_executable(bundle / "bin" / "uv", "#!/bin/sh\nexit 0\n")
+    _write_executable(bundle / "bin" / "book-vision-ocr", "#!/bin/sh\nexit 0\n")
     (bundle / "data" / "models" / "model.safetensors").write_bytes(b"model")
     _write_executable(
         bundle / "install-macos.command",
@@ -126,8 +127,8 @@ def test_launcher_downloads_pinned_release_verifies_and_installs(tmp_path: Path)
     assert completed.returncode == 0, completed.stderr
     urls = completed.download_log.read_text(encoding="utf-8").splitlines()  # type: ignore[attr-defined]
     assert urls == [
-        "https://github.com/example-owner/example-repo/releases/download/v0.1.0-beta.1/SHA256SUMS",
-        f"https://github.com/example-owner/example-repo/releases/download/v0.1.0-beta.1/{ARCHIVE}",
+        "https://github.com/example-owner/example-repo/releases/download/v0.2.0-beta.1/SHA256SUMS",
+        f"https://github.com/example-owner/example-repo/releases/download/v0.2.0-beta.1/{ARCHIVE}",
     ]
     install_dir = completed.install_dir  # type: ignore[attr-defined]
     assert (install_dir / "install-macos.command").is_file()
@@ -178,6 +179,7 @@ def test_launcher_reuses_complete_existing_install_without_downloading(tmp_path:
     (install_dir / "bin").mkdir(parents=True)
     (install_dir / "data" / "models").mkdir(parents=True)
     _write_executable(install_dir / "bin" / "uv", "#!/bin/sh\nexit 0\n")
+    _write_executable(install_dir / "bin" / "book-vision-ocr", "#!/bin/sh\nexit 0\n")
     (install_dir / "data" / "models" / "model.safetensors").write_bytes(b"model")
     install_log = tmp_path / "existing-install.txt"
     _write_executable(

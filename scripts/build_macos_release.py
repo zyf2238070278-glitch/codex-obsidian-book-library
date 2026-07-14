@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import stat
+import subprocess
 import tempfile
 import unicodedata
 import zipfile
@@ -48,7 +49,9 @@ REQUIRED_SOURCE_FILES = (
     "uv.lock",
 )
 
-EXECUTABLE_PATHS = frozenset({"install-macos.command", "bin/uv"})
+EXECUTABLE_PATHS = frozenset(
+    {"install-macos.command", "bin/uv", "bin/book-vision-ocr"}
+)
 REQUIRED_METADATA_KEYS = frozenset(
     {
         "version",
@@ -61,6 +64,8 @@ REQUIRED_METADATA_KEYS = frozenset(
         "python",
         "archive",
         "top_level_directory",
+        "vision_helper_version",
+        "vision_schema_version",
     }
 )
 FIXED_ZIP_TIMESTAMP = (1980, 1, 1, 0, 0, 0)
@@ -102,6 +107,7 @@ PRIVATE_ABSOLUTE_PATH_PATTERN = re.compile(
 BINARY_PAYLOAD_PATHS = frozenset(
     {
         "bin/uv",
+        "bin/book-vision-ocr",
         "data/models/model.safetensors",
         "data/models/sentencepiece.bpe.model",
     }
@@ -716,6 +722,111 @@ def _copy_uv_payload(
         size=info.st_size,
         sha256=expected_sha256,
     )
+
+
+VISION_HELPER_RELATIVE = "bin/book-vision-ocr"
+VISION_HELPER_LIPO = "/usr/bin/lipo"
+VISION_HELPER_CODESIGN = "/usr/bin/codesign"
+VISION_HELPER_MAGICS = frozenset({b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"})
+
+
+def _run_release_validation_command(
+    runner: Callable[..., Any],
+    argv: list[str],
+    *,
+    cwd: Path,
+) -> Any:
+    try:
+        return runner(
+            argv,
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except TypeError as exc:
+        try:
+            return runner(argv, cwd=cwd, check=True)
+        except TypeError:
+            raise exc
+
+
+def _validate_vision_capabilities(stdout: str, metadata: Mapping[str, str]) -> None:
+    try:
+        payload = json.loads(stdout)
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise ReleaseBuildError("vision helper capabilities are not valid JSON") from exc
+    if type(payload) is not dict or set(payload) != {"schema_version", "languages"}:
+        raise ReleaseBuildError("vision helper capabilities schema is invalid")
+    if (
+        type(payload["schema_version"]) is not int
+        or payload["schema_version"] != 1
+        or str(metadata["vision_schema_version"]) != "1"
+    ):
+        raise ReleaseBuildError("vision helper schema version is unsupported")
+    languages = payload["languages"]
+    if (
+        type(languages) is not list
+        or any(type(language) is not str or not language for language in languages)
+        or len(set(languages)) != len(languages)
+        or not {"zh-Hans", "en-US"}.issubset(languages)
+    ):
+        raise ReleaseBuildError("vision helper does not advertise zh-Hans and en-US")
+
+
+def _copy_vision_helper_payload(
+    vision_helper: Path,
+    payload_root: Path,
+    *,
+    project_root: Path,
+    metadata: Mapping[str, str],
+    run_command: Callable[..., Any],
+) -> tuple[str, ModelFileSpec]:
+    info = _ensure_regular_file(vision_helper, "Apple Vision OCR helper")
+    if stat.S_IMODE(info.st_mode) != 0o755 or not os.access(vision_helper, os.X_OK):
+        raise ReleaseBuildError("Apple Vision OCR helper must have mode 0755")
+    try:
+        with vision_helper.open("rb") as source:
+            if source.read(4) not in VISION_HELPER_MAGICS:
+                raise ReleaseBuildError("Apple Vision OCR helper is not a 64-bit Mach-O file")
+    except OSError as exc:
+        raise ReleaseBuildError(f"cannot read Apple Vision OCR helper: {vision_helper}") from exc
+    try:
+        architecture = _run_release_validation_command(
+            run_command,
+            [VISION_HELPER_LIPO, "-archs", str(vision_helper)],
+            cwd=project_root,
+        )
+        if (getattr(architecture, "stdout", "") or "").strip().split() != ["arm64"]:
+            raise ReleaseBuildError("Apple Vision OCR helper must be a thin arm64 binary")
+        _run_release_validation_command(
+            run_command,
+            [VISION_HELPER_CODESIGN, "--verify", "--strict", str(vision_helper)],
+            cwd=project_root,
+        )
+        capabilities = _run_release_validation_command(
+            run_command,
+            [str(vision_helper), "--capabilities"],
+            cwd=project_root,
+        )
+    except ReleaseBuildError:
+        raise
+    except (OSError, subprocess.CalledProcessError) as exc:
+        raise ReleaseBuildError(f"Apple Vision OCR helper validation failed: {exc}") from exc
+    if getattr(capabilities, "stderr", ""):
+        raise ReleaseBuildError("vision helper capabilities wrote unexpected stderr")
+    _validate_vision_capabilities(getattr(capabilities, "stdout", "") or "", metadata)
+
+    digest = _sha256_file(vision_helper)
+    destination = payload_root / VISION_HELPER_RELATIVE
+    _copy_file(vision_helper, destination, 0o755)
+    _verify_staged_file(
+        destination,
+        expected_size=info.st_size,
+        expected_sha256=digest,
+        label="staged Apple Vision OCR helper",
+    )
+    return VISION_HELPER_RELATIVE, ModelFileSpec(size=info.st_size, sha256=digest)
 
 
 def _payload_record(payload_root: Path, relative: str) -> dict[str, Any]:
@@ -1366,13 +1477,16 @@ def build_release(
     project_root: Path,
     model_snapshot: Path,
     uv_binary: Path,
+    vision_helper: Path,
     output_dir: Path,
     metadata_path: Path | None = None,
     model_manifest_path: Path | None = None,
+    run_command: Callable[..., Any] | None = None,
 ) -> BuildResult:
     project_root = Path(project_root).expanduser().absolute()
     model_snapshot = Path(model_snapshot).expanduser().absolute()
     uv_binary = Path(uv_binary).expanduser().absolute()
+    vision_helper = Path(vision_helper).expanduser().absolute()
     output_dir = Path(output_dir).expanduser().absolute()
     if metadata_path is None:
         metadata_path = project_root / "distribution" / "release.json"
@@ -1391,6 +1505,7 @@ def build_release(
     _validate_output_target(archive_path, "release ZIP")
     _validate_output_target(checksums_path, "SHA256SUMS")
     private_paths = (project_root, Path.home(), model_snapshot)
+    command_runner = run_command or subprocess.run
     with tempfile.TemporaryDirectory(prefix=".macos-release-", dir=output_dir) as temp:
         staging_root = Path(temp)
         payload_root = staging_root / metadata["top_level_directory"]
@@ -1415,6 +1530,15 @@ def build_release(
         )
         payload_files.add(uv_relative)
         trusted_payload[uv_relative] = trusted_uv
+        vision_relative, trusted_vision = _copy_vision_helper_payload(
+            vision_helper,
+            payload_root,
+            project_root=project_root,
+            metadata=metadata,
+            run_command=command_runner,
+        )
+        payload_files.add(vision_relative)
+        trusted_payload[vision_relative] = trusted_vision
         _write_manifest(payload_root, metadata, payload_files)
         staged_payload = payload_files | {"RELEASE-MANIFEST.json"}
         expected_staging_files = {
@@ -1546,6 +1670,7 @@ def _parser() -> argparse.ArgumentParser:
     parser.add_argument("--project-root", type=Path, required=True)
     parser.add_argument("--model-snapshot", type=Path, required=True)
     parser.add_argument("--uv-binary", type=Path, required=True)
+    parser.add_argument("--vision-helper", type=Path, required=True)
     parser.add_argument("--output-dir", type=Path, required=True)
     parser.add_argument(
         "--metadata",
@@ -1567,6 +1692,7 @@ def main(argv: list[str] | None = None) -> int:
             project_root=arguments.project_root,
             model_snapshot=arguments.model_snapshot,
             uv_binary=arguments.uv_binary,
+            vision_helper=arguments.vision_helper,
             output_dir=arguments.output_dir,
             metadata_path=arguments.metadata,
             model_manifest_path=arguments.model_manifest,

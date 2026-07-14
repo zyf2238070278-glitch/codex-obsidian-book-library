@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -37,6 +38,14 @@ VAULT_DIRECTORIES = (
 
 class InstallError(RuntimeError):
     """An expected installation failure with a user-facing message."""
+
+
+VISION_HELPER_RELATIVE = Path("bin/book-vision-ocr")
+VISION_HELPER_SCHEMA_VERSION = 1
+VISION_HELPER_LANGUAGES = frozenset({"zh-Hans", "en-US"})
+VISION_HELPER_LIPO = "/usr/bin/lipo"
+VISION_HELPER_CODESIGN = "/usr/bin/codesign"
+VISION_HELPER_MACHO_MAGICS = frozenset({b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"})
 
 
 @dataclass(frozen=True)
@@ -192,6 +201,105 @@ def _validate_python(python: Path) -> None:
         raise InstallError("Python 解释器不可执行：%s" % python)
 
 
+def _run_validation_command(
+    runner: Callable[..., Any],
+    argv: list[str],
+    *,
+    cwd: Path,
+) -> Any:
+    """Run a validation command with argv only (never through a shell).
+
+    The small compatibility fallback keeps the injectable runner used by the
+    installer tests useful even when it does not accept capture_output/text.
+    """
+
+    try:
+        return runner(
+            argv,
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except TypeError as exc:
+        try:
+            return runner(argv, cwd=cwd, check=True)
+        except TypeError:
+            raise exc
+
+
+def _validate_vision_helper(
+    *,
+    project_root: Path,
+    helper: Optional[Path] = None,
+    run_command: Callable[..., Any],
+) -> Path:
+    """Validate the packaged Apple Vision helper before publishing config."""
+
+    helper = helper or (project_root / VISION_HELPER_RELATIVE)
+    try:
+        info = helper.lstat()
+    except OSError as exc:
+        raise InstallError(
+            "缺少 Apple Vision OCR helper：%s。请重新下载完整 macOS 安装包。" % helper
+        ) from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise InstallError("Apple Vision OCR helper 必须是普通文件：%s" % helper)
+    if stat.S_IMODE(info.st_mode) != 0o755 or not os.access(str(helper), os.X_OK):
+        raise InstallError("Apple Vision OCR helper 必须具有 0755 可执行权限：%s" % helper)
+    try:
+        with helper.open("rb") as source:
+            if source.read(4) not in VISION_HELPER_MACHO_MAGICS:
+                raise InstallError("Apple Vision OCR helper 不是 64 位 Mach-O 文件：%s" % helper)
+    except OSError as exc:
+        raise InstallError("无法读取 Apple Vision OCR helper：%s" % helper) from exc
+
+    try:
+        architecture = _run_validation_command(
+            run_command, [VISION_HELPER_LIPO, "-archs", str(helper)], cwd=project_root
+        )
+        if (getattr(architecture, "stdout", "") or "").strip().split() != ["arm64"]:
+            raise InstallError("Apple Vision OCR helper 必须是 arm64：%s" % helper)
+        _run_validation_command(
+            run_command,
+            [VISION_HELPER_CODESIGN, "--verify", "--strict", str(helper)],
+            cwd=project_root,
+        )
+        capabilities = _run_validation_command(
+            run_command, [str(helper), "--capabilities"], cwd=project_root
+        )
+    except InstallError:
+        raise
+    except subprocess.CalledProcessError as exc:
+        raise InstallError("Apple Vision OCR helper 校验失败：退出码 %s" % exc.returncode) from exc
+    except OSError as exc:
+        raise InstallError("无法校验 Apple Vision OCR helper：%s" % exc) from exc
+
+    stderr = getattr(capabilities, "stderr", "") or ""
+    if stderr:
+        raise InstallError("Apple Vision OCR helper capabilities 输出了错误信息。")
+    try:
+        payload = json.loads(getattr(capabilities, "stdout", "") or "")
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise InstallError("Apple Vision OCR helper capabilities 不是有效 JSON。") from exc
+    if type(payload) is not dict or set(payload) != {"schema_version", "languages"}:
+        raise InstallError("Apple Vision OCR helper capabilities schema 不受支持。")
+    if (
+        type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") != VISION_HELPER_SCHEMA_VERSION
+    ):
+        raise InstallError("Apple Vision OCR helper schema 版本不受支持。")
+    languages = payload.get("languages")
+    if (
+        type(languages) is not list
+        or any(type(language) is not str or not language for language in languages)
+        or len(set(languages)) != len(languages)
+        or not VISION_HELPER_LANGUAGES.issubset(languages)
+    ):
+        raise InstallError("Apple Vision OCR helper 不支持中文或英文识别。")
+    return helper
+
+
 def _create_runtime_directories(project_root: Path, vault: Path) -> None:
     try:
         for relative in VAULT_DIRECTORIES:
@@ -209,6 +317,7 @@ def install(
     skip_sync: bool = False,
     codex_config: Optional[Path] = None,
     python: Optional[Path] = None,
+    vision_helper: Optional[Path] = None,
     find_executable: Optional[Callable[[str], Optional[str]]] = None,
     run_command: Optional[Callable[..., Any]] = None,
 ) -> InstallResult:
@@ -231,12 +340,26 @@ def install(
 
     if not skip_sync:
         uv = _find_uv(resolved_root, find_executable or shutil.which)
+        command_runner = run_command or subprocess.run
         _sync_environment(
             project_root=resolved_root,
             uv=uv,
-            run_command=run_command or subprocess.run,
+            run_command=command_runner,
         )
         _validate_python(resolved_python)
+
+    # Validate the native helper before creating runtime directories or writing
+    # Codex configuration.  A failed validation therefore leaves an existing
+    # configuration untouched and never publishes a partial one.
+    _validate_vision_helper(
+        project_root=resolved_root,
+        helper=(
+            _absolute_without_symlink_resolution(Path(vision_helper), resolved_root)
+            if vision_helper is not None
+            else None
+        ),
+        run_command=run_command or subprocess.run,
+    )
 
     _create_runtime_directories(resolved_root, resolved_vault)
     try:

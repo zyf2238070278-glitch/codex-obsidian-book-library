@@ -10,7 +10,11 @@ import fitz
 from book_agent.ocr.models import BoundingBox, OcrPageResult, VisionLine
 
 
-REQUIRED_MODEL_FILES = ("det.onnx", "rec.onnx", "cls.onnx")
+REQUIRED_MODEL_FILES = (
+    "PP-OCRv6_det_small.onnx",
+    "PP-OCRv6_rec_small.onnx",
+    "ch_ppocr_mobile_v2.0_cls_mobile.onnx",
+)
 
 
 class RapidOcrError(ValueError):
@@ -45,10 +49,11 @@ class RapidOcrEngine:
                     raise RapidOcrError("RapidOCR runtime is not installed") from exc
                 factory = RapidOCR
             try:
+                # RapidOCR resolves all detector/classifier/recognizer assets
+                # beneath this explicit root.  Supplying no root would make the
+                # library fall back to its own cache/download behavior.
                 self._runtime = factory(
-                    det_model_path=str(self._model_root / "det.onnx"),
-                    rec_model_path=str(self._model_root / "rec.onnx"),
-                    cls_model_path=str(self._model_root / "cls.onnx"),
+                    params={"Global.model_root_dir": str(self._model_root)}
                 )
             except Exception as exc:
                 raise RapidOcrError(f"could not initialize offline RapidOCR: {exc}") from exc

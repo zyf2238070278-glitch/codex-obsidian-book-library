@@ -16,7 +16,11 @@ def _image(path: Path) -> Path:
 
 def _models(root: Path) -> Path:
     root.mkdir()
-    for name in ("det.onnx", "rec.onnx", "cls.onnx"):
+    for name in (
+        "PP-OCRv6_det_small.onnx",
+        "PP-OCRv6_rec_small.onnx",
+        "ch_ppocr_mobile_v2.0_cls_mobile.onnx",
+    ):
         (root / name).write_bytes(b"model")
     return root
 

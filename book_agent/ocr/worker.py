@@ -24,6 +24,7 @@ from book_agent.config import AppPaths
 from book_agent.indexing import BookIndexer
 from book_agent.models import ParsedBook, SourceUnit
 from book_agent.ocr.models import OcrPageOutcome
+from book_agent.ocr.report import write_ocr_report
 from book_agent.ocr.router import OcrPageDecision
 from book_agent.storage import Database
 
@@ -275,6 +276,14 @@ class OcrWorker:
             # Only non-empty pages become searchable source units.  Empty pages
             # remain checkpoints and still count toward completion.
             checkpoints = self.database.list_ocr_pages(book_id)
+            skipped_pages = self.database.list_skipped_ocr_pages(book_id)
+            if skipped_pages:
+                write_ocr_report(
+                    self.paths,
+                    book_id=book_id,
+                    title=str(book.get("title") or original.stem),
+                    skipped_pages=skipped_pages,
+                )
             units = tuple(
                 SourceUnit(
                     text=str(row["text"]),

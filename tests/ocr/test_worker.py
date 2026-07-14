@@ -94,6 +94,7 @@ def test_worker_continues_after_skipped_page_and_indexes_other_pages(tmp_path):
     assert worker.run_once() is True
     assert engine.requested_pages == [1, 2, 3]
     assert database.get_ocr_job(book_id)["status"] == "completed"
+    assert (paths.ocr_reports / f"{book_id}-OCR处理报告.md").is_file()
 
 
 def test_page_fails_after_two_retries_and_worker_can_continue(tmp_path):

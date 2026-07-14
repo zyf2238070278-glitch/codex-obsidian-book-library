@@ -232,12 +232,11 @@ def test_native_helper_recognizes_synthetic_image_with_normalized_native_json(
 @pytest.mark.macos_vision
 def test_engine_default_runner_keeps_native_snapshot_until_vision_exits(
     tmp_path: Path,
+    vision_helper: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     pdf = _write_synthetic_pdf(tmp_path)
     temp_root = tmp_path / "ocr-temp"
-    vision_helper = PROJECT_ROOT / "bin" / "book-vision-ocr"
-    assert vision_helper.is_file()
     real_bounded = vision_module._run_bounded_command
     observed_during_run: list[tuple[Path, bool, bool]] = []
 
@@ -263,6 +262,7 @@ def test_engine_default_runner_keeps_native_snapshot_until_vision_exits(
     except VisionOcrError as exc:
         assert "exit code 2" in str(exc)
         assert "exit code -11" not in str(exc)
+        assert "Vision recognition failed" in str(exc)
     else:
         assert "VISION" in result.ordered_text().upper()
 

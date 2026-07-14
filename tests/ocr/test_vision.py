@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import shutil
 import stat
 import subprocess
@@ -54,6 +55,34 @@ def _payload(lines: list[dict[str, object]] | None = None) -> bytes:
         ensure_ascii=False,
         allow_nan=False,
     ).encode("utf-8")
+
+
+def _read_process_ids(path: Path) -> tuple[int, int]:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if path.is_file():
+            values = path.read_text(encoding="utf-8").split()
+            if len(values) == 2:
+                return int(values[0]), int(values[1])
+        time.sleep(0.01)
+    raise AssertionError("synthetic helper did not record process IDs")
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _assert_processes_gone(*process_ids: int) -> None:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if not any(_pid_exists(pid) for pid in process_ids):
+            return
+        time.sleep(0.01)
+    assert not [pid for pid in process_ids if _pid_exists(pid)]
 
 
 class RecordingRunner:
@@ -298,6 +327,53 @@ def test_codesign_verification_is_fixed_bounded_and_rechecks_snapshot(
     }
 
 
+def test_codesign_timeout_reports_the_codesign_stage_and_actual_limit(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot, source_fd = _private_snapshot_fixture(tmp_path)
+    monkeypatch.setattr(
+        vision_module,
+        "_run_bounded_command",
+        lambda argv, **kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        ),
+    )
+    try:
+        with pytest.raises(VisionOcrError, match="code-sign.*timed out.*30"):
+            vision_module._verify_codesign(snapshot)
+    finally:
+        os.close(snapshot.descriptor)
+        os.close(source_fd)
+        snapshot.path.unlink()
+        snapshot.directory.rmdir()
+
+
+def test_engine_does_not_misreport_codesign_timeout_as_helper_timeout(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf = _write_pdf(tmp_path / "book.pdf")
+    helper = _helper(tmp_path)
+    monkeypatch.setattr(
+        vision_module,
+        "_run_bounded_command",
+        lambda argv, **kwargs: (_ for _ in ()).throw(
+            subprocess.TimeoutExpired(argv, kwargs["timeout"])
+        ),
+    )
+
+    with pytest.raises(VisionOcrError) as captured:
+        VisionOcrEngine(
+            helper=helper,
+            temp_root=tmp_path / "ocr-temp",
+        ).recognize_page(pdf, page_index=0)
+
+    assert "code-sign verification timed out after 30 seconds" in str(captured.value)
+    assert "120" not in str(captured.value)
+    assert list((tmp_path / "ocr-temp").iterdir()) == []
+
+
 def _private_snapshot_fixture(
     tmp_path: Path,
 ) -> tuple[vision_module._ExecutableSnapshot, int]:
@@ -307,6 +383,160 @@ def _private_snapshot_fixture(
     temp_root = engine._prepare_temp_root()
     directory = engine._create_call_directory(temp_root)
     return engine._snapshot_helper(source_fd, directory, identity, digest), source_fd
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "missing-pipe",
+        "selector",
+        "set-blocking-stdout",
+        "set-blocking-stderr",
+        "register-stdout",
+        "register-stderr",
+    ],
+)
+def test_default_runner_reaps_process_and_closes_pipes_when_setup_fails(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    process_ids = tmp_path / f"{stage}.pids"
+    helper = tmp_path / "group-helper"
+    helper.write_text(
+        "#!/bin/sh\n"
+        "/bin/sleep 30 & child=$!\n"
+        "/bin/echo \"$$ $child\" > \"$PID_FILE\"\n"
+        "wait\n",
+        encoding="utf-8",
+    )
+    helper.chmod(0o700)
+    engine = VisionOcrEngine(helper=helper, temp_root=tmp_path / "ocr-temp")
+    source_fd, identity, digest = engine._validate_helper()
+    directory = engine._create_call_directory(engine._prepare_temp_root())
+    snapshot = engine._snapshot_helper(source_fd, directory, identity, digest)
+    request = RunRequest(
+        argv=(str(helper),),
+        environment=(
+            ("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),
+            ("PID_FILE", str(process_ids)),
+        ),
+        cwd=Path("/"),
+        timeout=120.0,
+        pass_fds=(),
+    )
+    real_popen = subprocess.Popen
+    real_selector = vision_module.selectors.DefaultSelector
+    real_set_blocking = os.set_blocking
+    process_holder: dict[str, subprocess.Popen[bytes]] = {}
+    selector_holder: dict[str, object] = {}
+
+    class MissingPipeProcess:
+        def __init__(self, process: subprocess.Popen[bytes]) -> None:
+            self.pid = process.pid
+            self.stdout = process.stdout
+            self.stderr = None
+            self._process = process
+
+        def wait(self, timeout: float) -> int:
+            return self._process.wait(timeout=timeout)
+
+        def kill(self) -> None:
+            self._process.kill()
+
+    def synchronized_popen(
+        argv: list[str],
+        **kwargs: object,
+    ) -> subprocess.Popen[bytes] | MissingPipeProcess:
+        process = real_popen(argv, **kwargs)  # type: ignore[arg-type]
+        process_holder["process"] = process
+        _read_process_ids(process_ids)
+        if stage == "missing-pipe":
+            return MissingPipeProcess(process)
+        return process
+
+    class TrackingSelector:
+        def __init__(self) -> None:
+            self._selector = real_selector()
+            self.register_calls = 0
+            self.closed = False
+            selector_holder["selector"] = self
+
+        def register(self, *args: object, **kwargs: object) -> object:
+            self.register_calls += 1
+            target = 1 if stage == "register-stdout" else 2
+            if stage.startswith("register-") and self.register_calls == target:
+                raise RuntimeError(f"synthetic {stage} failure")
+            return self._selector.register(*args, **kwargs)
+
+        def close(self) -> None:
+            self.closed = True
+            self._selector.close()
+
+        def __getattr__(self, name: str) -> object:
+            return getattr(self._selector, name)
+
+    blocking_calls = 0
+
+    def failing_set_blocking(descriptor: int, blocking: bool) -> None:
+        nonlocal blocking_calls
+        blocking_calls += 1
+        target = 1 if stage == "set-blocking-stdout" else 2
+        if stage.startswith("set-blocking-") and blocking_calls == target:
+            raise RuntimeError(f"synthetic {stage} failure")
+        real_set_blocking(descriptor, blocking)
+
+    monkeypatch.setattr(vision_module, "_verify_codesign", lambda value: None)
+    monkeypatch.setattr(vision_module.subprocess, "Popen", synchronized_popen)
+    if stage == "selector":
+        monkeypatch.setattr(
+            vision_module.selectors,
+            "DefaultSelector",
+            lambda: (_ for _ in ()).throw(RuntimeError("synthetic selector failure")),
+        )
+    else:
+        monkeypatch.setattr(
+            vision_module.selectors,
+            "DefaultSelector",
+            TrackingSelector,
+        )
+    monkeypatch.setattr(vision_module.os, "set_blocking", failing_set_blocking)
+    try:
+        with pytest.raises((RuntimeError, VisionOcrError), match="synthetic|pipe"):
+            vision_module._default_run_helper(request, snapshot)
+
+        leader_pid, child_pid = _read_process_ids(process_ids)
+        _assert_processes_gone(leader_pid, child_pid)
+        process = process_holder["process"]
+        assert process.stdout is not None and process.stdout.closed
+        if stage == "missing-pipe":
+            assert process.stderr is not None
+            process.stderr.close()
+        else:
+            assert process.stderr is not None and process.stderr.closed
+        if "selector" in selector_holder:
+            assert selector_holder["selector"].closed is True  # type: ignore[union-attr]
+        assert not snapshot.path.exists()
+        assert not snapshot.directory.exists()
+    finally:
+        os.close(snapshot.descriptor)
+        os.close(source_fd)
+        process = process_holder.get("process")
+        if process is not None:
+            if process.poll() is None:
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                process.wait(timeout=5)
+            if process.stdout is not None and not process.stdout.closed:
+                process.stdout.close()
+            if process.stderr is not None and not process.stderr.closed:
+                process.stderr.close()
+        if snapshot.path.exists():
+            snapshot.path.unlink()
+        if snapshot.directory.exists():
+            snapshot.directory.rmdir()
 
 
 @pytest.mark.parametrize(
@@ -535,6 +765,106 @@ def test_call_directory_creation_failure_does_not_leave_named_artifacts(
         VisionOcrEngine._create_call_directory(temp_root)
 
     assert list(temp_root.iterdir()) == []
+
+
+@pytest.mark.parametrize(
+    ("stage", "error_type"),
+    [
+        ("fchmod", OSError),
+        ("fchmod", KeyboardInterrupt),
+        ("fstat", OSError),
+        ("fstat", KeyboardInterrupt),
+        ("unlink", OSError),
+        ("unlink", KeyboardInterrupt),
+    ],
+)
+def test_anonymous_png_creation_failure_closes_fd_and_removes_named_entry(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+    error_type: type[BaseException],
+) -> None:
+    document = fitz.open()
+    page = document.new_page(width=20, height=20)
+    pixmap = page.get_pixmap(colorspace=fitz.csGRAY, alpha=False)
+    directory = tmp_path / "private-call"
+    directory.mkdir(mode=0o700)
+    before_fds = set(os.listdir("/dev/fd"))
+    real_fchmod = os.fchmod
+    real_fstat = os.fstat
+    real_unlink = os.unlink
+    failed = False
+
+    def maybe_fail() -> None:
+        nonlocal failed
+        if not failed:
+            failed = True
+            raise error_type(f"synthetic {stage} failure")
+
+    def failing_fchmod(descriptor: int, mode: int) -> None:
+        if stage == "fchmod":
+            maybe_fail()
+        real_fchmod(descriptor, mode)
+
+    def failing_fstat(descriptor: int) -> os.stat_result:
+        if stage == "fstat":
+            maybe_fail()
+        return real_fstat(descriptor)
+
+    def failing_unlink(path: object, *args: object, **kwargs: object) -> None:
+        if stage == "unlink":
+            maybe_fail()
+        real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(vision_module.os, "fchmod", failing_fchmod)
+    monkeypatch.setattr(vision_module.os, "fstat", failing_fstat)
+    monkeypatch.setattr(vision_module.os, "unlink", failing_unlink)
+    expected = KeyboardInterrupt if error_type is KeyboardInterrupt else VisionOcrError
+    try:
+        with pytest.raises(expected, match="synthetic|temporary PNG"):
+            VisionOcrEngine._write_anonymous_png(pixmap, directory)
+
+        assert list(directory.iterdir()) == []
+        assert set(os.listdir("/dev/fd")) == before_fds
+    finally:
+        monkeypatch.setattr(vision_module.os, "fchmod", real_fchmod)
+        monkeypatch.setattr(vision_module.os, "fstat", real_fstat)
+        monkeypatch.setattr(vision_module.os, "unlink", real_unlink)
+        document.close()
+        for entry in directory.iterdir():
+            entry.unlink()
+
+
+@pytest.mark.parametrize(
+    "error_type",
+    [RuntimeError, MemoryError, KeyboardInterrupt, SystemExit],
+)
+def test_png_encoding_failures_have_stable_errors_and_no_named_artifacts(
+    tmp_path: Path,
+    error_type: type[BaseException],
+) -> None:
+    directory = tmp_path / "private-call"
+    directory.mkdir(mode=0o700)
+    before_fds = set(os.listdir("/dev/fd"))
+
+    class FailingPixmap:
+        def tobytes(self, output: str) -> bytes:
+            assert output == "png"
+            raise error_type("synthetic PNG encoding failure")
+
+    expected = (
+        VisionOcrError
+        if error_type in (RuntimeError, MemoryError)
+        else error_type
+    )
+    with pytest.raises(expected, match="PNG|encoding"):
+        VisionOcrEngine._write_anonymous_png(  # type: ignore[arg-type]
+            FailingPixmap(),
+            directory,
+        )
+
+    assert list(directory.iterdir()) == []
+    assert set(os.listdir("/dev/fd")) == before_fds
 
 
 def test_default_runner_kills_timed_out_process_group_and_cleans_temp_files(

@@ -159,20 +159,22 @@ def _run_bounded_command(
     if executable is not None:
         popen_arguments["executable"] = os.fspath(executable)
     process = subprocess.Popen(argv, **popen_arguments)  # type: ignore[arg-type]
-    assert process.stdout is not None
-    assert process.stderr is not None
-    selector = selectors.DefaultSelector()
-    streams = {"stdout": process.stdout, "stderr": process.stderr}
+    selector: selectors.BaseSelector | None = None
+    streams: dict[str, object] = {}
     stdout = bytearray()
     stderr = bytearray()
     stderr_truncated = False
     deadline = time.monotonic() + timeout
 
-    for name, stream in streams.items():
-        os.set_blocking(stream.fileno(), False)
-        selector.register(stream, selectors.EVENT_READ, name)
-
     try:
+        if process.stdout is None or process.stderr is None:
+            raise VisionOcrError("Vision helper process pipes were not created")
+        streams = {"stdout": process.stdout, "stderr": process.stderr}
+        selector = selectors.DefaultSelector()
+        for name, stream in streams.items():
+            os.set_blocking(stream.fileno(), False)  # type: ignore[attr-defined]
+            selector.register(stream, selectors.EVENT_READ, name)
+
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -210,9 +212,17 @@ def _run_bounded_command(
         _terminate_process_group(process)
         raise
     finally:
-        selector.close()
-        for stream in streams.values():
-            stream.close()
+        if selector is not None:
+            try:
+                selector.close()
+            except Exception:
+                pass
+        for stream in (process.stdout, process.stderr):
+            if stream is not None:
+                try:
+                    stream.close()
+                except Exception:
+                    pass
 
 
 def _identity_from_stat(metadata: os.stat_result) -> _FileIdentity:
@@ -250,6 +260,17 @@ def _same_directory_identity(
         and current.group == expected.group
         and current.mode == expected.mode
         and stat.S_ISDIR(current.mode)
+    )
+
+
+def _same_created_regular_file(
+    current: _FileIdentity,
+    expected: _FileIdentity,
+) -> bool:
+    return (
+        current.device == expected.device
+        and current.inode == expected.inode
+        and stat.S_ISREG(current.mode)
     )
 
 
@@ -330,6 +351,26 @@ def _add_exception_note(error: BaseException, diagnostic: str) -> None:
         pass
 
 
+def _cleanup_unexposed_named_file(
+    path: Path,
+    expected: _FileIdentity | None,
+) -> str | None:
+    """Remove a just-created private entry before any callback can observe it."""
+
+    if expected is not None:
+        try:
+            current = _identity_from_stat(os.lstat(path))
+        except OSError as exc:
+            return f"OCR temporary PNG cleanup failed: {exc}"
+        if not _same_created_regular_file(current, expected):
+            return "OCR temporary PNG cleanup refused: file identity changed"
+    try:
+        os.unlink(path)
+    except OSError as exc:
+        return f"OCR temporary PNG cleanup failed: {exc}"
+    return None
+
+
 def _cleanup_private_snapshot(snapshot: _ExecutableSnapshot) -> str | None:
     """Remove only the unexposed private snapshot created for this call.
 
@@ -373,12 +414,19 @@ def _cleanup_private_snapshot(snapshot: _ExecutableSnapshot) -> str | None:
 def _verify_codesign(snapshot: _ExecutableSnapshot) -> None:
     if not _path_matches_digest(snapshot.path, snapshot.identity, snapshot.digest):
         raise VisionOcrError("Vision helper snapshot changed before code-sign verification")
-    result = _run_bounded_command(
-        [CODESIGN, "--verify", "--strict", os.fspath(snapshot.path)],
-        environment={"PATH": SAFE_PATH, "LANG": "C", "LC_ALL": "C"},
-        cwd=Path("/"),
-        timeout=_CODESIGN_TIMEOUT_SECONDS,
-    )
+    command = [CODESIGN, "--verify", "--strict", os.fspath(snapshot.path)]
+    try:
+        result = _run_bounded_command(
+            command,
+            environment={"PATH": SAFE_PATH, "LANG": "C", "LC_ALL": "C"},
+            cwd=Path("/"),
+            timeout=_CODESIGN_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise VisionOcrError(
+            "Vision helper code-sign verification timed out after "
+            f"{_CODESIGN_TIMEOUT_SECONDS:g} seconds"
+        ) from exc
     if result.returncode != 0:
         raise VisionOcrError(
             "Vision helper snapshot failed code-sign verification: "
@@ -787,11 +835,25 @@ class VisionOcrEngine:
             dir=directory,
         )
         path = Path(raw_path)
+        named_identity: _FileIdentity | None = None
+        name_is_linked = True
+        primary_error: BaseException | None = None
         try:
+            named_identity = _identity_from_stat(os.lstat(path))
+            if not stat.S_ISREG(named_identity.mode):
+                raise VisionOcrError("OCR temporary PNG must be a regular file")
             os.fchmod(descriptor, 0o600)
             identity = _identity_from_stat(os.fstat(descriptor))
+            if not _same_created_regular_file(identity, named_identity):
+                raise VisionOcrError("OCR temporary PNG identity changed before unlink")
             os.unlink(path)
-            png = pixmap.tobytes("png")
+            name_is_linked = False
+            try:
+                png = pixmap.tobytes("png")
+            except (RuntimeError, MemoryError) as exc:
+                raise VisionOcrError(
+                    f"could not encode OCR temporary PNG: {exc}"
+                ) from exc
             view = memoryview(png)
             while view:
                 written = os.write(descriptor, view)
@@ -811,9 +873,32 @@ class VisionOcrEngine:
             ):
                 raise VisionOcrError("OCR anonymous PNG has an unsafe identity")
             return descriptor, _identity_from_stat(metadata)
-        except BaseException:
-            os.close(descriptor)
+        except OSError as exc:
+            primary_error = VisionOcrError(
+                f"could not create OCR temporary PNG: {exc}"
+            )
+            raise primary_error from exc
+        except BaseException as exc:
+            primary_error = exc
             raise
+        finally:
+            cleanup_error: VisionOcrError | None = None
+            if name_is_linked:
+                cleanup_diagnostic = _cleanup_unexposed_named_file(
+                    path,
+                    named_identity,
+                )
+                if cleanup_diagnostic is not None and primary_error is not None:
+                    _add_exception_note(primary_error, cleanup_diagnostic)
+                elif cleanup_diagnostic is not None:
+                    cleanup_error = VisionOcrError(cleanup_diagnostic)
+            if primary_error is not None or cleanup_error is not None:
+                try:
+                    os.close(descriptor)
+                except OSError:
+                    pass
+            if cleanup_error is not None:
+                raise cleanup_error
 
     @staticmethod
     def _snapshot_helper(

@@ -40,4 +40,3 @@ if __name__ == "__main__":
         # Keep this entrypoint metadata-only; page text is never printed.
         print(f"OCR worker failed: {exc.__class__.__name__}: {str(exc)[:500]}", file=sys.stderr)
         raise SystemExit(1)
-

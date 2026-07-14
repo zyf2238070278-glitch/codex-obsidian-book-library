@@ -1,6 +1,6 @@
 import json
 from collections import UserString
-from dataclasses import FrozenInstanceError, asdict
+from dataclasses import FrozenInstanceError, asdict, dataclass
 from math import inf, nan
 
 import pytest
@@ -11,6 +11,16 @@ from book_agent.ocr import (
     VisionLine,
     VisionPageResult,
 )
+
+
+@dataclass(frozen=True)
+class _ExtendedBoundingBox(BoundingBox):
+    extra: object
+
+
+@dataclass(frozen=True)
+class _ExtendedVisionLine(VisionLine):
+    extra: object
 
 
 def _line(
@@ -97,6 +107,20 @@ def test_vision_line_rejects_blank_text(text: str) -> None:
         _line(text=text)
 
 
+@pytest.mark.parametrize("box", [None, object()])
+def test_vision_line_rejects_non_bounding_box_values(box: object) -> None:
+    with pytest.raises(ValueError, match="box"):
+        VisionLine("文字", 0.9, box)  # type: ignore[arg-type]
+
+
+def test_vision_line_rejects_extended_bounding_box_before_json() -> None:
+    box = _ExtendedBoundingBox(0.1, 0.2, 0.3, 0.4, extra=object())
+
+    with pytest.raises(ValueError, match="box"):
+        line = VisionLine("文字", 0.9, box)
+        json.dumps(asdict(line), ensure_ascii=False, allow_nan=False)
+
+
 @pytest.mark.parametrize("coordinate", [nan, inf, -inf])
 def test_bounding_box_rejects_nonfinite_coordinates(coordinate: float) -> None:
     with pytest.raises(ValueError, match="finite"):
@@ -168,10 +192,38 @@ def test_bounding_box_accepts_exact_normalized_image_bounds() -> None:
     )
 
 
-@pytest.mark.parametrize("schema_version", [0, 2, -1])
-def test_vision_page_result_requires_schema_version_one(schema_version: int) -> None:
+@pytest.mark.parametrize(
+    "schema_version", [0, 2, -1, True, False, 1.0, "1", None]
+)
+def test_vision_page_result_requires_schema_version_one(
+    schema_version: object,
+) -> None:
     with pytest.raises(ValueError, match="schema_version"):
-        VisionPageResult(schema_version=schema_version, lines=())
+        VisionPageResult(  # type: ignore[arg-type]
+            schema_version=schema_version,
+            lines=(),
+        )
+
+
+@pytest.mark.parametrize("lines", [[], (object(),), None])
+def test_vision_page_result_rejects_invalid_line_collections(
+    lines: object,
+) -> None:
+    with pytest.raises(ValueError, match="lines"):
+        VisionPageResult(schema_version=1, lines=lines)  # type: ignore[arg-type]
+
+
+def test_vision_page_result_rejects_extended_line_before_json() -> None:
+    line = _ExtendedVisionLine(
+        "文字",
+        0.9,
+        BoundingBox(0.1, 0.2, 0.3, 0.4),
+        extra=object(),
+    )
+
+    with pytest.raises(ValueError, match="lines"):
+        result = VisionPageResult(schema_version=1, lines=(line,))
+        json.dumps(asdict(result), ensure_ascii=False, allow_nan=False)
 
 
 @pytest.mark.parametrize(
@@ -190,6 +242,24 @@ def test_vision_page_result_requires_schema_version_one(schema_version: int) -> 
     ],
 )
 def test_ocr_job_summary_rejects_invalid_values(field: str, value: object) -> None:
+    with pytest.raises(ValueError, match=field):
+        _summary(**{field: value})
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("total_pages", True),
+        ("total_pages", 8.0),
+        ("completed_pages", False),
+        ("completed_pages", 2.0),
+        ("current_page", True),
+        ("current_page", 3.0),
+    ],
+)
+def test_ocr_job_summary_rejects_bool_and_noninteger_page_counters(
+    field: str, value: object
+) -> None:
     with pytest.raises(ValueError, match=field):
         _summary(**{field: value})
 

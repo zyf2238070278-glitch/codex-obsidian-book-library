@@ -61,7 +61,7 @@ class VisionLine:
             or not 0.0 <= self.confidence <= 1.0
         ):
             raise ValueError("confidence must be finite and between 0 and 1")
-        if not isinstance(self.box, BoundingBox):
+        if type(self.box) is not BoundingBox:
             raise ValueError("box must be a BoundingBox")
 
 
@@ -108,7 +108,7 @@ class VisionPageResult:
                 f"schema_version must be exactly {OCR_SCHEMA_VERSION}"
             )
         if not isinstance(self.lines, tuple) or not all(
-            isinstance(line, VisionLine) for line in self.lines
+            type(line) is VisionLine for line in self.lines
         ):
             raise ValueError("lines must be a tuple of VisionLine values")
 

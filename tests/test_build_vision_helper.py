@@ -2,8 +2,10 @@ from __future__ import annotations
 
 import json
 import os
+import signal
 import stat
 import subprocess
+import time
 from pathlib import Path
 from typing import Mapping
 
@@ -98,6 +100,34 @@ def _source(tmp_path: Path) -> Path:
     return source
 
 
+def _read_process_ids(path: Path) -> tuple[int, int]:
+    deadline = time.monotonic() + 2
+    while time.monotonic() < deadline:
+        if path.is_file():
+            values = path.read_text(encoding="utf-8").split()
+            if len(values) == 2:
+                return int(values[0]), int(values[1])
+        time.sleep(0.01)
+    raise AssertionError("child process did not record leader/child PIDs")
+
+
+def _pid_exists(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    return True
+
+
+def _assert_processes_gone(*process_ids: int) -> None:
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        if not any(_pid_exists(pid) for pid in process_ids):
+            return
+        time.sleep(0.01)
+    assert not [pid for pid in process_ids if _pid_exists(pid)]
+
+
 def test_default_runner_is_non_shell_and_uses_only_supplied_environment(
     tmp_path: Path,
 ) -> None:
@@ -124,29 +154,75 @@ def test_default_runner_is_non_shell_and_uses_only_supplied_environment(
 def test_default_runner_terminates_process_group_at_output_limit(
     tmp_path: Path,
 ) -> None:
+    process_ids = tmp_path / "output-limit.pids"
     environment = {
         "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
         "LANG": "en_US.UTF-8",
         "TMPDIR": str(tmp_path),
         "CLANG_MODULE_CACHE_PATH": str(tmp_path / "module-cache"),
         "SWIFT_MODULECACHE_PATH": str(tmp_path / "module-cache"),
+        "PID_FILE": str(process_ids),
     }
 
-    started = __import__("time").monotonic()
+    started = time.monotonic()
     result = vision_builder._default_run_command(
         [
             "/bin/sh",
             "-c",
-            "/usr/bin/yes bounded-output | /usr/bin/head -c 70000; /bin/sleep 5",
+            "/bin/sleep 30 & child=$!; "
+            "/bin/echo \"$$ $child\" > \"$PID_FILE\"; "
+            "/usr/bin/yes bounded-output | /usr/bin/head -c 70000; wait",
         ],
         environment=environment,
         timeout=0.5,
     )
 
-    assert __import__("time").monotonic() - started < 3
-    assert result.returncode != 0
+    leader_pid, child_pid = _read_process_ids(process_ids)
+    assert time.monotonic() - started < 3
+    assert result.returncode == 125
     assert "truncated" in result.stdout
+    assert "exceeded 65536 bytes" in result.stderr
     assert len(result.stdout.encode("utf-8")) < 70_000
+    _assert_processes_gone(leader_pid, child_pid)
+
+
+def test_default_runner_timeout_kills_group_once_and_reaps_leader_and_child(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    process_ids = tmp_path / "timeout.pids"
+    environment = {
+        "PATH": "/usr/bin:/bin:/usr/sbin:/sbin",
+        "LANG": "en_US.UTF-8",
+        "TMPDIR": str(tmp_path),
+        "CLANG_MODULE_CACHE_PATH": str(tmp_path / "module-cache"),
+        "SWIFT_MODULECACHE_PATH": str(tmp_path / "module-cache"),
+        "PID_FILE": str(process_ids),
+    }
+    kill_calls: list[tuple[int, int]] = []
+    real_killpg = vision_builder.os.killpg
+
+    def tracked_killpg(process_group: int, signal_number: int) -> None:
+        kill_calls.append((process_group, signal_number))
+        real_killpg(process_group, signal_number)
+
+    monkeypatch.setattr(vision_builder.os, "killpg", tracked_killpg)
+
+    with pytest.raises(subprocess.TimeoutExpired, match="timed out"):
+        vision_builder._default_run_command(
+            [
+                "/bin/sh",
+                "-c",
+                "/bin/sleep 30 & child=$!; "
+                "/bin/echo \"$$ $child\" > \"$PID_FILE\"; wait",
+            ],
+            environment=environment,
+            timeout=0.5,
+        )
+
+    leader_pid, child_pid = _read_process_ids(process_ids)
+    assert kill_calls == [(leader_pid, signal.SIGKILL)]
+    _assert_processes_gone(leader_pid, child_pid)
 
 
 def test_builder_uses_exact_non_shell_arm64_pipeline_and_atomically_installs(
@@ -541,8 +617,42 @@ def test_runtime_output_limit_preserves_old_helper_and_cleans_build_directory(
     monkeypatch.setattr(vision_builder, "XCRUN", str(noisy_tool))
     monkeypatch.setattr(vision_builder, "COMPILE_TIMEOUT_SECONDS", 0.5)
 
-    with pytest.raises(VisionHelperBuildError, match="truncated"):
+    with pytest.raises(
+        VisionHelperBuildError,
+        match="exceeded 65536 bytes.*truncated",
+    ):
         build_vision_helper(source=source, output=output)
 
+    assert output.read_bytes() == b"previous helper"
+    assert list(output.parent.glob(".book-vision-ocr-build-*")) == []
+
+
+def test_real_builder_timeout_preserves_old_helper_and_reaps_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    source = _source(tmp_path)
+    output = tmp_path / "bin" / "book-vision-ocr"
+    output.parent.mkdir()
+    output.write_bytes(b"previous helper")
+    output.chmod(0o755)
+    sleepy_tool = tmp_path / "sleepy-tool"
+    process_ids = Path(f"{sleepy_tool}.pids")
+    sleepy_tool.write_text(
+        "#!/bin/sh\n"
+        "/bin/sleep 30 & child=$!\n"
+        "/bin/echo \"$$ $child\" > \"$0.pids\"\n"
+        "wait\n",
+        encoding="utf-8",
+    )
+    sleepy_tool.chmod(0o755)
+    monkeypatch.setattr(vision_builder, "XCRUN", str(sleepy_tool))
+    monkeypatch.setattr(vision_builder, "COMPILE_TIMEOUT_SECONDS", 0.5)
+
+    with pytest.raises(VisionHelperBuildError, match="timed out after 0.5 seconds"):
+        build_vision_helper(source=source, output=output)
+
+    leader_pid, child_pid = _read_process_ids(process_ids)
+    _assert_processes_gone(leader_pid, child_pid)
     assert output.read_bytes() == b"previous helper"
     assert list(output.parent.glob(".book-vision-ocr-build-*")) == []

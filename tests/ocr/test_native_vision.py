@@ -118,6 +118,7 @@ def test_swift_source_uses_required_vision_and_imageio_contract() -> None:
         "maximumImageFileBytes = 64 * 1024 * 1024",
         "maximumImageDimension = 12_000",
         "maximumImagePixels = 40_000_000",
+        "textBudget.add(text)",
     ):
         assert required in source
     assert "maximumUnicodeScalars: Int = 100_000" in text_budget_source

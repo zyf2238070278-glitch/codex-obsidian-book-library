@@ -119,7 +119,6 @@ def _default_run_command(
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                terminate_process_group()
                 raise subprocess.TimeoutExpired(argv, timeout)
             events = selector.select(timeout=min(remaining, 0.1))
             for key, _ in events:
@@ -143,6 +142,16 @@ def _default_run_command(
                 break
 
         if truncated_stream is not None:
+            stderr = _render_output(
+                buffers["stderr"],
+                truncated=truncated_stream == "stderr",
+            )
+            if stderr:
+                stderr += "\n"
+            stderr += (
+                f"command output exceeded {MAXIMUM_COMMAND_OUTPUT_BYTES} bytes; "
+                "output truncated"
+            )
             return subprocess.CompletedProcess(
                 argv,
                 OUTPUT_LIMIT_EXIT_CODE,
@@ -150,15 +159,11 @@ def _default_run_command(
                     buffers["stdout"],
                     truncated=truncated_stream == "stdout",
                 ),
-                _render_output(
-                    buffers["stderr"],
-                    truncated=truncated_stream == "stderr",
-                ),
+                stderr,
             )
 
         remaining = deadline - time.monotonic()
         if remaining <= 0:
-            terminate_process_group()
             raise subprocess.TimeoutExpired(argv, timeout)
         return_code = process.wait(timeout=remaining)
         return subprocess.CompletedProcess(

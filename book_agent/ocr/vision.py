@@ -12,7 +12,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Callable, Mapping, Protocol
+from typing import Mapping, Protocol
 
 import fitz
 
@@ -111,10 +111,17 @@ class _FileIdentity:
 @dataclass(frozen=True)
 class _ExecutableSnapshot:
     directory: Path
+    directory_identity: _FileIdentity
     path: Path
     descriptor: int
     identity: _FileIdentity
     digest: str
+
+
+@dataclass(frozen=True)
+class _DefaultRunOutcome:
+    result: subprocess.CompletedProcess[bytes]
+    cleanup_diagnostic: str | None
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -137,7 +144,6 @@ def _run_bounded_command(
     timeout: float,
     executable: Path | None = None,
     pass_fds: tuple[int, ...] = (),
-    after_spawn: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
     popen_arguments: dict[str, object] = {
         "stdin": subprocess.DEVNULL,
@@ -153,12 +159,6 @@ def _run_bounded_command(
     if executable is not None:
         popen_arguments["executable"] = os.fspath(executable)
     process = subprocess.Popen(argv, **popen_arguments)  # type: ignore[arg-type]
-    if after_spawn is not None:
-        try:
-            after_spawn()
-        except BaseException:
-            _terminate_process_group(process)
-            raise
     assert process.stdout is not None
     assert process.stderr is not None
     selector = selectors.DefaultSelector()
@@ -239,6 +239,20 @@ def _mode_allows_effective_execute(identity: _FileIdentity) -> bool:
     return bool(identity.mode & stat.S_IXOTH)
 
 
+def _same_directory_identity(
+    current: _FileIdentity,
+    expected: _FileIdentity,
+) -> bool:
+    return (
+        current.device == expected.device
+        and current.inode == expected.inode
+        and current.owner == expected.owner
+        and current.group == expected.group
+        and current.mode == expected.mode
+        and stat.S_ISDIR(current.mode)
+    )
+
+
 def _open_regular_nofollow(path: Path, *, description: str) -> tuple[int, _FileIdentity]:
     flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
     try:
@@ -309,9 +323,51 @@ def _path_matches_digest(
             os.close(descriptor)
 
 
-def _remove_private_snapshot_name(snapshot: _ExecutableSnapshot) -> None:
-    os.unlink(snapshot.path)
-    os.rmdir(snapshot.directory)
+def _add_exception_note(error: BaseException, diagnostic: str) -> None:
+    try:
+        error.add_note(diagnostic)
+    except AttributeError:
+        pass
+
+
+def _cleanup_private_snapshot(snapshot: _ExecutableSnapshot) -> str | None:
+    """Remove only the unexposed private snapshot created for this call.
+
+    Identity checks prevent accidental replacement cleanup. As documented at
+    launch, this path-based boundary does not resist a hostile same-UID process
+    racing the final check and unlink on Darwin.
+    """
+
+    try:
+        directory_metadata = os.lstat(snapshot.directory)
+    except OSError as exc:
+        return f"Vision helper private cleanup failed: call directory: {exc}"
+    if not _same_directory_identity(
+        _identity_from_stat(directory_metadata),
+        snapshot.directory_identity,
+    ):
+        return (
+            "Vision helper private cleanup refused: call directory identity changed"
+        )
+    if not _path_matches_digest(snapshot.path, snapshot.identity, snapshot.digest):
+        return "Vision helper private cleanup refused: snapshot identity changed"
+    try:
+        os.unlink(snapshot.path)
+    except OSError as exc:
+        return f"Vision helper private cleanup failed: snapshot unlink: {exc}"
+    try:
+        current_directory = _identity_from_stat(os.lstat(snapshot.directory))
+        if not _same_directory_identity(
+            current_directory,
+            snapshot.directory_identity,
+        ):
+            return (
+                "Vision helper private cleanup refused: call directory identity changed"
+            )
+        os.rmdir(snapshot.directory)
+    except OSError as exc:
+        return f"Vision helper private cleanup failed: call directory removal: {exc}"
+    return None
 
 
 def _verify_codesign(snapshot: _ExecutableSnapshot) -> None:
@@ -335,24 +391,41 @@ def _verify_codesign(snapshot: _ExecutableSnapshot) -> None:
 def _default_run_helper(
     request: RunRequest,
     snapshot: _ExecutableSnapshot,
-) -> subprocess.CompletedProcess[bytes]:
-    _verify_codesign(snapshot)
-    if not _path_matches_digest(snapshot.path, snapshot.identity, snapshot.digest):
-        raise VisionOcrError("Vision helper snapshot changed immediately before launch")
+) -> _DefaultRunOutcome:
+    result: subprocess.CompletedProcess[bytes] | None = None
+    primary_error: BaseException | None = None
+    cleanup_diagnostic: str | None = None
+    try:
+        _verify_codesign(snapshot)
+        if not _path_matches_digest(snapshot.path, snapshot.identity, snapshot.digest):
+            raise VisionOcrError(
+                "Vision helper snapshot changed immediately before launch"
+            )
 
-    # Darwin has no public fexecve/execveat and does not execute Mach-O from
-    # /dev/fd. The random 0700 directory is therefore the strongest public-API
-    # boundary available here. It is not claimed to resist a hostile same-UID
-    # process. Popen reports exec failure before returning; remove the private
-    # name immediately after that point while the child keeps its executable.
-    return _run_bounded_command(
-        list(request.argv),
-        environment=dict(request.environment),
-        cwd=request.cwd,
-        timeout=request.timeout,
-        executable=snapshot.path,
-        pass_fds=request.pass_fds,
-        after_spawn=lambda: _remove_private_snapshot_name(snapshot),
+        # Darwin has no public fexecve/execveat and does not execute Mach-O from
+        # /dev/fd. The random 0700 directory is therefore the strongest public-API
+        # boundary available here. It is not claimed to resist a hostile same-UID
+        # process. Swift/Foundation may lazily map the executable, so the private
+        # name must remain until stdout/stderr are drained and the child is reaped.
+        result = _run_bounded_command(
+            list(request.argv),
+            environment=dict(request.environment),
+            cwd=request.cwd,
+            timeout=request.timeout,
+            executable=snapshot.path,
+            pass_fds=request.pass_fds,
+        )
+    except BaseException as exc:
+        primary_error = exc
+        raise
+    finally:
+        cleanup_diagnostic = _cleanup_private_snapshot(snapshot)
+        if cleanup_diagnostic is not None and primary_error is not None:
+            _add_exception_note(primary_error, cleanup_diagnostic)
+    assert result is not None
+    return _DefaultRunOutcome(
+        result=result,
+        cleanup_diagnostic=cleanup_diagnostic,
     )
 
 
@@ -755,6 +828,12 @@ class VisionOcrEngine:
         descriptor = -1
         succeeded = False
         try:
+            directory_identity = _identity_from_stat(os.lstat(directory))
+            if (
+                not stat.S_ISDIR(directory_identity.mode)
+                or stat.S_IMODE(directory_identity.mode) != 0o700
+            ):
+                raise VisionOcrError("Vision helper call directory is not private")
             descriptor = os.open(
                 snapshot,
                 os.O_RDWR
@@ -813,6 +892,7 @@ class VisionOcrEngine:
             succeeded = True
             return _ExecutableSnapshot(
                 directory=directory,
+                directory_identity=directory_identity,
                 path=snapshot,
                 descriptor=descriptor,
                 identity=snapshot_identity,
@@ -834,6 +914,9 @@ class VisionOcrEngine:
         png_descriptor = -1
         call_directory: Path | None = None
         snapshot: _ExecutableSnapshot | None = None
+        snapshot_cleanup_attempted = False
+        default_cleanup_diagnostic: str | None = None
+        primary_error: BaseException | None = None
         try:
             helper_descriptor, helper_identity, helper_digest = self._validate_helper()
             temp_root = self._prepare_temp_root()
@@ -867,24 +950,18 @@ class VisionOcrEngine:
                 pass_fds=(png_descriptor,),
             )
             if self._run_helper is None:
-                runner: Callable[[RunRequest], subprocess.CompletedProcess[bytes | str]] = (
-                    lambda value: _default_run_helper(value, snapshot)
-                )
+                snapshot_cleanup_attempted = True
+                outcome = _default_run_helper(request, snapshot)
+                result: subprocess.CompletedProcess[bytes | str] = outcome.result
+                default_cleanup_diagnostic = outcome.cleanup_diagnostic
             else:
                 # Test/injected runners receive only the public descriptor contract.
                 # Remove every private name before invoking external callback code.
-                _remove_private_snapshot_name(snapshot)
-                runner = self._run_helper
-            try:
-                result = runner(request)
-            except subprocess.TimeoutExpired as exc:
-                raise VisionOcrError(
-                    f"Vision helper timed out after {HELPER_TIMEOUT_SECONDS:g} seconds"
-                ) from exc
-            except VisionOcrError:
-                raise
-            except (OSError, subprocess.SubprocessError, TypeError) as exc:
-                raise VisionOcrError(f"could not run Vision helper: {exc}") from exc
+                snapshot_cleanup_attempted = True
+                cleanup_diagnostic = _cleanup_private_snapshot(snapshot)
+                if cleanup_diagnostic is not None:
+                    raise VisionOcrError(cleanup_diagnostic)
+                result = self._run_helper(request)
 
             source_digest, source_size = _hash_descriptor(
                 helper_descriptor,
@@ -916,7 +993,34 @@ class VisionOcrEngine:
                     f"Vision helper failed with exit code {result.returncode}: "
                     f"{_safe_diagnostic(result.stderr)}"
                 )
-            return _parse_helper_output(result.stdout)
+            parsed = _parse_helper_output(result.stdout)
+            if default_cleanup_diagnostic is not None:
+                cleanup_error = VisionOcrError(default_cleanup_diagnostic)
+                default_cleanup_diagnostic = None
+                raise cleanup_error
+            return parsed
+        except subprocess.TimeoutExpired as exc:
+            primary_error = VisionOcrError(
+                f"Vision helper timed out after {HELPER_TIMEOUT_SECONDS:g} seconds"
+            )
+            for note in getattr(exc, "__notes__", ()):
+                _add_exception_note(primary_error, note)
+            raise primary_error from exc
+        except VisionOcrError as exc:
+            primary_error = exc
+            if default_cleanup_diagnostic is not None:
+                _add_exception_note(exc, default_cleanup_diagnostic)
+            raise
+        except (OSError, subprocess.SubprocessError, TypeError) as exc:
+            primary_error = VisionOcrError(f"could not run Vision helper: {exc}")
+            for note in getattr(exc, "__notes__", ()):
+                _add_exception_note(primary_error, note)
+            raise primary_error from exc
+        except BaseException as exc:
+            primary_error = exc
+            if default_cleanup_diagnostic is not None:
+                _add_exception_note(exc, default_cleanup_diagnostic)
+            raise
         finally:
             for descriptor in (
                 png_descriptor,
@@ -928,16 +1032,22 @@ class VisionOcrEngine:
                         os.close(descriptor)
                     except OSError:
                         pass
-            if snapshot is not None:
-                try:
-                    os.unlink(snapshot.path)
-                except FileNotFoundError:
-                    pass
-            if call_directory is not None:
+            final_cleanup_diagnostic: str | None = None
+            if snapshot is not None and not snapshot_cleanup_attempted:
+                final_cleanup_diagnostic = _cleanup_private_snapshot(snapshot)
+            elif snapshot is None and call_directory is not None:
                 try:
                     os.rmdir(call_directory)
-                except FileNotFoundError:
-                    pass
+                except OSError as exc:
+                    final_cleanup_diagnostic = (
+                        "Vision helper private cleanup failed: "
+                        f"call directory removal: {exc}"
+                    )
+            if final_cleanup_diagnostic is not None:
+                if primary_error is not None:
+                    _add_exception_note(primary_error, final_cleanup_diagnostic)
+                else:
+                    raise VisionOcrError(final_cleanup_diagnostic)
 
 
 __all__ = [

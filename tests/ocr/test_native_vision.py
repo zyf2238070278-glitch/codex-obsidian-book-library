@@ -10,6 +10,8 @@ from pathlib import Path
 
 import pytest
 
+from book_agent.ocr import vision as vision_module
+from book_agent.ocr.vision import VisionOcrEngine, VisionOcrError
 from scripts.build_vision_helper import build_vision_helper
 
 
@@ -97,6 +99,23 @@ def _write_synthetic_image(tmp_path: Path) -> Path:
     pixmap.save(image)
     document.close()
     return image
+
+
+def _write_synthetic_pdf(tmp_path: Path) -> Path:
+    fitz = pytest.importorskip("fitz")
+    document = fitz.open()
+    page = document.new_page(width=600, height=300)
+    page.insert_text(
+        (40, 150),
+        "VISION ENGINE 123",
+        fontsize=48,
+        fontname="helv",
+        color=(0, 0, 0),
+    )
+    pdf = tmp_path / "synthetic-engine.pdf"
+    document.save(pdf)
+    document.close()
+    return pdf
 
 
 def test_swift_source_uses_required_vision_and_imageio_contract() -> None:
@@ -208,6 +227,51 @@ def test_native_helper_recognizes_synthetic_image_with_normalized_native_json(
         if previous_key is not None:
             assert previous_key <= key
         previous_key = key
+
+
+@pytest.mark.macos_vision
+def test_engine_default_runner_keeps_native_snapshot_until_vision_exits(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf = _write_synthetic_pdf(tmp_path)
+    temp_root = tmp_path / "ocr-temp"
+    vision_helper = PROJECT_ROOT / "bin" / "book-vision-ocr"
+    assert vision_helper.is_file()
+    real_bounded = vision_module._run_bounded_command
+    observed_during_run: list[tuple[Path, bool, bool]] = []
+
+    def tracked_bounded(
+        argv: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        executable = kwargs.get("executable")
+        if executable is None:
+            return real_bounded(argv, **kwargs)  # type: ignore[arg-type]
+        snapshot = Path(executable)
+        existed_before = snapshot.is_file()
+        result = real_bounded(argv, **kwargs)  # type: ignore[arg-type]
+        observed_during_run.append((snapshot, existed_before, snapshot.is_file()))
+        return result
+
+    monkeypatch.setattr(vision_module, "_run_bounded_command", tracked_bounded)
+    try:
+        result = VisionOcrEngine(
+            helper=vision_helper.resolve(),
+            temp_root=temp_root,
+        ).recognize_page(pdf.resolve(), page_index=0)
+    except VisionOcrError as exc:
+        assert "exit code 2" in str(exc)
+        assert "exit code -11" not in str(exc)
+    else:
+        assert "VISION" in result.ordered_text().upper()
+
+    assert len(observed_during_run) == 1
+    snapshot, existed_before, existed_after_process_exit = observed_during_run[0]
+    assert existed_before is True
+    assert existed_after_process_exit is True
+    assert not snapshot.exists()
+    assert list(temp_root.iterdir()) == []
 
 
 @pytest.mark.macos_vision

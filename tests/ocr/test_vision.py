@@ -184,7 +184,7 @@ def test_default_process_runner_explicitly_disables_shell_and_inheritance(
             self.pid = 999_999
 
         def wait(self, timeout: float) -> int:
-            assert not Path(captured["executable"]).exists()
+            assert Path(captured["executable"]).is_file()
             return 0
 
     def fake_popen(argv: list[str], **kwargs: object) -> FakeProcess:
@@ -215,6 +215,7 @@ def test_default_process_runner_explicitly_disables_shell_and_inheritance(
         "zh-Hans,en-US",
     ]
     assert captured["pass_fds"] == (image_fd,)
+    assert not Path(captured["executable"]).exists()
     assert list((tmp_path / "ocr-temp").iterdir()) == []
 
 
@@ -295,6 +296,224 @@ def test_codesign_verification_is_fixed_bounded_and_rechecks_snapshot(
         "LANG": "C",
         "LC_ALL": "C",
     }
+
+
+def _private_snapshot_fixture(
+    tmp_path: Path,
+) -> tuple[vision_module._ExecutableSnapshot, int]:
+    helper = _helper(tmp_path)
+    engine = VisionOcrEngine(helper=helper, temp_root=tmp_path / "ocr-temp")
+    source_fd, identity, digest = engine._validate_helper()
+    temp_root = engine._prepare_temp_root()
+    directory = engine._create_call_directory(temp_root)
+    return engine._snapshot_helper(source_fd, directory, identity, digest), source_fd
+
+
+@pytest.mark.parametrize(
+    "outcome",
+    ["success", "nonzero", "timeout", "output-limit", "interrupt", "popen"],
+)
+def test_default_runner_keeps_snapshot_until_bounded_command_finishes_then_cleans(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    outcome: str,
+) -> None:
+    snapshot, source_fd = _private_snapshot_fixture(tmp_path)
+    request = RunRequest(
+        argv=(str(tmp_path / "book-vision-ocr"), "--version"),
+        environment=(("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),),
+        cwd=Path("/"),
+        timeout=120.0,
+        pass_fds=(),
+    )
+
+    def fake_bounded(
+        argv: list[str],
+        **kwargs: object,
+    ) -> subprocess.CompletedProcess[bytes]:
+        assert snapshot.path.is_file()
+        assert snapshot.directory.is_dir()
+        assert "after_spawn" not in kwargs
+        if outcome == "timeout":
+            raise subprocess.TimeoutExpired(argv, 120)
+        if outcome == "output-limit":
+            raise VisionOcrError("synthetic output limit")
+        if outcome == "interrupt":
+            raise KeyboardInterrupt()
+        if outcome == "popen":
+            raise OSError("synthetic Popen failure")
+        return subprocess.CompletedProcess(
+            argv,
+            9 if outcome == "nonzero" else 0,
+            b"",
+            b"",
+        )
+
+    monkeypatch.setattr(vision_module, "_verify_codesign", lambda value: None)
+    monkeypatch.setattr(vision_module, "_run_bounded_command", fake_bounded)
+    try:
+        if outcome == "timeout":
+            with pytest.raises(subprocess.TimeoutExpired):
+                vision_module._default_run_helper(request, snapshot)
+        elif outcome == "output-limit":
+            with pytest.raises(VisionOcrError, match="output limit"):
+                vision_module._default_run_helper(request, snapshot)
+        elif outcome == "interrupt":
+            with pytest.raises(KeyboardInterrupt):
+                vision_module._default_run_helper(request, snapshot)
+        elif outcome == "popen":
+            with pytest.raises(OSError, match="Popen"):
+                vision_module._default_run_helper(request, snapshot)
+        else:
+            vision_module._default_run_helper(request, snapshot)
+
+        assert not snapshot.path.exists()
+        assert not snapshot.directory.exists()
+    finally:
+        os.close(snapshot.descriptor)
+        os.close(source_fd)
+        if snapshot.path.exists():
+            snapshot.path.unlink()
+        if snapshot.directory.exists():
+            snapshot.directory.rmdir()
+
+
+def test_default_runner_reports_cleanup_failure_without_masking_primary_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot, source_fd = _private_snapshot_fixture(tmp_path)
+    request = RunRequest(
+        argv=(str(tmp_path / "book-vision-ocr"), "--version"),
+        environment=(("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),),
+        cwd=Path("/"),
+        timeout=120.0,
+        pass_fds=(),
+    )
+    real_unlink = os.unlink
+
+    def fail_snapshot_unlink(path: object, *args: object, **kwargs: object) -> None:
+        if Path(path) == snapshot.path:
+            raise PermissionError("synthetic cleanup failure")
+        real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(vision_module, "_verify_codesign", lambda value: None)
+    monkeypatch.setattr(
+        vision_module,
+        "_run_bounded_command",
+        lambda argv, **kwargs: (_ for _ in ()).throw(KeyboardInterrupt()),
+    )
+    monkeypatch.setattr(vision_module.os, "unlink", fail_snapshot_unlink)
+    try:
+        with pytest.raises(KeyboardInterrupt) as captured:
+            vision_module._default_run_helper(request, snapshot)
+        assert any(
+            "cleanup" in note.lower()
+            for note in getattr(captured.value, "__notes__", ())
+        )
+    finally:
+        monkeypatch.setattr(vision_module.os, "unlink", real_unlink)
+        os.close(snapshot.descriptor)
+        os.close(source_fd)
+        if snapshot.path.exists():
+            snapshot.path.unlink()
+        if snapshot.directory.exists():
+            snapshot.directory.rmdir()
+
+
+def test_private_cleanup_refuses_replaced_snapshot_without_unlinking_it(
+    tmp_path: Path,
+) -> None:
+    snapshot, source_fd = _private_snapshot_fixture(tmp_path)
+    replacement = tmp_path / "external-synthetic-file"
+    replacement_bytes = b"synthetic external content must survive"
+    replacement.write_bytes(replacement_bytes)
+    os.replace(replacement, snapshot.path)
+    try:
+        diagnostic = vision_module._cleanup_private_snapshot(snapshot)
+
+        assert diagnostic is not None and "refused" in diagnostic
+        assert snapshot.path.read_bytes() == replacement_bytes
+        assert snapshot.directory.is_dir()
+    finally:
+        os.close(snapshot.descriptor)
+        os.close(source_fd)
+        if snapshot.path.exists():
+            snapshot.path.unlink()
+        if snapshot.directory.exists():
+            snapshot.directory.rmdir()
+
+
+def test_nonzero_default_run_preserves_exit_error_and_cleans_snapshot(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf = _write_pdf(tmp_path / "book.pdf")
+    helper = _helper(tmp_path)
+    monkeypatch.setattr(vision_module, "_verify_codesign", lambda value: None)
+    monkeypatch.setattr(
+        vision_module,
+        "_run_bounded_command",
+        lambda argv, **kwargs: subprocess.CompletedProcess(
+            argv,
+            9,
+            b"",
+            b"synthetic nonzero",
+        ),
+    )
+
+    with pytest.raises(VisionOcrError, match="exit code 9.*synthetic nonzero"):
+        VisionOcrEngine(
+            helper=helper,
+            temp_root=tmp_path / "ocr-temp",
+        ).recognize_page(pdf, page_index=0)
+
+    assert list((tmp_path / "ocr-temp").iterdir()) == []
+
+
+def test_successful_default_run_converts_cleanup_failure_to_vision_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    pdf = _write_pdf(tmp_path / "book.pdf")
+    helper = _helper(tmp_path)
+    real_unlink = os.unlink
+    blocked_paths: list[Path] = []
+
+    def fail_private_snapshot_unlink(
+        path: object,
+        *args: object,
+        **kwargs: object,
+    ) -> None:
+        candidate = Path(path)
+        if (
+            candidate.name == "book-vision-ocr"
+            and candidate.parent.name.startswith("vision-call-")
+        ):
+            blocked_paths.append(candidate)
+            raise PermissionError("synthetic cleanup failure")
+        real_unlink(path, *args, **kwargs)  # type: ignore[arg-type]
+
+    monkeypatch.setattr(vision_module, "_verify_codesign", lambda value: None)
+    monkeypatch.setattr(
+        vision_module,
+        "_run_bounded_command",
+        lambda argv, **kwargs: subprocess.CompletedProcess(argv, 0, _payload(), b""),
+    )
+    monkeypatch.setattr(vision_module.os, "unlink", fail_private_snapshot_unlink)
+    try:
+        with pytest.raises(VisionOcrError, match="cleanup"):
+            VisionOcrEngine(
+                helper=helper,
+                temp_root=tmp_path / "ocr-temp",
+            ).recognize_page(pdf, page_index=0)
+    finally:
+        monkeypatch.setattr(vision_module.os, "unlink", real_unlink)
+        for path in blocked_paths:
+            if path.exists():
+                path.unlink()
+            if path.parent.exists():
+                path.parent.rmdir()
 
 
 def test_call_directory_creation_failure_does_not_leave_named_artifacts(

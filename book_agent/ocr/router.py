@@ -41,19 +41,17 @@ def _result_fields(result: Any) -> tuple[str, tuple[Any, ...], float | None]:
 
 
 class LocalOcrRouter:
-    """Bounded local fallback order: Vision, RapidOCR, then Tesseract."""
+    """Bounded local fallback order: Apple Vision, then RapidOCR."""
 
     def __init__(
         self,
         *,
         vision: VisionPageEngine,
         rapid: ImagePageEngine,
-        tesseract: ImagePageEngine,
         renderer: RenderPlanner | None = None,
     ) -> None:
         self._vision = vision
         self._rapid = rapid
-        self._tesseract = tesseract
         self._renderer = RenderPlanner() if renderer is None else renderer
 
     @staticmethod
@@ -106,10 +104,7 @@ class LocalOcrRouter:
         directory: tempfile.TemporaryDirectory[str] | None = None
         try:
             directory, image, ink_ratio = self._render_image(pdf, page_index)
-            for engine_name, engine, strategy in (
-                ("rapidocr", self._rapid, "enhanced"),
-                ("tesseract", self._tesseract, "enhanced"),
-            ):
+            for engine_name, engine, strategy in (("rapidocr", self._rapid, "enhanced"),):
                 try:
                     attempts.append(f"{strategy}:{engine_name}")
                     accepted = self._accepted(

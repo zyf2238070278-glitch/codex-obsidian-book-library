@@ -47,16 +47,14 @@ class _ImageEngine:
 
 def test_router_stops_after_accepted_vision_result(tmp_path: Path) -> None:
     rapid = _ImageEngine(AssertionError("must not run"))
-    tesseract = _ImageEngine(AssertionError("must not run"))
     decision = LocalOcrRouter(
         vision=_Vision(_result("Vision text", engine="apple_vision")),
         rapid=rapid,
-        tesseract=tesseract,
     ).recognize_page(_pdf(tmp_path / "book.pdf"), page_index=0)
 
     assert decision.outcome.engine == "apple_vision"
     assert decision.text == "Vision text"
-    assert not rapid.called and not tesseract.called
+    assert not rapid.called
 
 
 def test_router_uses_rapid_after_low_quality_vision(tmp_path: Path) -> None:
@@ -64,7 +62,6 @@ def test_router_uses_rapid_after_low_quality_vision(tmp_path: Path) -> None:
     decision = LocalOcrRouter(
         vision=_Vision(_result("\ufffd\ufffd", engine="apple_vision")),
         rapid=rapid,
-        tesseract=_ImageEngine(AssertionError("must not run")),
     ).recognize_page(_pdf(tmp_path / "book.pdf"), page_index=0)
 
     assert decision.outcome.engine == "rapidocr"
@@ -76,7 +73,6 @@ def test_router_returns_skipped_after_all_local_strategies_fail(tmp_path: Path) 
     decision = LocalOcrRouter(
         vision=_Vision(RuntimeError("vision unavailable")),
         rapid=_ImageEngine(RuntimeError("rapid unavailable")),
-        tesseract=_ImageEngine(RuntimeError("tesseract unavailable")),
     ).recognize_page(_pdf(tmp_path / "book.pdf"), page_index=0)
 
     assert decision.outcome.status == "skipped"

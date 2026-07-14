@@ -45,16 +45,6 @@ def _legacy_vision_fixture(
         helper.parent.mkdir(parents=True, exist_ok=True)
         helper.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 64)
         helper.chmod(0o755)
-        tesseract = project_root / "bin" / "tesseract"
-        tesseract.write_text("#!/bin/sh\n", encoding="utf-8")
-        tesseract.chmod(0o755)
-        runtime_lib = project_root / "lib" / "libtesseract.dylib"
-        runtime_lib.parent.mkdir(parents=True, exist_ok=True)
-        runtime_lib.write_bytes(b"runtime")
-        tessdata = project_root / "data" / "ocr-models" / "tessdata"
-        tessdata.mkdir(parents=True, exist_ok=True)
-        for language in ("chi_sim", "chi_tra", "eng"):
-            (tessdata / f"{language}.traineddata").write_bytes(b"data")
         original_runner = kwargs.get("run_command")
 
         def runner(argv: list[str], **runner_kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -122,11 +112,6 @@ def test_install_uses_default_vault_and_creates_runtime_directories(
         assert not (expected_vault / obsolete).exists()
 
 
-def test_tesseract_runtime_requires_binary_library_and_languages(tmp_path: Path) -> None:
-    project_root = tmp_path / "release"
-
-    with pytest.raises(install_macos.InstallError, match="Tesseract"):
-        install_macos._validate_tesseract_runtime(project_root)
 
 
 def test_install_uses_explicit_vault_and_codex_config(tmp_path: Path) -> None:

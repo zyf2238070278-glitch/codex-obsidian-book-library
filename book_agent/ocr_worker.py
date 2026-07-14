@@ -10,7 +10,6 @@ from book_agent.embeddings import E5EmbeddingProvider
 from book_agent.indexing import BookIndexer
 from book_agent.ocr.rapid import RapidOcrEngine
 from book_agent.ocr.router import LocalOcrRouter
-from book_agent.ocr.tesseract import TesseractEngine
 from book_agent.ocr.vision import VisionOcrEngine
 from book_agent.ocr.worker import OcrWorker
 from book_agent.storage import Database
@@ -31,10 +30,6 @@ def main() -> int:
     router = LocalOcrRouter(
         vision=VisionOcrEngine(helper=paths.vision_helper, temp_root=paths.ocr),
         rapid=RapidOcrEngine(paths.ocr_models / "rapidocr"),
-        tesseract=TesseractEngine(
-            binary=paths.root / "bin" / "tesseract",
-            tessdata=paths.ocr_models / "tessdata",
-        ),
     )
     worker = OcrWorker(paths, database, router, indexer)
     worker.run_until_empty()

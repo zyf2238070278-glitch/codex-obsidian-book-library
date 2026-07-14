@@ -9,17 +9,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Iterator
 
-import numpy as np
-
-from book_agent.chunking import chunk_book
 from book_agent.config import AppPaths
-from book_agent.embeddings import encode_vector
+from book_agent.indexing import BookIndexer
 from book_agent.parsers import (
     SUPPORTED_EXTENSIONS,
     NeedsOcrError,
     parse_document,
 )
-from book_agent.rendering import render_parsed_book
 from book_agent.storage import Database
 from book_agent.vault import ImportedOriginal, VaultManager
 
@@ -96,6 +92,7 @@ class ImportService:
         embedding_provider: Any,
         *,
         vault_root_identity: tuple[int, int] | None = None,
+        indexer: BookIndexer | None = None,
     ) -> None:
         self.paths = paths
         self.database = database
@@ -104,6 +101,16 @@ class ImportService:
         self.vault = VaultManager(
             paths,
             vault_root_identity=vault_root_identity,
+        )
+        self.indexer = (
+            indexer
+            if indexer is not None
+            else BookIndexer(
+                paths,
+                database,
+                embedding_provider,
+                vault_root_identity=vault_root_identity,
+            )
         )
 
     def import_book(
@@ -346,36 +353,6 @@ class ImportService:
                     original.path,
                     original.identity,
                 )
-            self.database.update_book_metadata(book_id, parsed.title, parsed.author)
-            destination = self.paths.parsed / book_id / "正文.md"
-            markdown_path = destination.relative_to(self.paths.vault).as_posix()
-            passages = chunk_book(book_id, parsed, markdown_path)
-            if not passages:
-                raise ValueError("解析完成，但没有生成可检索段落。")
-            render_parsed_book(
-                destination,
-                book_id,
-                parsed,
-                original.path,
-                passages,
-                managed_root=self.paths.vault,
-                expected_root_identity=self.vault_root_identity,
-            )
-            parsed_path = str(destination.absolute())
-            self.database.replace_passages(book_id, passages)
-            passage_count = len(passages)
-
-            status, error, message = self._build_semantic_index(passages)
-            return self._finalize(
-                book_id=book_id,
-                status=status,
-                source_format=source_format,
-                original_path=original_path,
-                parsed_path=parsed_path,
-                passage_count=passage_count,
-                error=error,
-                message=message,
-            )
         except NeedsOcrError as error:
             detail = _error_detail(error)
             return self._finalize(
@@ -414,6 +391,21 @@ class ImportService:
                     "记录导入中断状态时失败：" + _error_detail(status_error)
                 )
             raise
+
+        indexed = self.indexer.index_parsed_book(
+            book_id=book_id,
+            parsed=parsed,
+            original_path=original.path,
+        )
+        return ImportResult(
+            book_id=book_id,
+            status=indexed.status,
+            source_format=source_format,
+            original_path=original_path,
+            parsed_path=indexed.parsed_path,
+            passage_count=indexed.passage_count,
+            message=indexed.message,
+        )
 
     @contextmanager
     def _book_lock(self, book_id: str) -> Iterator[None]:
@@ -557,69 +549,6 @@ class ImportService:
             self._remove_imported_original(original)
         except BaseException as cleanup_error:
             failure.add_note(f"{context}：{_error_detail(cleanup_error)}")
-
-    def _build_semantic_index(
-        self, passages: list[Any]
-    ) -> tuple[str, str | None, str]:
-        try:
-            if not self.embedding_provider.available:
-                message = (
-                    "导入完成；语义模型未启用，当前可使用关键词检索，"
-                    "稍后启用模型即可恢复语义索引。"
-                )
-                return "keyword_only", message, message
-
-            vectors = list(
-                self.embedding_provider.embed_passages(
-                    [passage.text for passage in passages]
-                )
-            )
-            if len(vectors) != len(passages):
-                raise ValueError(
-                    "语义向量数量不匹配："
-                    f"应有 {len(passages)} 个，实际得到 {len(vectors)} 个。"
-                )
-            normalized_vectors = self._validated_vectors(vectors)
-            encoded = {
-                passage.passage_id: encode_vector(vector)
-                for passage, vector in zip(
-                    passages, normalized_vectors, strict=True
-                )
-            }
-            self.database.set_embeddings(encoded)
-        except Exception as error:
-            detail = _error_detail(error)
-            message = f"语义索引失败，可稍后恢复：{detail}"
-            return "keyword_only", message, message
-
-        return "ready", None, "导入完成，关键词与语义索引均已就绪。"
-
-    @staticmethod
-    def _validated_vectors(vectors: list[Any]) -> list[np.ndarray]:
-        normalized_vectors: list[np.ndarray] = []
-        expected_dimension: int | None = None
-        for ordinal, vector in enumerate(vectors, start=1):
-            try:
-                normalized = np.asarray(vector, dtype=np.float32)
-            except (TypeError, ValueError, OverflowError) as error:
-                raise ValueError(
-                    f"第 {ordinal} 个语义向量无法转换为 float32。"
-                ) from error
-            if normalized.ndim != 1:
-                raise ValueError(f"第 {ordinal} 个语义向量必须是一维数组。")
-            if normalized.size == 0:
-                raise ValueError(f"第 {ordinal} 个语义向量不能为空。")
-            if not np.all(np.isfinite(normalized)):
-                raise ValueError(f"第 {ordinal} 个语义向量必须全部是有限数值。")
-            if expected_dimension is None:
-                expected_dimension = int(normalized.size)
-            elif normalized.size != expected_dimension:
-                raise ValueError(
-                    "所有语义向量必须维度一致："
-                    f"期望 {expected_dimension}，第 {ordinal} 个为 {normalized.size}。"
-                )
-            normalized_vectors.append(np.ascontiguousarray(normalized))
-        return normalized_vectors
 
     def _finalize(
         self,

@@ -2,7 +2,7 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Add resumable, background, fully local Apple Vision OCR for scanned PDFs, expose it through Codex MCP tools, validate it on a real Chinese book, and publish a macOS Apple Silicon `v0.2.0-beta.1` release.
+**Goal:** Add resumable, background, fully local Apple Vision OCR for scanned PDFs, expose it through Codex MCP tools, validate it only with generated test books, and publish a macOS Apple Silicon `v0.2.0-beta.1` release without starting OCR on the user's current books.
 
 **Architecture:** Python owns job persistence, queueing, PDF rendering, checkpointing, indexing, and MCP responses. A small arm64 Swift executable owns only one-page Apple Vision recognition and returns versioned JSON. OCR jobs remain separate from book search status, so incomplete OCR text is never searchable; after all pages are checkpointed, a shared indexing service atomically publishes the same Markdown, passages, and embeddings used by ordinary imports.
 
@@ -670,11 +670,12 @@ git add AGENTS.md README.md docs tests/test_release_docs.py
 git commit -m "docs: add Apple Vision OCR workflows"
 ```
 
-### Task 11: Full automated verification and native quality gate
+### Task 11: Full automated verification and synthetic native quality gate
 
 **Files:**
 - Modify only files required by failures proven during this task
 - Use temporary artifacts under: `tmp/pdfs/apple-vision-ocr/`
+- Read only for invariant check: current user library database configured outside the feature worktree
 
 - [ ] **Step 1: Run the complete automated suite**
 
@@ -691,27 +692,31 @@ Expected: every test passes with no warnings or skipped non-platform tests beyon
 
 Expected: Apple Vision reports schema 1 plus `zh-Hans` and `en-US`, and recognizes the known rasterized Chinese/English fixture.
 
-- [ ] **Step 3: Create a visual QA sample from the real pilot book**
+- [ ] **Step 3: Create a synthetic Chinese/English visual QA book**
 
-Render 10 representative physical pages from the managed original of 《照片的本质》 into `tmp/pdfs/apple-vision-ocr/`, inspect each rendered PNG, and compare its visible heading/body order with the OCR checkpoint. Do not copy those images or text into Git.
+Generate a 10-page PDF whose pages are images containing known simplified-Chinese and English headings/body text. Render or inspect every page under `tmp/pdfs/apple-vision-ocr/`, then compare visible order with Apple Vision output. Do not copy the generated PDF, PNGs, or OCR output into Git.
 
 Acceptance: all 10 outputs preserve physical page number; at least 9 contain readable正文 in the expected order; any error is documented with page number before full-book OCR.
 
-- [ ] **Step 4: Exercise pause/resume on the pilot**
+- [ ] **Step 4: Exercise pause/resume in a temporary library**
 
-Start OCR, wait for at least three page checkpoints, call pause, verify the worker stops at a page boundary, restart Codex services, resume, and confirm the completed page count never decreases or repeats.
+Import the generated image-only PDF into a temporary project and temporary Vault. Start OCR, wait for at least three page checkpoints, call pause, verify the worker stops at a page boundary, restart the temporary services, resume, and confirm the completed page count never decreases or repeats.
 
-- [ ] **Step 5: Process the full pilot book and verify retrieval**
+- [ ] **Step 5: Finish the synthetic book and verify retrieval**
 
-After completion, call `library_status`, `search_books`, and `get_passages`. Confirm status `ready` or `keyword_only`, search results point to physical PDF pages, short quotations come only from `get_passages`, and Obsidian links open the parsed Markdown.
+After completion in the temporary library, call `library_status`, `search_books`, and `get_passages`. Confirm status `ready` or `keyword_only`, search results point to physical PDF pages, returned evidence matches only the known generated text, and Obsidian links open the parsed Markdown.
 
-- [ ] **Step 6: Re-run the complete suite after real-data validation**
+- [ ] **Step 6: Prove the user's current books were not touched**
+
+Before and after all native/integration tests, read the current library status without starting any OCR tool. Confirm every existing book retains its prior status and that no `ocr_jobs` or `ocr_pages` rows were created for those book IDs. Do not call `start_ocr` or `start_pending_ocr` against the current project.
+
+- [ ] **Step 7: Re-run the complete suite after synthetic validation**
 
 Run: `.venv/bin/python -m pytest -q`
 
 Expected: every automated test still passes.
 
-- [ ] **Step 7: Commit only code/test corrections, never runtime data**
+- [ ] **Step 8: Commit only code/test corrections, never runtime data**
 
 Verify `git status --short` contains no PDF, PNG, SQLite, OCR checkpoint, model, log, or user path before committing any proven correction.
 
@@ -763,3 +768,4 @@ Report the repository URL, Release URL, one-line install command, SHA-256, suppo
 - New signatures are consistent: `BookIndexer.index_parsed_book`, `OcrService.start_ocr/start_pending_ocr/status/pause`, `OcrWorker.run_once`, and database OCR methods retain the same names across tasks.
 - The plan contains no optional implementation branches: Swift helper + Python orchestration is the only production route.
 - Runtime OCR artifacts and real book pages never enter Git or the public ZIP.
+- No task starts OCR on the user's current books; native and end-to-end validation use generated image-only PDFs in temporary libraries.

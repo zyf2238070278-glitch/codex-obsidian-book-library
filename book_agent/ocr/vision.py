@@ -4,7 +4,6 @@ import hashlib
 import json
 import math
 import os
-import secrets
 import selectors
 import signal
 import stat
@@ -13,7 +12,7 @@ import tempfile
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Mapping, Protocol
+from typing import Callable, Mapping, Protocol
 
 import fitz
 
@@ -36,6 +35,8 @@ MAXIMUM_HELPER_BYTES = 256 * 1024 * 1024
 MAXIMUM_TEXT_UTF8_BYTES = 400_000
 MAXIMUM_TEXT_UNICODE_SCALARS = 100_000
 SAFE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+CODESIGN = "/usr/bin/codesign"
+_CODESIGN_TIMEOUT_SECONDS = 30.0
 _LANGUAGES = "zh-Hans,en-US"
 _PIPE_CHUNK_BYTES = 16 * 1024
 _BOUNDING_BOX_EPSILON = 1e-6
@@ -46,25 +47,74 @@ class VisionOcrError(ValueError):
     """A PDF page could not be rendered or recognized safely."""
 
 
+@dataclass(frozen=True)
+class RunRequest:
+    argv: tuple[str, ...]
+    environment: tuple[tuple[str, str], ...]
+    cwd: Path
+    timeout: float
+    pass_fds: tuple[int, ...]
+
+    def __post_init__(self) -> None:
+        if type(self.argv) is not tuple or not self.argv or not all(
+            type(value) is str and value for value in self.argv
+        ):
+            raise ValueError("argv must be a nonempty tuple of strings")
+        if type(self.environment) is not tuple or not all(
+            type(pair) is tuple
+            and len(pair) == 2
+            and all(type(value) is str and value for value in pair)
+            for pair in self.environment
+        ):
+            raise ValueError("environment must contain string pairs")
+        if len({key for key, _ in self.environment}) != len(self.environment):
+            raise ValueError("environment keys must be unique")
+        if not isinstance(self.cwd, Path) or not self.cwd.is_absolute():
+            raise ValueError("cwd must be an absolute pathlib.Path")
+        if (
+            not isinstance(self.timeout, (int, float))
+            or isinstance(self.timeout, bool)
+            or not math.isfinite(self.timeout)
+            or self.timeout <= 0
+        ):
+            raise ValueError("timeout must be finite and greater than zero")
+        if type(self.pass_fds) is not tuple or len(set(self.pass_fds)) != len(
+            self.pass_fds
+        ):
+            raise ValueError("pass_fds must be a tuple of unique descriptors")
+        for descriptor in self.pass_fds:
+            if type(descriptor) is not int or descriptor < 0:
+                raise ValueError("pass_fds must contain native file descriptors")
+            try:
+                metadata = os.fstat(descriptor)
+            except OSError as exc:
+                raise ValueError("pass_fds contains a closed file descriptor") from exc
+            if not stat.S_ISREG(metadata.st_mode):
+                raise ValueError("pass_fds descriptors must refer to regular files")
+
+
 class HelperRunner(Protocol):
-    def __call__(
-        self,
-        argv: list[str],
-        *,
-        environment: Mapping[str, str],
-        cwd: Path,
-        timeout: float,
-        executable: Path,
-    ) -> subprocess.CompletedProcess[bytes | str]: ...
+    def __call__(self, request: RunRequest) -> subprocess.CompletedProcess[bytes | str]: ...
 
 
 @dataclass(frozen=True)
 class _FileIdentity:
     device: int
     inode: int
+    owner: int
+    group: int
     size: int
     mode: int
     modified_ns: int
+
+
+@dataclass(frozen=True)
+class _ExecutableSnapshot:
+    directory: Path
+    path: Path
+    descriptor: int
+    identity: _FileIdentity
+    digest: str
 
 
 def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
@@ -79,26 +129,36 @@ def _terminate_process_group(process: subprocess.Popen[bytes]) -> None:
         process.wait(timeout=5)
 
 
-def _default_run_helper(
+def _run_bounded_command(
     argv: list[str],
     *,
     environment: Mapping[str, str],
     cwd: Path,
     timeout: float,
-    executable: Path,
+    executable: Path | None = None,
+    pass_fds: tuple[int, ...] = (),
+    after_spawn: Callable[[], None] | None = None,
 ) -> subprocess.CompletedProcess[bytes]:
-    process = subprocess.Popen(
-        argv,
-        stdin=subprocess.DEVNULL,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        shell=False,
-        cwd=os.fspath(cwd),
-        env=dict(environment),
-        close_fds=True,
-        start_new_session=True,
-        executable=os.fspath(executable),
-    )
+    popen_arguments: dict[str, object] = {
+        "stdin": subprocess.DEVNULL,
+        "stdout": subprocess.PIPE,
+        "stderr": subprocess.PIPE,
+        "shell": False,
+        "cwd": os.fspath(cwd),
+        "env": dict(environment),
+        "close_fds": True,
+        "start_new_session": True,
+        "pass_fds": pass_fds,
+    }
+    if executable is not None:
+        popen_arguments["executable"] = os.fspath(executable)
+    process = subprocess.Popen(argv, **popen_arguments)  # type: ignore[arg-type]
+    if after_spawn is not None:
+        try:
+            after_spawn()
+        except BaseException:
+            _terminate_process_group(process)
+            raise
     assert process.stdout is not None
     assert process.stderr is not None
     selector = selectors.DefaultSelector()
@@ -159,10 +219,24 @@ def _identity_from_stat(metadata: os.stat_result) -> _FileIdentity:
     return _FileIdentity(
         device=metadata.st_dev,
         inode=metadata.st_ino,
+        owner=metadata.st_uid,
+        group=metadata.st_gid,
         size=metadata.st_size,
         mode=metadata.st_mode,
         modified_ns=metadata.st_mtime_ns,
     )
+
+
+def _mode_allows_effective_execute(identity: _FileIdentity) -> bool:
+    effective_uid = os.geteuid()
+    if effective_uid == 0:
+        return bool(identity.mode & 0o111)
+    if effective_uid == identity.owner:
+        return bool(identity.mode & stat.S_IXUSR)
+    effective_groups = {os.getegid(), *os.getgroups()}
+    if identity.group in effective_groups:
+        return bool(identity.mode & stat.S_IXGRP)
+    return bool(identity.mode & stat.S_IXOTH)
 
 
 def _open_regular_nofollow(path: Path, *, description: str) -> tuple[int, _FileIdentity]:
@@ -186,57 +260,6 @@ def _path_has_identity(path: Path, expected: _FileIdentity) -> bool:
     except OSError:
         return False
     return _identity_from_stat(metadata) == expected
-
-
-def _same_created_file(metadata: os.stat_result, expected: _FileIdentity) -> bool:
-    return (
-        stat.S_ISREG(metadata.st_mode)
-        and metadata.st_dev == expected.device
-        and metadata.st_ino == expected.inode
-        and metadata.st_mode == expected.mode
-    )
-
-
-def _cleanup_owned_artifact(
-    path: Path,
-    expected: _FileIdentity,
-    *,
-    description: str,
-) -> str | None:
-    """Delete only the exact regular file created by this process."""
-
-    descriptor = -1
-    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
-    try:
-        descriptor = os.open(path, flags)
-        opened = os.fstat(descriptor)
-        current = os.lstat(path)
-        if not _same_created_file(opened, expected) or not _same_created_file(
-            current, expected
-        ):
-            return (
-                f"safety cleanup refused for {description}: path no longer identifies "
-                "the created regular file"
-            )
-        try:
-            os.unlink(path)
-        except OSError as exc:
-            return f"safety cleanup refused for {description}: could not unlink: {exc}"
-        return None
-    except FileNotFoundError:
-        return f"safety cleanup refused for {description}: artifact path disappeared"
-    except OSError as exc:
-        return f"safety cleanup refused for {description}: {exc}"
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-
-
-def _add_cleanup_note(error: BaseException, diagnostic: str) -> None:
-    try:
-        error.add_note(diagnostic)
-    except AttributeError:
-        pass
 
 
 def _hash_descriptor(
@@ -284,6 +307,53 @@ def _path_matches_digest(
     finally:
         if descriptor >= 0:
             os.close(descriptor)
+
+
+def _remove_private_snapshot_name(snapshot: _ExecutableSnapshot) -> None:
+    os.unlink(snapshot.path)
+    os.rmdir(snapshot.directory)
+
+
+def _verify_codesign(snapshot: _ExecutableSnapshot) -> None:
+    if not _path_matches_digest(snapshot.path, snapshot.identity, snapshot.digest):
+        raise VisionOcrError("Vision helper snapshot changed before code-sign verification")
+    result = _run_bounded_command(
+        [CODESIGN, "--verify", "--strict", os.fspath(snapshot.path)],
+        environment={"PATH": SAFE_PATH, "LANG": "C", "LC_ALL": "C"},
+        cwd=Path("/"),
+        timeout=_CODESIGN_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        raise VisionOcrError(
+            "Vision helper snapshot failed code-sign verification: "
+            f"{_safe_diagnostic(result.stderr)}"
+        )
+    if not _path_matches_digest(snapshot.path, snapshot.identity, snapshot.digest):
+        raise VisionOcrError("Vision helper snapshot changed during code-sign verification")
+
+
+def _default_run_helper(
+    request: RunRequest,
+    snapshot: _ExecutableSnapshot,
+) -> subprocess.CompletedProcess[bytes]:
+    _verify_codesign(snapshot)
+    if not _path_matches_digest(snapshot.path, snapshot.identity, snapshot.digest):
+        raise VisionOcrError("Vision helper snapshot changed immediately before launch")
+
+    # Darwin has no public fexecve/execveat and does not execute Mach-O from
+    # /dev/fd. The random 0700 directory is therefore the strongest public-API
+    # boundary available here. It is not claimed to resist a hostile same-UID
+    # process. Popen reports exec failure before returning; remove the private
+    # name immediately after that point while the child keeps its executable.
+    return _run_bounded_command(
+        list(request.argv),
+        environment=dict(request.environment),
+        cwd=request.cwd,
+        timeout=request.timeout,
+        executable=snapshot.path,
+        pass_fds=request.pass_fds,
+        after_spawn=lambda: _remove_private_snapshot_name(snapshot),
+    )
 
 
 def _strict_json_object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
@@ -463,13 +533,13 @@ class VisionOcrEngine:
         *,
         helper: Path,
         temp_root: Path,
-        run_helper: HelperRunner = _default_run_helper,
+        run_helper: HelperRunner | None = None,
     ) -> None:
         if not isinstance(helper, Path):
             raise TypeError("helper must be a pathlib.Path")
         if not isinstance(temp_root, Path):
             raise TypeError("temp_root must be a pathlib.Path")
-        if not callable(run_helper):
+        if run_helper is not None and not callable(run_helper):
             raise TypeError("run_helper must be callable")
         self._helper = helper
         self._temp_root = temp_root
@@ -487,7 +557,17 @@ class VisionOcrEngine:
                 raise VisionOcrError("Vision helper must not be empty")
             if identity.size > MAXIMUM_HELPER_BYTES:
                 raise VisionOcrError("Vision helper file size exceeds the safe limit")
-            if identity.mode & 0o111 == 0:
+            if not _mode_allows_effective_execute(identity):
+                raise VisionOcrError("Vision helper must be executable")
+            try:
+                accessible = os.access(
+                    self._helper,
+                    os.X_OK,
+                    effective_ids=True,
+                )
+            except TypeError:
+                accessible = os.access(self._helper, os.X_OK)
+            if not accessible or not _path_has_identity(self._helper, identity):
                 raise VisionOcrError("Vision helper must be executable")
             digest, size = _hash_descriptor(
                 descriptor,
@@ -600,96 +680,91 @@ class VisionOcrEngine:
                 document.close()
 
     @staticmethod
-    def _write_png(pixmap: fitz.Pixmap, temp_root: Path) -> tuple[Path, _FileIdentity]:
-        descriptor = -1
-        path: Path | None = None
-        creation_identity: _FileIdentity | None = None
+    def _create_call_directory(temp_root: Path) -> Path:
+        directory = Path(tempfile.mkdtemp(prefix="vision-call-", dir=temp_root))
         try:
-            descriptor, raw_path = tempfile.mkstemp(
-                prefix="vision-page-",
-                suffix=".png",
-                dir=temp_root,
-            )
-            path = Path(raw_path)
-            creation_identity = _identity_from_stat(os.fstat(descriptor))
+            os.chmod(directory, 0o700, follow_symlinks=False)
+            metadata = os.lstat(directory)
+            if (
+                not stat.S_ISDIR(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o700
+            ):
+                raise VisionOcrError("OCR call directory is not private")
+            return directory
+        except OSError as exc:
+            try:
+                os.rmdir(directory)
+            except OSError:
+                pass
+            raise VisionOcrError(
+                f"could not prepare OCR call directory: {exc}"
+            ) from exc
+        except BaseException:
+            try:
+                os.rmdir(directory)
+            except OSError:
+                pass
+            raise
+
+    @staticmethod
+    def _write_anonymous_png(pixmap: fitz.Pixmap, directory: Path) -> tuple[int, _FileIdentity]:
+        descriptor, raw_path = tempfile.mkstemp(
+            prefix="vision-page-",
+            suffix=".png",
+            dir=directory,
+        )
+        path = Path(raw_path)
+        try:
             os.fchmod(descriptor, 0o600)
-            creation_identity = _identity_from_stat(os.fstat(descriptor))
+            identity = _identity_from_stat(os.fstat(descriptor))
+            os.unlink(path)
             png = pixmap.tobytes("png")
             view = memoryview(png)
             while view:
                 written = os.write(descriptor, view)
                 if written <= 0:
-                    raise OSError("short write")
+                    raise OSError("short PNG write")
                 view = view[written:]
             os.fsync(descriptor)
+            os.lseek(descriptor, 0, os.SEEK_SET)
             metadata = os.fstat(descriptor)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise VisionOcrError("OCR temporary PNG must be a regular file")
-            if stat.S_IMODE(metadata.st_mode) != 0o600:
-                raise VisionOcrError("OCR temporary PNG must have mode 0600")
-            identity = _identity_from_stat(metadata)
-            if not _path_has_identity(path, identity):
-                raise VisionOcrError("OCR temporary PNG changed while being written")
-            return path, identity
-        except OSError as exc:
-            error = VisionOcrError(f"could not create OCR temporary PNG: {exc}")
-            if path is not None and creation_identity is not None:
-                diagnostic = _cleanup_owned_artifact(
-                    path,
-                    creation_identity,
-                    description="OCR temporary PNG",
-                )
-                if diagnostic is not None:
-                    _add_cleanup_note(error, diagnostic)
-            raise error from exc
-        except BaseException as exc:
-            if path is not None and creation_identity is not None:
-                diagnostic = _cleanup_owned_artifact(
-                    path,
-                    creation_identity,
-                    description="OCR temporary PNG",
-                )
-                if diagnostic is not None:
-                    _add_cleanup_note(exc, diagnostic)
+            if (
+                not stat.S_ISREG(metadata.st_mode)
+                or stat.S_IMODE(metadata.st_mode) != 0o600
+                or metadata.st_size <= 0
+                or os.pread(descriptor, 8, 0) != b"\x89PNG\r\n\x1a\n"
+                or metadata.st_dev != identity.device
+                or metadata.st_ino != identity.inode
+            ):
+                raise VisionOcrError("OCR anonymous PNG has an unsafe identity")
+            return descriptor, _identity_from_stat(metadata)
+        except BaseException:
+            os.close(descriptor)
             raise
-        finally:
-            if descriptor >= 0:
-                os.close(descriptor)
 
     @staticmethod
     def _snapshot_helper(
         source_descriptor: int,
-        temp_root: Path,
+        directory: Path,
         expected: _FileIdentity,
         expected_digest: str,
-    ) -> tuple[Path, _FileIdentity, str]:
+    ) -> _ExecutableSnapshot:
         """Copy a verified helper fd into an independent private executable."""
 
-        snapshot: Path | None = None
+        snapshot = directory / "book-vision-ocr"
         descriptor = -1
-        creation_identity: _FileIdentity | None = None
+        succeeded = False
         try:
-            for _ in range(16):
-                candidate = temp_root / f"vision-helper-{secrets.token_hex(16)}.snapshot"
-                try:
-                    descriptor = os.open(
-                        candidate,
-                        os.O_WRONLY
-                        | os.O_CREAT
-                        | os.O_EXCL
-                        | getattr(os, "O_CLOEXEC", 0)
-                        | getattr(os, "O_NOFOLLOW", 0),
-                        0o700,
-                    )
-                except FileExistsError:
-                    continue
-                snapshot = candidate
-                break
-            if snapshot is None or descriptor < 0:
-                raise VisionOcrError("could not create a private Vision helper snapshot")
-            creation_identity = _identity_from_stat(os.fstat(descriptor))
+            descriptor = os.open(
+                snapshot,
+                os.O_RDWR
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o700,
+            )
             os.fchmod(descriptor, 0o700)
-            creation_identity = _identity_from_stat(os.fstat(descriptor))
 
             if _identity_from_stat(os.fstat(source_descriptor)) != expected:
                 raise VisionOcrError("Vision helper changed before snapshot creation")
@@ -734,79 +809,74 @@ class VisionOcrEngine:
                 raise VisionOcrError("Vision helper snapshot has an unsafe file identity")
             if not _path_has_identity(snapshot, snapshot_identity):
                 raise VisionOcrError("Vision helper snapshot changed while being created")
-            return snapshot, snapshot_identity, snapshot_digest
-        except OSError as exc:
-            error = VisionOcrError(f"could not create Vision helper snapshot: {exc}")
-            if snapshot is not None and creation_identity is not None:
-                diagnostic = _cleanup_owned_artifact(
-                    snapshot,
-                    creation_identity,
-                    description="Vision helper snapshot",
-                )
-                if diagnostic is not None:
-                    _add_cleanup_note(error, diagnostic)
-            raise error from exc
-        except BaseException as exc:
-            if snapshot is not None and creation_identity is not None:
-                diagnostic = _cleanup_owned_artifact(
-                    snapshot,
-                    creation_identity,
-                    description="Vision helper snapshot",
-                )
-                if diagnostic is not None:
-                    _add_cleanup_note(exc, diagnostic)
-            raise
+            os.lseek(descriptor, 0, os.SEEK_SET)
+            succeeded = True
+            return _ExecutableSnapshot(
+                directory=directory,
+                path=snapshot,
+                descriptor=descriptor,
+                identity=snapshot_identity,
+                digest=snapshot_digest,
+            )
         finally:
-            if descriptor >= 0:
+            if not succeeded and descriptor >= 0:
                 os.close(descriptor)
+            if not succeeded:
+                try:
+                    os.unlink(snapshot)
+                except FileNotFoundError:
+                    pass
 
     def recognize_page(self, pdf: Path, *, page_index: int) -> VisionPageResult:
         helper_descriptor = -1
         helper_identity: _FileIdentity | None = None
         helper_digest: str | None = None
-        image_path: Path | None = None
-        image_identity: _FileIdentity | None = None
-        snapshot_path: Path | None = None
-        snapshot_identity: _FileIdentity | None = None
-        snapshot_digest: str | None = None
-        primary_error: BaseException | None = None
+        png_descriptor = -1
+        call_directory: Path | None = None
+        snapshot: _ExecutableSnapshot | None = None
         try:
             helper_descriptor, helper_identity, helper_digest = self._validate_helper()
             temp_root = self._prepare_temp_root()
             pixmap, _rendered_dpi = self._render_page(pdf, page_index)
-            image_path, image_identity = self._write_png(pixmap, temp_root)
-            snapshot_path, snapshot_identity, snapshot_digest = self._snapshot_helper(
+            call_directory = self._create_call_directory(temp_root)
+            png_descriptor, _png_identity = self._write_anonymous_png(
+                pixmap,
+                call_directory,
+            )
+            snapshot = self._snapshot_helper(
                 helper_descriptor,
-                temp_root,
+                call_directory,
                 helper_identity,
                 helper_digest,
             )
-            if not _path_matches_digest(
-                snapshot_path,
-                snapshot_identity,
-                snapshot_digest,
-            ):
-                raise VisionOcrError("Vision helper snapshot changed before recognition")
-            argv = [
-                os.fspath(self._helper),
-                "--image",
-                os.fspath(image_path),
-                "--languages",
-                _LANGUAGES,
-            ]
-            environment = {
-                "PATH": SAFE_PATH,
-                "LANG": "en_US.UTF-8",
-                "LC_ALL": "en_US.UTF-8",
-            }
-            try:
-                result = self._run_helper(
-                    argv,
-                    environment=environment,
-                    cwd=Path("/"),
-                    timeout=HELPER_TIMEOUT_SECONDS,
-                    executable=snapshot_path,
+            request = RunRequest(
+                argv=(
+                    os.fspath(self._helper),
+                    "--image",
+                    f"/dev/fd/{png_descriptor}",
+                    "--languages",
+                    _LANGUAGES,
+                ),
+                environment=(
+                    ("PATH", SAFE_PATH),
+                    ("LANG", "en_US.UTF-8"),
+                    ("LC_ALL", "en_US.UTF-8"),
+                ),
+                cwd=Path("/"),
+                timeout=HELPER_TIMEOUT_SECONDS,
+                pass_fds=(png_descriptor,),
+            )
+            if self._run_helper is None:
+                runner: Callable[[RunRequest], subprocess.CompletedProcess[bytes | str]] = (
+                    lambda value: _default_run_helper(value, snapshot)
                 )
+            else:
+                # Test/injected runners receive only the public descriptor contract.
+                # Remove every private name before invoking external callback code.
+                _remove_private_snapshot_name(snapshot)
+                runner = self._run_helper
+            try:
+                result = runner(request)
             except subprocess.TimeoutExpired as exc:
                 raise VisionOcrError(
                     f"Vision helper timed out after {HELPER_TIMEOUT_SECONDS:g} seconds"
@@ -827,14 +897,16 @@ class VisionOcrEngine:
                 or source_digest != helper_digest
             ):
                 raise VisionOcrError("Vision helper changed while recognition was running")
-            if not _path_matches_digest(
-                snapshot_path,
-                snapshot_identity,
-                snapshot_digest,
+            snapshot_digest, snapshot_size = _hash_descriptor(
+                snapshot.descriptor,
+                maximum_bytes=MAXIMUM_HELPER_BYTES,
+            )
+            if (
+                snapshot_size != snapshot.identity.size
+                or snapshot_digest != snapshot.digest
+                or _identity_from_stat(os.fstat(snapshot.descriptor)) != snapshot.identity
             ):
                 raise VisionOcrError("Vision helper snapshot changed during recognition")
-            if not _path_has_identity(image_path, image_identity):
-                raise VisionOcrError("OCR temporary PNG changed during recognition")
             if not isinstance(result, subprocess.CompletedProcess):
                 raise VisionOcrError("Vision helper runner returned an invalid result")
             if type(result.returncode) is not int:
@@ -845,35 +917,27 @@ class VisionOcrEngine:
                     f"{_safe_diagnostic(result.stderr)}"
                 )
             return _parse_helper_output(result.stdout)
-        except BaseException as exc:
-            primary_error = exc
-            raise
         finally:
-            cleanup_errors: list[str] = []
-            if image_path is not None and image_identity is not None:
-                diagnostic = _cleanup_owned_artifact(
-                    image_path,
-                    image_identity,
-                    description="OCR temporary PNG",
-                )
-                if diagnostic is not None:
-                    cleanup_errors.append(diagnostic)
-            if snapshot_path is not None and snapshot_identity is not None:
-                diagnostic = _cleanup_owned_artifact(
-                    snapshot_path,
-                    snapshot_identity,
-                    description="Vision helper snapshot",
-                )
-                if diagnostic is not None:
-                    cleanup_errors.append(diagnostic)
-            if helper_descriptor >= 0:
-                os.close(helper_descriptor)
-            if cleanup_errors:
-                diagnostic = "; ".join(cleanup_errors)
-                if primary_error is not None:
-                    _add_cleanup_note(primary_error, diagnostic)
-                else:
-                    raise VisionOcrError(diagnostic)
+            for descriptor in (
+                png_descriptor,
+                snapshot.descriptor if snapshot else -1,
+                helper_descriptor,
+            ):
+                if descriptor >= 0:
+                    try:
+                        os.close(descriptor)
+                    except OSError:
+                        pass
+            if snapshot is not None:
+                try:
+                    os.unlink(snapshot.path)
+                except FileNotFoundError:
+                    pass
+            if call_directory is not None:
+                try:
+                    os.rmdir(call_directory)
+                except FileNotFoundError:
+                    pass
 
 
 __all__ = [
@@ -882,6 +946,7 @@ __all__ = [
     "MAXIMUM_HELPER_BYTES",
     "MAXIMUM_PAGE_PIXELS",
     "MAXIMUM_STDOUT_BYTES",
+    "RunRequest",
     "VisionOcrEngine",
     "VisionOcrError",
 ]

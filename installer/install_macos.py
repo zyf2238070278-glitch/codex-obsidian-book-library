@@ -51,6 +51,10 @@ VISION_HELPER_LANGUAGES = frozenset({"zh-Hans", "en-US"})
 VISION_HELPER_LIPO = "/usr/bin/lipo"
 VISION_HELPER_CODESIGN = "/usr/bin/codesign"
 VISION_HELPER_MACHO_MAGICS = frozenset({b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"})
+TESSERACT_BINARY_RELATIVE = Path("bin/tesseract")
+TESSERACT_LIBRARY_RELATIVE = Path("lib/libtesseract.dylib")
+TESSERACT_TESSDATA_RELATIVE = Path("data/ocr-models/tessdata")
+TESSERACT_LANGUAGES = ("chi_sim", "chi_tra", "eng")
 
 
 @dataclass(frozen=True)
@@ -307,6 +311,39 @@ def _validate_vision_helper(
     return helper
 
 
+def _validate_tesseract_runtime(project_root: Path) -> None:
+    """Reject incomplete bundled Tesseract payloads before publishing config."""
+
+    binary = project_root / TESSERACT_BINARY_RELATIVE
+    library = project_root / TESSERACT_LIBRARY_RELATIVE
+    tessdata = project_root / TESSERACT_TESSDATA_RELATIVE
+    try:
+        binary_info = binary.lstat()
+    except OSError as exc:
+        raise InstallError("缺少完整 Tesseract OCR 运行时：未找到可执行文件。") from exc
+    if (
+        stat.S_ISLNK(binary_info.st_mode)
+        or not stat.S_ISREG(binary_info.st_mode)
+        or not os.access(str(binary), os.X_OK)
+    ):
+        raise InstallError("完整 Tesseract OCR 运行时中的可执行文件无效。")
+    try:
+        library_info = library.lstat()
+    except OSError as exc:
+        raise InstallError("缺少完整 Tesseract OCR 运行时：未找到动态库。") from exc
+    if stat.S_ISLNK(library_info.st_mode) or not stat.S_ISREG(library_info.st_mode):
+        raise InstallError("完整 Tesseract OCR 运行时中的动态库无效。")
+    missing = [
+        language
+        for language in TESSERACT_LANGUAGES
+        if not (tessdata / f"{language}.traineddata").is_file()
+    ]
+    if missing:
+        raise InstallError(
+            "缺少完整 Tesseract OCR 语言包：" + ", ".join(missing)
+        )
+
+
 def _create_runtime_directories(project_root: Path, vault: Path) -> None:
     try:
         for relative in VAULT_DIRECTORIES:
@@ -368,6 +405,7 @@ def install(
         ),
         run_command=run_command or subprocess.run,
     )
+    _validate_tesseract_runtime(resolved_root)
 
     _create_runtime_directories(resolved_root, resolved_vault)
     try:

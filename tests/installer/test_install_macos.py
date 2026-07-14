@@ -34,7 +34,7 @@ def _legacy_vision_fixture(
     # leave those calls untouched.
     if any(
         token in request.node.name.casefold()
-        for token in ("vision", "helper", "ocr", "capabilities", "schema", "language")
+        for token in ("vision", "helper", "ocr", "tesseract", "capabilities", "schema", "language")
     ):
         return
     original = install_macos.install
@@ -45,6 +45,16 @@ def _legacy_vision_fixture(
         helper.parent.mkdir(parents=True, exist_ok=True)
         helper.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 64)
         helper.chmod(0o755)
+        tesseract = project_root / "bin" / "tesseract"
+        tesseract.write_text("#!/bin/sh\n", encoding="utf-8")
+        tesseract.chmod(0o755)
+        runtime_lib = project_root / "lib" / "libtesseract.dylib"
+        runtime_lib.parent.mkdir(parents=True, exist_ok=True)
+        runtime_lib.write_bytes(b"runtime")
+        tessdata = project_root / "data" / "ocr-models" / "tessdata"
+        tessdata.mkdir(parents=True, exist_ok=True)
+        for language in ("chi_sim", "chi_tra", "eng"):
+            (tessdata / f"{language}.traineddata").write_bytes(b"data")
         original_runner = kwargs.get("run_command")
 
         def runner(argv: list[str], **runner_kwargs: object) -> subprocess.CompletedProcess[str]:
@@ -103,12 +113,20 @@ def test_install_uses_default_vault_and_creates_runtime_directories(
         assert (expected_vault / relative).is_dir()
     assert (project_root / "data").is_dir()
     assert (project_root / "data" / "models").is_dir()
+    assert (project_root / "data" / "ocr-models").is_dir()
     for obsolete in (
         "书库/00-原始书籍",
         "书库/10-解析文本",
         "书库/20-索引",
     ):
         assert not (expected_vault / obsolete).exists()
+
+
+def test_tesseract_runtime_requires_binary_library_and_languages(tmp_path: Path) -> None:
+    project_root = tmp_path / "release"
+
+    with pytest.raises(install_macos.InstallError, match="Tesseract"):
+        install_macos._validate_tesseract_runtime(project_root)
 
 
 def test_install_uses_explicit_vault_and_codex_config(tmp_path: Path) -> None:

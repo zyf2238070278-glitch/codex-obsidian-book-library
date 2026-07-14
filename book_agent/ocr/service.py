@@ -151,7 +151,7 @@ class OcrService:
         if existing is not None and existing.get("status") == "completed":
             return self._summary_for(validated_id)
         if existing is not None and existing.get("status") in ("queued", "running"):
-            self._validate_eligible_book(book)
+            self._validate_existing_job(book, existing)
             status_value = str(existing["status"])
             if status_value == "running":
                 status_value = self._requeue_stale_running(validated_id)
@@ -184,13 +184,19 @@ class OcrService:
         selected = rows[:safe_limit]
         jobs: list[dict[str, object]] = []
         errors: list[dict[str, str]] = []
+        should_ensure_worker = False
         for book in selected:
             book_id = _validate_book_id(book.get("book_id"))
             try:
                 existing = self.database.get_ocr_job(book_id)
-                if existing is not None and existing.get("status") == "running":
-                    self._requeue_stale_running(book_id)
-                    existing = self.database.get_ocr_job(book_id)
+                if existing is not None and existing.get("status") in (
+                    "queued",
+                    "running",
+                ):
+                    self._validate_existing_job(book, existing)
+                    if existing.get("status") == "running":
+                        self._requeue_stale_running(book_id)
+                        existing = self.database.get_ocr_job(book_id)
                 if existing is None or existing.get("status") not in (
                     "queued",
                     "running",
@@ -204,7 +210,9 @@ class OcrService:
                         DEFAULT_LANGUAGES,
                         schema_version=OCR_SCHEMA_VERSION,
                     )
-                jobs.append(_summary_payload(self._summary_for(book_id)))
+                summary = self._summary_for(book_id)
+                jobs.append(_summary_payload(summary))
+                should_ensure_worker = should_ensure_worker or summary.status == "queued"
             except Exception as exc:
                 errors.append(
                     {
@@ -214,7 +222,7 @@ class OcrService:
                     }
                 )
 
-        if self._has_queued_job():
+        if should_ensure_worker:
             self._ensure_worker_started()
         has_more = len(rows) > safe_limit
         result: dict[str, object] = {
@@ -313,6 +321,23 @@ class OcrService:
             raise ValueError("Book is already searchable and does not need OCR")
         if status_value != "needs_ocr":
             raise ValueError(f"Book status {status_value} is not eligible for OCR")
+
+    def _validate_existing_job(
+        self,
+        book: Mapping[str, object],
+        job: Mapping[str, object],
+    ) -> None:
+        """Revalidate mutable filesystem evidence before every explicit restart."""
+
+        self._validate_eligible_book(book)
+        current_page_count = self._validated_pdf_page_count(book)
+        stored_page_count = job.get("total_pages")
+        if type(stored_page_count) is not int or stored_page_count <= 0:
+            raise ValueError("Existing OCR job page count is invalid")
+        if current_page_count != stored_page_count:
+            raise ValueError(
+                "Managed PDF page count no longer matches the existing OCR job"
+            )
 
     def _validated_pdf_page_count(self, book: Mapping[str, object]) -> int:
         raw_path = book.get("original_path")
@@ -532,7 +557,7 @@ class OcrService:
                     """
                     UPDATE ocr_jobs
                     SET status='queued', worker_id=NULL, lease_expires_at=NULL,
-                        error=NULL, updated_at=?, finished_at=NULL
+                        pause_requested=0, error=NULL, updated_at=?, finished_at=NULL
                     WHERE book_id=? AND status='running'
                       AND (lease_expires_at IS NULL OR lease_expires_at <= ?)
                     """,
@@ -569,7 +594,6 @@ class OcrService:
         return [dict(row) for row in rows]
 
     def _ensure_worker_started(self) -> bool:
-        now = self._now()
         with _managed_directory_beneath(
             self.paths.root,
             self.paths.ocr,
@@ -584,6 +608,7 @@ class OcrService:
             )
             try:
                 fcntl.flock(lock_fd, fcntl.LOCK_EX)
+                now = self._now()
                 if not self._has_queued_job() or self._has_live_lease(now):
                     return False
                 if self._marker_is_live(ocr_fd, now):

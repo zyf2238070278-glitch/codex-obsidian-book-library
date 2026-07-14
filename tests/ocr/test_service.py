@@ -15,6 +15,7 @@ from typing import Any
 import fitz
 import pytest
 
+import book_agent.ocr.service as service_module
 from book_agent.config import AppPaths
 from book_agent.ocr.models import OcrJobSummary
 from book_agent.ocr.service import OcrService
@@ -293,6 +294,85 @@ def test_idempotent_start_and_resume_preserve_checkpoints(app) -> None:
     assert len(launcher.calls) == 1
 
 
+def test_existing_queued_job_revalidates_hash_without_mutating_job(app) -> None:
+    service, database, launcher, paths = app
+    original = _book(database, paths, BOOK_A, pages=2)
+    service.start_ocr(BOOK_A)
+    before_job = database.get_ocr_job(BOOK_A)
+    original.write_bytes(b"%PDF-replaced-and-corrupt")
+    replaced = original.read_bytes()
+
+    with pytest.raises(ValueError, match="content hash"):
+        service.start_ocr(BOOK_A)
+
+    assert database.get_ocr_job(BOOK_A) == before_job
+    assert database.list_ocr_pages(BOOK_A) == []
+    assert original.read_bytes() == replaced
+    assert len(launcher.calls) == 1
+
+
+def test_existing_running_job_revalidates_corrupt_pdf_without_mutation(app) -> None:
+    service, database, launcher, paths = app
+    original = _book(database, paths, BOOK_A, pages=2)
+    service.start_ocr(BOOK_A)
+    claimed = database.claim_next_ocr_job("worker", 60, now=NOW)
+    assert claimed is not None
+    original.write_bytes(b"%PDF-corrupt")
+    digest = hashlib.sha256(original.read_bytes()).hexdigest()
+    with database._connection() as connection:
+        connection.execute(
+            "UPDATE books SET content_sha256=? WHERE book_id=?", (digest, BOOK_A)
+        )
+    before_job = database.get_ocr_job(BOOK_A)
+
+    with pytest.raises(ValueError, match="invalid or damaged"):
+        service.start_ocr(BOOK_A)
+
+    assert database.get_ocr_job(BOOK_A) == before_job
+    assert database.list_ocr_pages(BOOK_A) == []
+    assert original.read_bytes() == b"%PDF-corrupt"
+    assert len(launcher.calls) == 1
+
+
+def test_existing_job_rejects_changed_page_count_before_spawn(app) -> None:
+    service, database, launcher, paths = app
+    original = _book(database, paths, BOOK_A, pages=2)
+    service.start_ocr(BOOK_A)
+    original.unlink()
+    digest = _pdf(original, 3)
+    with database._connection() as connection:
+        connection.execute(
+            "UPDATE books SET content_sha256=? WHERE book_id=?", (digest, BOOK_A)
+        )
+    before_job = database.get_ocr_job(BOOK_A)
+    before = original.read_bytes()
+
+    with pytest.raises(ValueError, match="page count.*job|job.*page count"):
+        service.start_ocr(BOOK_A)
+
+    assert database.get_ocr_job(BOOK_A) == before_job
+    assert original.read_bytes() == before
+    assert len(launcher.calls) == 1
+
+
+def test_pending_batch_revalidates_existing_job_and_reports_replacement(app) -> None:
+    service, database, launcher, paths = app
+    original = _book(database, paths, BOOK_A, pages=2)
+    database.queue_ocr_job(BOOK_A, 2, ("zh-Hans", "en-US"))
+    original.write_bytes(b"replaced")
+    before_job = database.get_ocr_job(BOOK_A)
+
+    result = service.start_pending_ocr()
+
+    assert result["jobs"] == []
+    assert result["error_count"] == 1
+    assert result["errors"][0]["book_id"] == BOOK_A
+    assert "content hash" in result["errors"][0]["error"]
+    assert database.get_ocr_job(BOOK_A) == before_job
+    assert database.list_ocr_pages(BOOK_A) == []
+    assert launcher.calls == []
+
+
 def test_resume_paused_job_preserves_checkpoints(app) -> None:
     service, database, _, paths = app
     _book(database, paths, BOOK_A, pages=3)
@@ -309,6 +389,37 @@ def test_resume_paused_job_preserves_checkpoints(app) -> None:
     assert resumed.status == "queued"
     assert resumed.completed_pages == 1
     assert [row["page_number"] for row in database.list_ocr_pages(BOOK_A)] == [1]
+
+
+@pytest.mark.parametrize("terminal_status", ["paused", "failed"])
+def test_explicit_resume_clears_pause_flag_and_preserves_checkpoints(
+    app, terminal_status: str
+) -> None:
+    service, database, _, paths = app
+    _book(database, paths, BOOK_A, pages=2)
+    database.queue_ocr_job(BOOK_A, 2, ("zh-Hans", "en-US"))
+    claimed = database.claim_next_ocr_job("worker", 60, now=NOW)
+    assert claimed is not None
+    database.save_ocr_page(
+        BOOK_A, "worker", 1, "1", "checkpoint", "sha", 0.8, 100, now=NOW
+    )
+    if terminal_status == "paused":
+        database.pause_ocr_job(BOOK_A, "worker", now=NOW)
+    else:
+        database.fail_ocr_job(BOOK_A, "worker", "failure", 2, now=NOW)
+    with database._connection() as connection:
+        connection.execute(
+            "UPDATE ocr_jobs SET pause_requested=1 WHERE book_id=?", (BOOK_A,)
+        )
+
+    resumed = service.start_ocr(BOOK_A)
+
+    job = database.get_ocr_job(BOOK_A)
+    assert resumed.status == "queued"
+    assert job["pause_requested"] == 0
+    assert job["worker_id"] is None
+    assert job["lease_expires_at"] is None
+    assert [page["page_number"] for page in database.list_ocr_pages(BOOK_A)] == [1]
 
 
 def test_start_completed_job_is_a_noop(app) -> None:
@@ -566,6 +677,97 @@ def test_expired_running_lease_is_requeued_before_worker_restart(app) -> None:
 
     assert result.status == "queued"
     assert database.get_ocr_job(BOOK_A)["worker_id"] is None
+    assert len(launcher.calls) == 1
+
+
+def test_expired_pause_requested_worker_requeues_cleanly_and_keeps_checkpoint(app) -> None:
+    service, database, launcher, paths = app
+    _book(database, paths, BOOK_A, pages=2)
+    database.queue_ocr_job(BOOK_A, 2, ("zh-Hans", "en-US"))
+    old_now = NOW - timedelta(seconds=120)
+    claimed = database.claim_next_ocr_job("dead-worker", 60, now=old_now)
+    assert claimed is not None
+    database.save_ocr_page(
+        BOOK_A,
+        "dead-worker",
+        1,
+        "1",
+        "checkpoint",
+        "sha",
+        0.8,
+        100,
+        now=old_now,
+    )
+    database.request_ocr_pause(BOOK_A, now=old_now)
+
+    result = service.start_ocr(BOOK_A)
+
+    job = database.get_ocr_job(BOOK_A)
+    assert result.status == "queued"
+    assert job["pause_requested"] == 0
+    assert job["worker_id"] is None
+    assert job["lease_expires_at"] is None
+    assert [page["page_number"] for page in database.list_ocr_pages(BOOK_A)] == [1]
+    assert len(launcher.calls) == 1
+
+
+def test_worker_launch_uses_time_sampled_after_flock(monkeypatch, app) -> None:
+    _, database, launcher, paths = app
+    _book(database, paths, BOOK_A)
+    clock = {"now": NOW}
+    service = OcrService(
+        paths,
+        database,
+        popen_factory=launcher,
+        now_factory=lambda: clock["now"],
+        pid_probe=lambda pid: pid == launcher.pid,
+    )
+    real_flock = service_module.fcntl.flock
+
+    def delayed_flock(descriptor: int, operation: int) -> None:
+        real_flock(descriptor, operation)
+        clock["now"] += timedelta(seconds=31)
+
+    monkeypatch.setattr(service_module.fcntl, "flock", delayed_flock)
+
+    service.start_ocr(BOOK_A)
+    monkeypatch.setattr(service_module.fcntl, "flock", real_flock)
+    service.start_ocr(BOOK_A)
+
+    assert len(launcher.calls) == 1
+    marker = json.loads((paths.ocr / "worker.json").read_text(encoding="utf-8"))
+    assert marker["launched_at"].startswith("2026-07-14T04:05:37")
+
+
+def test_fresh_post_lock_time_does_not_treat_expired_lease_as_live(
+    monkeypatch, app
+) -> None:
+    _, database, launcher, paths = app
+    _book(database, paths, BOOK_A)
+    _book(database, paths, BOOK_B)
+    database.queue_ocr_job(BOOK_A, 2, ("zh-Hans", "en-US"))
+    claimed = database.claim_next_ocr_job("old-worker", 10, now=NOW)
+    assert claimed is not None
+    database.queue_ocr_job(BOOK_B, 2, ("zh-Hans", "en-US"))
+    clock = {"now": NOW}
+    service = OcrService(
+        paths,
+        database,
+        popen_factory=launcher,
+        now_factory=lambda: clock["now"],
+        pid_probe=lambda _: False,
+    )
+    real_flock = service_module.fcntl.flock
+
+    def delayed_flock(descriptor: int, operation: int) -> None:
+        real_flock(descriptor, operation)
+        clock["now"] += timedelta(seconds=20)
+
+    monkeypatch.setattr(service_module.fcntl, "flock", delayed_flock)
+
+    result = service.start_ocr(BOOK_B)
+
+    assert result.status == "queued"
     assert len(launcher.calls) == 1
 
 

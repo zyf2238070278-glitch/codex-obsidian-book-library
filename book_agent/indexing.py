@@ -14,7 +14,9 @@ from book_agent.rendering import render_parsed_book
 from book_agent.storage import Database
 
 
-_INDEX_STATUSES = frozenset({"processing", "ready", "keyword_only", "failed"})
+_INDEX_STATUSES = frozenset(
+    {"processing", "ready", "keyword_only", "needs_ocr", "failed"}
+)
 
 
 def _error_detail(error: BaseException) -> str:

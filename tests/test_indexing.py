@@ -194,6 +194,20 @@ def test_index_result_is_frozen_json_safe_and_strictly_native() -> None:
             "message": "message",
         },
         {
+            "status": "duplicate",
+            "parsed_path": None,
+            "passage_count": 0,
+            "error": None,
+            "message": "message",
+        },
+        {
+            "status": "",
+            "parsed_path": None,
+            "passage_count": 0,
+            "error": None,
+            "message": "message",
+        },
+        {
             "status": "ready",
             "parsed_path": Path("正文.md"),
             "passage_count": 0,
@@ -451,6 +465,49 @@ def test_final_status_failure_falls_back_to_failed_and_hides_passages(
     assert "状态写入失败：first status write failed" in result.message
     assert database.count_passages("a" * 24) == result.passage_count == 1
     assert database.keyword_search("状态失败证据", 5) == []
+
+
+def test_double_status_failure_reports_actual_needs_ocr_state_once(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database, _ = app
+    database.update_book_status("a" * 24, "needs_ocr", error="等待 OCR")
+    attempts = 0
+
+    def always_fail(*args, **kwargs) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise OSError("status database unavailable")
+
+    monkeypatch.setattr(database, "update_book_status", always_fail)
+
+    result = BookIndexer(
+        paths,
+        database,
+        NullEmbeddingProvider(),
+    ).index_parsed_book(
+        book_id="a" * 24,
+        parsed=ParsedBook(
+            title="OCR 已解析",
+            author=None,
+            source_format="pdf",
+            units=(SourceUnit("OCR 完成后的正文", page_start=1, page_end=1),),
+        ),
+        original_path=paths.originals / "scan.pdf",
+    )
+
+    assert attempts == 2
+    assert result.status == "needs_ocr"
+    assert result.error == result.message
+    assert "状态写入失败" in result.message
+    assert "失败状态也无法写入" in result.message
+    assert result.to_dict()["status"] == "needs_ocr"
+    serialized = result.to_dict()
+    assert json.loads(json.dumps(serialized, ensure_ascii=False)) == serialized
+    assert database.get_book("a" * 24)["status"] == "needs_ocr"
+    assert database.count_passages("a" * 24) == result.passage_count == 1
+    assert database.keyword_search("OCR 完成后的正文", 5) == []
 
 
 def test_interruption_marks_failed_hides_passages_and_reraises(

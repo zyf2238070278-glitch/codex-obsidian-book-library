@@ -119,6 +119,41 @@ def _two_passage_book() -> ParsedBook:
     )
 
 
+def _parsed_for_preflight() -> ParsedBook:
+    return ParsedBook(
+        title="不应写入的标题",
+        author="不应写入的作者",
+        source_format="pdf",
+        units=(SourceUnit("不应发布的正文", page_start=1, page_end=1),),
+    )
+
+
+def _file_snapshot(root: Path) -> dict[Path, bytes]:
+    if not root.exists():
+        return {}
+    return {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
+def _forbid_index_writes(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_write(*args, **kwargs) -> None:
+        raise AssertionError("index preflight performed a database write")
+
+    for method_name in (
+        "update_book_metadata",
+        "update_book_status",
+        "replace_passages",
+        "set_embeddings",
+    ):
+        monkeypatch.setattr(database, method_name, unexpected_write)
+
+
 def test_indexer_publishes_markdown_passages_and_ready_status(
     app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
 ) -> None:
@@ -164,6 +199,111 @@ def test_indexer_publishes_markdown_passages_and_ready_status(
         decode_vector(embedded[0][1]),
         np.array([0.0, 0.5, 1.0], dtype=np.float32),
     )
+
+
+@pytest.mark.parametrize(
+    "book_id",
+    [
+        True,
+        None,
+        Path("a" * 24),
+        "A" * 24,
+        "a" * 23,
+        "a" * 25,
+        "g" * 24,
+        "a" * 12 + "/" + "b" * 11,
+    ],
+)
+def test_indexer_rejects_invalid_book_ids_before_any_mutation(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+    monkeypatch: pytest.MonkeyPatch,
+    book_id: object,
+) -> None:
+    paths, database, provider = app
+    books_before = database.list_books()
+    passage_count_before = database.count_passages()
+    files_before = _file_snapshot(paths.vault)
+    _forbid_index_writes(database, monkeypatch)
+
+    result = BookIndexer(paths, database, provider).index_parsed_book(
+        book_id=book_id,  # type: ignore[arg-type]
+        parsed=_parsed_for_preflight(),
+        original_path=paths.originals / "scan.pdf",
+    )
+
+    expected = "索引失败：book_id 必须是 24 位小写十六进制字符串。"
+    assert result == IndexResult(
+        status="failed",
+        parsed_path=None,
+        passage_count=0,
+        error=expected,
+        message=expected,
+    )
+    assert database.list_books() == books_before
+    assert database.count_passages() == passage_count_before
+    assert _file_snapshot(paths.vault) == files_before
+
+
+def test_indexer_rejects_path_traversal_without_overwriting_vault_sentinel(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database, provider = app
+    paths.notes.mkdir(parents=True)
+    sentinel = paths.notes / "正文.md"
+    sentinel.write_text("用户笔记哨兵", encoding="utf-8")
+    paths.parsed.mkdir(parents=True)
+    parsed_sentinel = paths.parsed / "保留.md"
+    parsed_sentinel.write_text("解析目录哨兵", encoding="utf-8")
+    books_before = database.list_books()
+    passage_count_before = database.count_passages()
+    _forbid_index_writes(database, monkeypatch)
+
+    result = BookIndexer(paths, database, provider).index_parsed_book(
+        book_id="../30-AI读书笔记",
+        parsed=_parsed_for_preflight(),
+        original_path=paths.originals / "scan.pdf",
+    )
+
+    expected = "索引失败：book_id 必须是 24 位小写十六进制字符串。"
+    assert result.error == result.message == expected
+    assert result.parsed_path is None
+    assert sentinel.read_text(encoding="utf-8") == "用户笔记哨兵"
+    assert parsed_sentinel.read_text(encoding="utf-8") == "解析目录哨兵"
+    assert database.list_books() == books_before
+    assert database.count_passages() == passage_count_before
+
+
+def test_indexer_rejects_unknown_book_before_publishing_or_database_writes(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database, provider = app
+    missing_id = "d" * 24
+    paths.parsed.mkdir(parents=True)
+    parsed_sentinel = paths.parsed / "保留.md"
+    parsed_sentinel.write_text("解析目录哨兵", encoding="utf-8")
+    books_before = database.list_books()
+    passage_count_before = database.count_passages()
+    files_before = _file_snapshot(paths.vault)
+    _forbid_index_writes(database, monkeypatch)
+
+    result = BookIndexer(paths, database, provider).index_parsed_book(
+        book_id=missing_id,
+        parsed=_parsed_for_preflight(),
+        original_path=paths.originals / "scan.pdf",
+    )
+
+    expected = f"索引失败：找不到书籍记录：{missing_id}"
+    assert result.error == result.message == expected
+    assert result.status == "failed"
+    assert result.parsed_path is None
+    assert result.passage_count == 0
+    assert not (paths.parsed / missing_id).exists()
+    assert parsed_sentinel.read_text(encoding="utf-8") == "解析目录哨兵"
+    assert database.list_books() == books_before
+    assert database.count_passages() == passage_count_before
+    assert _file_snapshot(paths.vault) == files_before
 
 
 def test_index_result_is_frozen_json_safe_and_strictly_native() -> None:

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -17,6 +18,12 @@ from book_agent.storage import Database
 _INDEX_STATUSES = frozenset(
     {"processing", "ready", "keyword_only", "needs_ocr", "failed"}
 )
+_BOOK_ID_LENGTH = 24
+_LOWER_HEX_DIGITS = frozenset("0123456789abcdef")
+_INVALID_BOOK_ID_MESSAGE = (
+    "索引失败：book_id 必须是 24 位小写十六进制字符串。"
+)
+_UNSAFE_DESTINATION_MESSAGE = "索引失败：解析文本目标路径不安全。"
 
 
 def _error_detail(error: BaseException) -> str:
@@ -78,11 +85,20 @@ class BookIndexer:
         parsed: ParsedBook,
         original_path: str | Path,
     ) -> IndexResult:
+        if not self._valid_book_id(book_id):
+            return self._diagnostic_failure(_INVALID_BOOK_ID_MESSAGE)
+        if self.database.get_book(book_id) is None:
+            return self._diagnostic_failure(
+                f"索引失败：找不到书籍记录：{book_id}"
+            )
+        destination = self._parsed_destination(book_id)
+        if destination is None:
+            return self._diagnostic_failure(_UNSAFE_DESTINATION_MESSAGE)
+
         parsed_path: str | None = None
         passage_count = 0
         try:
             self.database.update_book_metadata(book_id, parsed.title, parsed.author)
-            destination = self.paths.parsed / book_id / "正文.md"
             markdown_path = destination.relative_to(self.paths.vault).as_posix()
             passages = chunk_book(book_id, parsed, markdown_path)
             if not passages:
@@ -134,6 +150,46 @@ class BookIndexer:
                     "记录导入中断状态时失败：" + _error_detail(status_error)
                 )
             raise
+
+    @staticmethod
+    def _valid_book_id(book_id: object) -> bool:
+        return (
+            type(book_id) is str
+            and len(book_id) == _BOOK_ID_LENGTH
+            and all(character in _LOWER_HEX_DIGITS for character in book_id)
+        )
+
+    @staticmethod
+    def _diagnostic_failure(message: str) -> IndexResult:
+        return IndexResult(
+            status="failed",
+            parsed_path=None,
+            passage_count=0,
+            error=message,
+            message=message,
+        )
+
+    def _parsed_destination(self, book_id: str) -> Path | None:
+        try:
+            parsed_root = Path(
+                os.path.abspath(os.fspath(self.paths.parsed.expanduser()))
+            )
+            expected_parent = Path(
+                os.path.abspath(os.fspath(parsed_root / book_id))
+            )
+            destination = Path(
+                os.path.abspath(os.fspath(expected_parent / "正文.md"))
+            )
+            expected_parent.relative_to(parsed_root)
+        except (OSError, RuntimeError, TypeError, ValueError):
+            return None
+
+        if (
+            expected_parent.parent != parsed_root
+            or destination.parent != expected_parent
+        ):
+            return None
+        return destination
 
     def _build_semantic_index(
         self,

@@ -26,6 +26,9 @@ package = false
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "macos_vision: requires macOS and a locally built Apple Vision helper",
+]
 filterwarnings = [
     "ignore:^builtin type (SwigPyPacked|SwigPyObject|swigvarlink) has no __module__ attribute$:DeprecationWarning",
 ]

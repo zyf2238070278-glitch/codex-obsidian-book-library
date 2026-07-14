@@ -389,6 +389,7 @@ def _private_snapshot_fixture(
     "stage",
     [
         "missing-pipe",
+        "deadline",
         "selector",
         "set-blocking-stdout",
         "set-blocking-stderr",
@@ -430,6 +431,8 @@ def test_default_runner_reaps_process_and_closes_pipes_when_setup_fails(
     real_set_blocking = os.set_blocking
     process_holder: dict[str, subprocess.Popen[bytes]] = {}
     selector_holder: dict[str, object] = {}
+    popen_returned = False
+    deadline_failed = False
 
     class MissingPipeProcess:
         def __init__(self, process: subprocess.Popen[bytes]) -> None:
@@ -448,9 +451,11 @@ def test_default_runner_reaps_process_and_closes_pipes_when_setup_fails(
         argv: list[str],
         **kwargs: object,
     ) -> subprocess.Popen[bytes] | MissingPipeProcess:
+        nonlocal popen_returned
         process = real_popen(argv, **kwargs)  # type: ignore[arg-type]
         process_holder["process"] = process
         _read_process_ids(process_ids)
+        popen_returned = True
         if stage == "missing-pipe":
             return MissingPipeProcess(process)
         return process
@@ -486,6 +491,15 @@ def test_default_runner_reaps_process_and_closes_pipes_when_setup_fails(
             raise RuntimeError(f"synthetic {stage} failure")
         real_set_blocking(descriptor, blocking)
 
+    real_monotonic = time.monotonic
+
+    def failing_monotonic() -> float:
+        nonlocal deadline_failed
+        if stage == "deadline" and popen_returned and not deadline_failed:
+            deadline_failed = True
+            raise KeyboardInterrupt("synthetic deadline failure")
+        return real_monotonic()
+
     monkeypatch.setattr(vision_module, "_verify_codesign", lambda value: None)
     monkeypatch.setattr(vision_module.subprocess, "Popen", synchronized_popen)
     if stage == "selector":
@@ -501,8 +515,14 @@ def test_default_runner_reaps_process_and_closes_pipes_when_setup_fails(
             TrackingSelector,
         )
     monkeypatch.setattr(vision_module.os, "set_blocking", failing_set_blocking)
+    monkeypatch.setattr(vision_module.time, "monotonic", failing_monotonic)
     try:
-        with pytest.raises((RuntimeError, VisionOcrError), match="synthetic|pipe"):
+        expected = (
+            KeyboardInterrupt
+            if stage == "deadline"
+            else (RuntimeError, VisionOcrError)
+        )
+        with pytest.raises(expected, match="synthetic|pipe"):
             vision_module._default_run_helper(request, snapshot)
 
         leader_pid, child_pid = _read_process_ids(process_ids)
@@ -533,6 +553,48 @@ def test_default_runner_reaps_process_and_closes_pipes_when_setup_fails(
                 process.stdout.close()
             if process.stderr is not None and not process.stderr.closed:
                 process.stderr.close()
+        if snapshot.path.exists():
+            snapshot.path.unlink()
+        if snapshot.directory.exists():
+            snapshot.directory.rmdir()
+
+
+def test_popen_failure_does_not_attempt_to_kill_an_unstarted_process_group(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    snapshot, source_fd = _private_snapshot_fixture(tmp_path)
+    request = RunRequest(
+        argv=(str(tmp_path / "book-vision-ocr"), "--version"),
+        environment=(("PATH", "/usr/bin:/bin:/usr/sbin:/sbin"),),
+        cwd=Path("/"),
+        timeout=120.0,
+        pass_fds=(),
+    )
+    terminated: list[object] = []
+    monkeypatch.setattr(vision_module, "_verify_codesign", lambda value: None)
+    monkeypatch.setattr(
+        vision_module.subprocess,
+        "Popen",
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            KeyboardInterrupt("synthetic Popen failure")
+        ),
+    )
+    monkeypatch.setattr(
+        vision_module,
+        "_terminate_process_group",
+        lambda process: terminated.append(process),
+    )
+    try:
+        with pytest.raises(KeyboardInterrupt, match="Popen"):
+            vision_module._default_run_helper(request, snapshot)
+
+        assert terminated == []
+        assert not snapshot.path.exists()
+        assert not snapshot.directory.exists()
+    finally:
+        os.close(snapshot.descriptor)
+        os.close(source_fd)
         if snapshot.path.exists():
             snapshot.path.unlink()
         if snapshot.directory.exists():

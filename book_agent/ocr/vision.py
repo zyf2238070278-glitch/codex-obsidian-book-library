@@ -145,36 +145,41 @@ def _run_bounded_command(
     executable: Path | None = None,
     pass_fds: tuple[int, ...] = (),
 ) -> subprocess.CompletedProcess[bytes]:
-    popen_arguments: dict[str, object] = {
-        "stdin": subprocess.DEVNULL,
-        "stdout": subprocess.PIPE,
-        "stderr": subprocess.PIPE,
-        "shell": False,
-        "cwd": os.fspath(cwd),
-        "env": dict(environment),
-        "close_fds": True,
-        "start_new_session": True,
-        "pass_fds": pass_fds,
-    }
-    if executable is not None:
-        popen_arguments["executable"] = os.fspath(executable)
-    process = subprocess.Popen(argv, **popen_arguments)  # type: ignore[arg-type]
+    process: subprocess.Popen[bytes] | None = None
     selector: selectors.BaseSelector | None = None
-    streams: dict[str, object] = {}
-    stdout = bytearray()
-    stderr = bytearray()
+    streams: dict[str, object] | None = None
+    stdout: bytearray | None = None
+    stderr: bytearray | None = None
     stderr_truncated = False
-    deadline = time.monotonic() + timeout
+    deadline: float | None = None
 
     try:
+        popen_arguments: dict[str, object] = {
+            "stdin": subprocess.DEVNULL,
+            "stdout": subprocess.PIPE,
+            "stderr": subprocess.PIPE,
+            "shell": False,
+            "cwd": os.fspath(cwd),
+            "env": dict(environment),
+            "close_fds": True,
+            "start_new_session": True,
+            "pass_fds": pass_fds,
+        }
+        if executable is not None:
+            popen_arguments["executable"] = os.fspath(executable)
+        process = subprocess.Popen(argv, **popen_arguments)  # type: ignore[arg-type]
         if process.stdout is None or process.stderr is None:
             raise VisionOcrError("Vision helper process pipes were not created")
         streams = {"stdout": process.stdout, "stderr": process.stderr}
+        stdout = bytearray()
+        stderr = bytearray()
+        deadline = time.monotonic() + timeout
         selector = selectors.DefaultSelector()
         for name, stream in streams.items():
             os.set_blocking(stream.fileno(), False)  # type: ignore[attr-defined]
             selector.register(stream, selectors.EVENT_READ, name)
 
+        assert deadline is not None and stdout is not None and stderr is not None
         while selector.get_map():
             remaining = deadline - time.monotonic()
             if remaining <= 0:
@@ -209,20 +214,24 @@ def _run_bounded_command(
             stderr.extend(b"\n...[truncated]")
         return subprocess.CompletedProcess(argv, returncode, bytes(stdout), bytes(stderr))
     except BaseException:
-        _terminate_process_group(process)
+        if process is not None:
+            _terminate_process_group(process)
         raise
     finally:
-        if selector is not None:
-            try:
-                selector.close()
-            except Exception:
-                pass
-        for stream in (process.stdout, process.stderr):
-            if stream is not None:
+        try:
+            if selector is not None:
                 try:
-                    stream.close()
+                    selector.close()
                 except Exception:
                     pass
+        finally:
+            if process is not None:
+                for stream in (process.stdout, process.stderr):
+                    if stream is not None:
+                        try:
+                            stream.close()
+                        except Exception:
+                            pass
 
 
 def _identity_from_stat(metadata: os.stat_result) -> _FileIdentity:

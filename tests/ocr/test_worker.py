@@ -6,6 +6,8 @@ from pathlib import Path
 import fitz
 
 from book_agent.config import AppPaths
+from book_agent.ocr.models import OcrPageOutcome
+from book_agent.ocr.router import OcrPageDecision
 from book_agent.ocr.worker import OcrWorker
 from book_agent.storage import Database
 
@@ -76,6 +78,22 @@ def test_blank_pages_still_complete(tmp_path):
     assert worker.run_once() is True
     assert database.get_ocr_job(book_id)["status"] == "failed"
     assert database.get_book(book_id)["status"] == "needs_ocr"
+
+
+def test_worker_continues_after_skipped_page_and_indexes_other_pages(tmp_path):
+    paths, database, _pdf, book_id = _app(tmp_path)
+    skipped = OcrPageDecision(
+        OcrPageOutcome("skipped", None, "all_local_engines_failed", "all engines failed"),
+        "",
+        None,
+        ("standard:apple_vision",),
+    )
+    engine = _Engine({1: "first", 2: skipped, 3: "third"})
+    worker = OcrWorker(paths, database, engine, _Indexer(database, book_id), worker_id="worker-a")
+
+    assert worker.run_once() is True
+    assert engine.requested_pages == [1, 2, 3]
+    assert database.get_ocr_job(book_id)["status"] == "completed"
 
 
 def test_page_fails_after_two_retries_and_worker_can_continue(tmp_path):

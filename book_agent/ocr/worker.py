@@ -23,6 +23,8 @@ import fitz
 from book_agent.config import AppPaths
 from book_agent.indexing import BookIndexer
 from book_agent.models import ParsedBook, SourceUnit
+from book_agent.ocr.models import OcrPageOutcome
+from book_agent.ocr.router import OcrPageDecision
 from book_agent.storage import Database
 
 
@@ -196,7 +198,17 @@ class OcrWorker:
                         result = self.engine.recognize_page(
                             original, page_index=physical_page - 1
                         )
-                        text, confidence = _result_text(result)
+                        if isinstance(result, OcrPageDecision):
+                            outcome = result.outcome
+                            text = result.text
+                            confidence = result.mean_confidence
+                        else:
+                            text, confidence = _result_text(result)
+                            outcome = (
+                                OcrPageOutcome("recognized", "apple_vision", "legacy")
+                                if text
+                                else OcrPageOutcome("blank", None, "legacy_empty")
+                            )
                         elapsed = max(0, int(round((self.monotonic() - started) * 1000)))
                     except (KeyboardInterrupt, SystemExit):
                         raise
@@ -220,16 +232,21 @@ class OcrWorker:
                     )
                     if checked is not None:
                         checked[1].close()
-                    digest = hashlib.sha256(text.encode("utf-8")).hexdigest()
+                    digest = (
+                        hashlib.sha256(text.encode("utf-8")).hexdigest()
+                        if outcome.status == "recognized"
+                        else None
+                    )
                     # Persistence and lease renewal are deliberately outside the
                     # engine retry block: a saved page must never be OCR'd again
                     # merely because renewing its lease failed.
-                    self.database.save_ocr_page(
+                    self.database.save_ocr_page_result(
                         book_id,
                         self.worker_id,
                         physical_page,
                         page_label,
-                        text,
+                        outcome,
+                        text if outcome.status == "recognized" else None,
                         digest,
                         confidence,
                         elapsed,

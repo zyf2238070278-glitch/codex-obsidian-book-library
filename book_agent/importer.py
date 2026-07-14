@@ -363,7 +363,10 @@ class ImportService:
                 parsed_path=None,
                 passage_count=0,
                 error=f"需要 OCR：{detail}",
-                message="原书已保存，但该 PDF 需要 OCR 后才能建立检索索引。",
+                message=(
+                    "原书已保存，但该 PDF 没有可提取文字。请明确说“开始 OCR 这本书”"
+                    "后再进行本机识别。"
+                ),
             )
         except Exception as error:
             detail = _error_detail(error)

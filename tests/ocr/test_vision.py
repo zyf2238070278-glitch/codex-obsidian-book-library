@@ -15,6 +15,7 @@ import pytest
 from book_agent.ocr import vision as vision_module
 from book_agent.ocr.vision import (
     HELPER_TIMEOUT_SECONDS,
+    MAXIMUM_HELPER_BYTES,
     MAXIMUM_LONG_EDGE_PIXELS,
     MAXIMUM_PAGE_PIXELS,
     MAXIMUM_STDOUT_BYTES,
@@ -91,6 +92,8 @@ class RecordingRunner:
                     executable.stat().st_dev,
                     executable.stat().st_ino,
                 ),
+                "executable_mode": stat.S_IMODE(executable.stat().st_mode),
+                "executable_contents": executable.read_bytes(),
                 "image": image,
                 "mode": stat.S_IMODE(image.stat().st_mode),
                 "width": pixmap.width,
@@ -344,10 +347,12 @@ def test_invokes_absolute_helper_and_png_with_fixed_contract(tmp_path: Path) -> 
     assert call["mode"] == 0o600
     assert Path(call["executable"]).is_absolute()
     assert Path(call["executable"]) != tmp_path / "book-vision-ocr"
-    assert call["executable_identity"] == (
+    assert call["executable_identity"] != (
         (tmp_path / "book-vision-ocr").stat().st_dev,
         (tmp_path / "book-vision-ocr").stat().st_ino,
     )
+    assert call["executable_mode"] == 0o700
+    assert call["executable_contents"] == (tmp_path / "book-vision-ocr").read_bytes()
     assert not Path(call["executable"]).exists()
     assert Path(argv[2]).parent == (tmp_path / "ocr-temp").absolute()
     assert not Path(argv[2]).exists()
@@ -490,6 +495,49 @@ def test_detects_helper_path_exchange_and_cleans_png(tmp_path: Path) -> None:
     assert list((tmp_path / "ocr-temp").glob("*.png")) == []
 
 
+def test_private_helper_snapshot_is_immune_to_in_place_source_rewrite(
+    tmp_path: Path,
+) -> None:
+    pdf = _write_pdf(tmp_path / "book.pdf")
+    helper = _helper(tmp_path)
+    original = helper.read_bytes()
+    replacement = original.replace(b"exit 0", b"exit 9")
+    before = helper.stat()
+
+    class RewritingRunner(RecordingRunner):
+        snapshot_contents: bytes | None = None
+
+        def __call__(self, *args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes | str]:
+            executable = Path(kwargs["executable"])
+            helper.write_bytes(replacement)
+            helper.chmod(stat.S_IMODE(before.st_mode))
+            os.utime(helper, ns=(before.st_atime_ns, before.st_mtime_ns))
+            self.snapshot_contents = executable.read_bytes()
+            return super().__call__(*args, **kwargs)  # type: ignore[arg-type]
+
+    runner = RewritingRunner()
+    with pytest.raises(VisionOcrError, match="helper changed|helper.*changed"):
+        _engine(tmp_path, runner, helper=helper).recognize_page(pdf, page_index=0)
+
+    assert runner.snapshot_contents == original
+    assert helper.read_bytes() == replacement
+    assert list((tmp_path / "ocr-temp").iterdir()) == []
+
+
+def test_rejects_helper_larger_than_bounded_snapshot_limit(tmp_path: Path) -> None:
+    pdf = _write_pdf(tmp_path / "book.pdf")
+    helper = tmp_path / "oversized-helper"
+    with helper.open("wb") as stream:
+        stream.truncate(MAXIMUM_HELPER_BYTES + 1)
+    helper.chmod(0o700)
+    runner = RecordingRunner()
+
+    with pytest.raises(VisionOcrError, match="helper.*size|helper.*large"):
+        _engine(tmp_path, runner, helper=helper).recognize_page(pdf, page_index=0)
+
+    assert runner.calls == []
+
+
 def test_detects_png_path_exchange_without_following_symlink(tmp_path: Path) -> None:
     pdf = _write_pdf(tmp_path / "book.pdf")
 
@@ -505,7 +553,143 @@ def test_detects_png_path_exchange_without_following_symlink(tmp_path: Path) -> 
         _engine(tmp_path, SwappingRunner()).recognize_page(pdf, page_index=0)
 
     assert pdf.is_file()
-    assert list((tmp_path / "ocr-temp").iterdir()) == []
+    remaining = list((tmp_path / "ocr-temp").iterdir())
+    assert len(remaining) == 1
+    assert remaining[0].is_symlink()
+    assert remaining[0].resolve() == pdf
+
+
+@pytest.mark.parametrize("artifact", ["image", "executable"])
+def test_cleanup_never_unlinks_regular_file_replacement(
+    tmp_path: Path,
+    artifact: str,
+) -> None:
+    pdf = _write_pdf(tmp_path / "book.pdf")
+    sentinel = tmp_path / f"user-{artifact}.pdf"
+    sentinel_bytes = b"USER PDF SENTINEL - MUST SURVIVE"
+    sentinel.write_bytes(sentinel_bytes)
+
+    class ReplacingRunner(RecordingRunner):
+        replacement_path: Path | None = None
+
+        def __call__(self, *args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes | str]:
+            argv = args[0]
+            target = Path(argv[2]) if artifact == "image" else Path(kwargs["executable"])
+            result = super().__call__(*args, **kwargs)  # type: ignore[arg-type]
+            os.replace(sentinel, target)
+            self.replacement_path = target
+            return result
+
+    runner = ReplacingRunner()
+    with pytest.raises(VisionOcrError, match="changed|cleanup refused") as captured:
+        _engine(tmp_path, runner).recognize_page(pdf, page_index=0)
+
+    assert runner.replacement_path is not None
+    assert runner.replacement_path.is_file()
+    assert runner.replacement_path.read_bytes() == sentinel_bytes
+    assert any("cleanup refused" in note for note in getattr(captured.value, "__notes__", []))
+
+
+@pytest.mark.parametrize("failure", ["error", "interrupt"])
+def test_cleanup_refusal_is_attached_without_hiding_primary_failure(
+    tmp_path: Path,
+    failure: str,
+) -> None:
+    pdf = _write_pdf(tmp_path / "book.pdf")
+    sentinel = tmp_path / f"user-{failure}.pdf"
+    sentinel_bytes = b"USER PDF SENTINEL ON FAILURE"
+    sentinel.write_bytes(sentinel_bytes)
+
+    class FailingReplacingRunner(RecordingRunner):
+        replacement_path: Path | None = None
+
+        def __call__(self, *args: object, **kwargs: object) -> subprocess.CompletedProcess[bytes | str]:
+            image = Path(args[0][2])
+            os.replace(sentinel, image)
+            self.replacement_path = image
+            if failure == "interrupt":
+                raise KeyboardInterrupt()
+            raise subprocess.TimeoutExpired(args[0], 120)
+
+    runner = FailingReplacingRunner()
+    expected = KeyboardInterrupt if failure == "interrupt" else VisionOcrError
+    with pytest.raises(expected) as captured:
+        _engine(tmp_path, runner).recognize_page(pdf, page_index=0)
+
+    assert runner.replacement_path is not None
+    assert runner.replacement_path.read_bytes() == sentinel_bytes
+    assert any("cleanup refused" in note for note in getattr(captured.value, "__notes__", []))
+
+
+@pytest.mark.parametrize("stage", ["png", "snapshot"])
+def test_partial_artifact_cleanup_never_unlinks_regular_replacement(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    stage: str,
+) -> None:
+    pdf = _write_pdf(tmp_path / "book.pdf")
+    sentinel = tmp_path / f"partial-{stage}.pdf"
+    sentinel_bytes = b"PARTIAL ARTIFACT USER PDF SENTINEL"
+    sentinel.write_bytes(sentinel_bytes)
+    temp_root = tmp_path / "ocr-temp"
+    real_fsync = vision_module.os.fsync
+    replacement_path: Path | None = None
+
+    def replacing_fsync(descriptor: int) -> None:
+        nonlocal replacement_path
+        pattern = "vision-page-*.png" if stage == "png" else "vision-helper-*.snapshot"
+        candidates = list(temp_root.glob(pattern))
+        if candidates:
+            replacement_path = candidates[0]
+            os.replace(sentinel, replacement_path)
+            raise OSError(f"synthetic {stage} fsync failure")
+        real_fsync(descriptor)
+
+    monkeypatch.setattr(vision_module.os, "fsync", replacing_fsync)
+
+    with pytest.raises(VisionOcrError, match="could not.*(PNG|snapshot)") as captured:
+        _engine(tmp_path, RecordingRunner()).recognize_page(pdf, page_index=0)
+
+    assert replacement_path is not None
+    assert replacement_path.read_bytes() == sentinel_bytes
+    assert any("cleanup refused" in note for note in getattr(captured.value, "__notes__", []))
+
+
+@pytest.mark.parametrize("valid_output", [True, False])
+def test_original_pdf_bytes_and_metadata_are_never_modified(
+    tmp_path: Path,
+    valid_output: bool,
+) -> None:
+    pdf = _write_pdf(tmp_path / "book.pdf", pages=2)
+    before_bytes = pdf.read_bytes()
+    before = pdf.stat()
+    runner = RecordingRunner(_payload() if valid_output else b"{")
+
+    if valid_output:
+        _engine(tmp_path, runner).recognize_page(pdf, page_index=1)
+    else:
+        with pytest.raises(VisionOcrError, match="JSON"):
+            _engine(tmp_path, runner).recognize_page(pdf, page_index=1)
+
+    after = pdf.stat()
+    assert pdf.read_bytes() == before_bytes
+    assert (after.st_dev, after.st_ino, after.st_size, after.st_mode, after.st_mtime_ns) == (
+        before.st_dev,
+        before.st_ino,
+        before.st_size,
+        before.st_mode,
+        before.st_mtime_ns,
+    )
+
+
+def test_deeply_nested_json_becomes_stable_vision_error(tmp_path: Path) -> None:
+    pdf = _write_pdf(tmp_path / "book.pdf")
+    deeply_nested = b"[" * 10_000 + b"0" + b"]" * 10_000
+
+    with pytest.raises(VisionOcrError, match="invalid JSON"):
+        _engine(tmp_path, RecordingRunner(deeply_nested)).recognize_page(
+            pdf, page_index=0
+        )
 
 
 def test_helper_must_be_absolute_regular_and_executable(tmp_path: Path) -> None:

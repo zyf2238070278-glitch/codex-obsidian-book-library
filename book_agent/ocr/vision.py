@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import os
+import secrets
 import selectors
 import signal
 import stat
@@ -30,6 +32,7 @@ HELPER_TIMEOUT_SECONDS = 120.0
 MAXIMUM_STDOUT_BYTES = 1024 * 1024
 MAXIMUM_STDERR_BYTES = 16 * 1024
 MAXIMUM_DIAGNOSTIC_BYTES = 4 * 1024
+MAXIMUM_HELPER_BYTES = 256 * 1024 * 1024
 MAXIMUM_TEXT_UTF8_BYTES = 400_000
 MAXIMUM_TEXT_UNICODE_SCALARS = 100_000
 SAFE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
@@ -185,6 +188,104 @@ def _path_has_identity(path: Path, expected: _FileIdentity) -> bool:
     return _identity_from_stat(metadata) == expected
 
 
+def _same_created_file(metadata: os.stat_result, expected: _FileIdentity) -> bool:
+    return (
+        stat.S_ISREG(metadata.st_mode)
+        and metadata.st_dev == expected.device
+        and metadata.st_ino == expected.inode
+        and metadata.st_mode == expected.mode
+    )
+
+
+def _cleanup_owned_artifact(
+    path: Path,
+    expected: _FileIdentity,
+    *,
+    description: str,
+) -> str | None:
+    """Delete only the exact regular file created by this process."""
+
+    descriptor = -1
+    flags = os.O_RDONLY | getattr(os, "O_CLOEXEC", 0) | getattr(os, "O_NOFOLLOW", 0)
+    try:
+        descriptor = os.open(path, flags)
+        opened = os.fstat(descriptor)
+        current = os.lstat(path)
+        if not _same_created_file(opened, expected) or not _same_created_file(
+            current, expected
+        ):
+            return (
+                f"safety cleanup refused for {description}: path no longer identifies "
+                "the created regular file"
+            )
+        try:
+            os.unlink(path)
+        except OSError as exc:
+            return f"safety cleanup refused for {description}: could not unlink: {exc}"
+        return None
+    except FileNotFoundError:
+        return f"safety cleanup refused for {description}: artifact path disappeared"
+    except OSError as exc:
+        return f"safety cleanup refused for {description}: {exc}"
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
+def _add_cleanup_note(error: BaseException, diagnostic: str) -> None:
+    try:
+        error.add_note(diagnostic)
+    except AttributeError:
+        pass
+
+
+def _hash_descriptor(
+    descriptor: int,
+    *,
+    maximum_bytes: int,
+) -> tuple[str, int]:
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    digest = hashlib.sha256()
+    total = 0
+    while True:
+        chunk = os.read(descriptor, 1024 * 1024)
+        if not chunk:
+            break
+        total += len(chunk)
+        if total > maximum_bytes:
+            raise VisionOcrError("Vision helper file size exceeds the safe limit")
+        digest.update(chunk)
+    os.lseek(descriptor, 0, os.SEEK_SET)
+    return digest.hexdigest(), total
+
+
+def _path_matches_digest(
+    path: Path,
+    expected: _FileIdentity,
+    expected_digest: str,
+) -> bool:
+    descriptor = -1
+    try:
+        descriptor, opened = _open_regular_nofollow(path, description="Vision helper")
+        if opened != expected:
+            return False
+        digest, size = _hash_descriptor(
+            descriptor,
+            maximum_bytes=MAXIMUM_HELPER_BYTES,
+        )
+        return (
+            size == expected.size
+            and digest == expected_digest
+            and _identity_from_stat(os.fstat(descriptor)) == expected
+            and _path_has_identity(path, expected)
+        )
+    except (OSError, VisionOcrError):
+        return False
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+
+
 def _strict_json_object_pairs(pairs: list[tuple[str, object]]) -> dict[str, object]:
     result: dict[str, object] = {}
     for key, value in pairs:
@@ -290,7 +391,7 @@ def _parse_helper_output(stdout: bytes | str) -> VisionPageResult:
             parse_constant=_reject_json_constant,
             object_pairs_hook=_strict_json_object_pairs,
         )
-    except (json.JSONDecodeError, ValueError) as exc:
+    except (json.JSONDecodeError, ValueError, RecursionError) as exc:
         raise VisionOcrError(f"Vision helper returned invalid JSON: {exc}") from exc
     if type(payload) is not dict or set(payload) != {"schema_version", "lines"}:
         raise VisionOcrError("Vision helper response has an invalid schema")
@@ -374,19 +475,31 @@ class VisionOcrEngine:
         self._temp_root = temp_root
         self._run_helper = run_helper
 
-    def _validate_helper(self) -> _FileIdentity:
+    def _validate_helper(self) -> tuple[int, _FileIdentity, str]:
         if not self._helper.is_absolute():
             raise VisionOcrError("Vision helper path must be absolute")
         descriptor, identity = _open_regular_nofollow(
             self._helper,
             description="Vision helper",
         )
-        os.close(descriptor)
-        if identity.size <= 0:
-            raise VisionOcrError("Vision helper must not be empty")
-        if identity.mode & 0o111 == 0 or not os.access(self._helper, os.X_OK):
-            raise VisionOcrError("Vision helper must be executable")
-        return identity
+        try:
+            if identity.size <= 0:
+                raise VisionOcrError("Vision helper must not be empty")
+            if identity.size > MAXIMUM_HELPER_BYTES:
+                raise VisionOcrError("Vision helper file size exceeds the safe limit")
+            if identity.mode & 0o111 == 0:
+                raise VisionOcrError("Vision helper must be executable")
+            digest, size = _hash_descriptor(
+                descriptor,
+                maximum_bytes=MAXIMUM_HELPER_BYTES,
+            )
+            after = _identity_from_stat(os.fstat(descriptor))
+            if after != identity or size != identity.size:
+                raise VisionOcrError("Vision helper changed while being validated")
+            return descriptor, identity, digest
+        except BaseException:
+            os.close(descriptor)
+            raise
 
     def _prepare_temp_root(self) -> Path:
         if not self._temp_root.is_absolute():
@@ -490,6 +603,7 @@ class VisionOcrEngine:
     def _write_png(pixmap: fitz.Pixmap, temp_root: Path) -> tuple[Path, _FileIdentity]:
         descriptor = -1
         path: Path | None = None
+        creation_identity: _FileIdentity | None = None
         try:
             descriptor, raw_path = tempfile.mkstemp(
                 prefix="vision-page-",
@@ -497,7 +611,9 @@ class VisionOcrEngine:
                 dir=temp_root,
             )
             path = Path(raw_path)
+            creation_identity = _identity_from_stat(os.fstat(descriptor))
             os.fchmod(descriptor, 0o600)
+            creation_identity = _identity_from_stat(os.fstat(descriptor))
             png = pixmap.tobytes("png")
             view = memoryview(png)
             while view:
@@ -515,62 +631,162 @@ class VisionOcrEngine:
             if not _path_has_identity(path, identity):
                 raise VisionOcrError("OCR temporary PNG changed while being written")
             return path, identity
-        except BaseException:
-            if path is not None:
-                try:
-                    path.unlink(missing_ok=True)
-                except OSError:
-                    pass
+        except OSError as exc:
+            error = VisionOcrError(f"could not create OCR temporary PNG: {exc}")
+            if path is not None and creation_identity is not None:
+                diagnostic = _cleanup_owned_artifact(
+                    path,
+                    creation_identity,
+                    description="OCR temporary PNG",
+                )
+                if diagnostic is not None:
+                    _add_cleanup_note(error, diagnostic)
+            raise error from exc
+        except BaseException as exc:
+            if path is not None and creation_identity is not None:
+                diagnostic = _cleanup_owned_artifact(
+                    path,
+                    creation_identity,
+                    description="OCR temporary PNG",
+                )
+                if diagnostic is not None:
+                    _add_cleanup_note(exc, diagnostic)
             raise
         finally:
             if descriptor >= 0:
                 os.close(descriptor)
 
     @staticmethod
-    def _pin_helper(
-        helper: Path,
+    def _snapshot_helper(
+        source_descriptor: int,
         temp_root: Path,
         expected: _FileIdentity,
-    ) -> Path:
-        """Hard-link the verified helper so path replacement cannot change execution."""
+        expected_digest: str,
+    ) -> tuple[Path, _FileIdentity, str]:
+        """Copy a verified helper fd into an independent private executable."""
 
-        descriptor, raw_path = tempfile.mkstemp(
-            prefix="vision-helper-",
-            suffix=".pinned",
-            dir=temp_root,
-        )
-        os.close(descriptor)
-        pinned = Path(raw_path)
+        snapshot: Path | None = None
+        descriptor = -1
+        creation_identity: _FileIdentity | None = None
         try:
-            pinned.unlink()
-            os.link(helper, pinned, follow_symlinks=False)
-            metadata = os.lstat(pinned)
-            if not stat.S_ISREG(metadata.st_mode):
-                raise VisionOcrError("pinned Vision helper must be a regular file")
-            if _identity_from_stat(metadata) != expected:
-                raise VisionOcrError("Vision helper changed before recognition started")
-            return pinned
-        except VisionOcrError:
-            pinned.unlink(missing_ok=True)
-            raise
+            for _ in range(16):
+                candidate = temp_root / f"vision-helper-{secrets.token_hex(16)}.snapshot"
+                try:
+                    descriptor = os.open(
+                        candidate,
+                        os.O_WRONLY
+                        | os.O_CREAT
+                        | os.O_EXCL
+                        | getattr(os, "O_CLOEXEC", 0)
+                        | getattr(os, "O_NOFOLLOW", 0),
+                        0o700,
+                    )
+                except FileExistsError:
+                    continue
+                snapshot = candidate
+                break
+            if snapshot is None or descriptor < 0:
+                raise VisionOcrError("could not create a private Vision helper snapshot")
+            creation_identity = _identity_from_stat(os.fstat(descriptor))
+            os.fchmod(descriptor, 0o700)
+            creation_identity = _identity_from_stat(os.fstat(descriptor))
+
+            if _identity_from_stat(os.fstat(source_descriptor)) != expected:
+                raise VisionOcrError("Vision helper changed before snapshot creation")
+            os.lseek(source_descriptor, 0, os.SEEK_SET)
+            copied_digest = hashlib.sha256()
+            copied = 0
+            while True:
+                chunk = os.read(source_descriptor, 1024 * 1024)
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > MAXIMUM_HELPER_BYTES:
+                    raise VisionOcrError("Vision helper file size exceeds the safe limit")
+                copied_digest.update(chunk)
+                view = memoryview(chunk)
+                while view:
+                    written = os.write(descriptor, view)
+                    if written <= 0:
+                        raise OSError("short helper snapshot write")
+                    view = view[written:]
+            os.fsync(descriptor)
+            snapshot_identity = _identity_from_stat(os.fstat(descriptor))
+            source_after = _identity_from_stat(os.fstat(source_descriptor))
+            source_digest, source_size = _hash_descriptor(
+                source_descriptor,
+                maximum_bytes=MAXIMUM_HELPER_BYTES,
+            )
+            snapshot_digest = copied_digest.hexdigest()
+            if (
+                source_after != expected
+                or source_size != expected.size
+                or source_digest != expected_digest
+                or copied != expected.size
+                or snapshot_digest != expected_digest
+            ):
+                raise VisionOcrError("Vision helper changed during snapshot creation")
+            if (
+                not stat.S_ISREG(snapshot_identity.mode)
+                or stat.S_IMODE(snapshot_identity.mode) != 0o700
+                or snapshot_identity.size != expected.size
+            ):
+                raise VisionOcrError("Vision helper snapshot has an unsafe file identity")
+            if not _path_has_identity(snapshot, snapshot_identity):
+                raise VisionOcrError("Vision helper snapshot changed while being created")
+            return snapshot, snapshot_identity, snapshot_digest
         except OSError as exc:
-            pinned.unlink(missing_ok=True)
-            raise VisionOcrError(f"could not pin Vision helper safely: {exc}") from exc
+            error = VisionOcrError(f"could not create Vision helper snapshot: {exc}")
+            if snapshot is not None and creation_identity is not None:
+                diagnostic = _cleanup_owned_artifact(
+                    snapshot,
+                    creation_identity,
+                    description="Vision helper snapshot",
+                )
+                if diagnostic is not None:
+                    _add_cleanup_note(error, diagnostic)
+            raise error from exc
+        except BaseException as exc:
+            if snapshot is not None and creation_identity is not None:
+                diagnostic = _cleanup_owned_artifact(
+                    snapshot,
+                    creation_identity,
+                    description="Vision helper snapshot",
+                )
+                if diagnostic is not None:
+                    _add_cleanup_note(exc, diagnostic)
+            raise
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
     def recognize_page(self, pdf: Path, *, page_index: int) -> VisionPageResult:
-        helper_identity = self._validate_helper()
-        temp_root = self._prepare_temp_root()
-        pixmap, _rendered_dpi = self._render_page(pdf, page_index)
+        helper_descriptor = -1
+        helper_identity: _FileIdentity | None = None
+        helper_digest: str | None = None
         image_path: Path | None = None
         image_identity: _FileIdentity | None = None
-        pinned_helper: Path | None = None
+        snapshot_path: Path | None = None
+        snapshot_identity: _FileIdentity | None = None
+        snapshot_digest: str | None = None
+        primary_error: BaseException | None = None
         try:
+            helper_descriptor, helper_identity, helper_digest = self._validate_helper()
+            temp_root = self._prepare_temp_root()
+            pixmap, _rendered_dpi = self._render_page(pdf, page_index)
             image_path, image_identity = self._write_png(pixmap, temp_root)
-            pinned_helper = self._pin_helper(
-                self._helper,
+            snapshot_path, snapshot_identity, snapshot_digest = self._snapshot_helper(
+                helper_descriptor,
                 temp_root,
                 helper_identity,
+                helper_digest,
             )
+            if not _path_matches_digest(
+                snapshot_path,
+                snapshot_identity,
+                snapshot_digest,
+            ):
+                raise VisionOcrError("Vision helper snapshot changed before recognition")
             argv = [
                 os.fspath(self._helper),
                 "--image",
@@ -589,7 +805,7 @@ class VisionOcrEngine:
                     environment=environment,
                     cwd=Path("/"),
                     timeout=HELPER_TIMEOUT_SECONDS,
-                    executable=pinned_helper,
+                    executable=snapshot_path,
                 )
             except subprocess.TimeoutExpired as exc:
                 raise VisionOcrError(
@@ -600,10 +816,23 @@ class VisionOcrEngine:
             except (OSError, subprocess.SubprocessError, TypeError) as exc:
                 raise VisionOcrError(f"could not run Vision helper: {exc}") from exc
 
-            if not _path_has_identity(self._helper, helper_identity):
+            source_digest, source_size = _hash_descriptor(
+                helper_descriptor,
+                maximum_bytes=MAXIMUM_HELPER_BYTES,
+            )
+            if (
+                not _path_has_identity(self._helper, helper_identity)
+                or _identity_from_stat(os.fstat(helper_descriptor)) != helper_identity
+                or source_size != helper_identity.size
+                or source_digest != helper_digest
+            ):
                 raise VisionOcrError("Vision helper changed while recognition was running")
-            if not _path_has_identity(pinned_helper, helper_identity):
-                raise VisionOcrError("pinned Vision helper changed during recognition")
+            if not _path_matches_digest(
+                snapshot_path,
+                snapshot_identity,
+                snapshot_digest,
+            ):
+                raise VisionOcrError("Vision helper snapshot changed during recognition")
             if not _path_has_identity(image_path, image_identity):
                 raise VisionOcrError("OCR temporary PNG changed during recognition")
             if not isinstance(result, subprocess.CompletedProcess):
@@ -616,22 +845,41 @@ class VisionOcrEngine:
                     f"{_safe_diagnostic(result.stderr)}"
                 )
             return _parse_helper_output(result.stdout)
+        except BaseException as exc:
+            primary_error = exc
+            raise
         finally:
-            if image_path is not None:
-                try:
-                    image_path.unlink(missing_ok=True)
-                except OSError:
-                    pass
-            if pinned_helper is not None:
-                try:
-                    pinned_helper.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            cleanup_errors: list[str] = []
+            if image_path is not None and image_identity is not None:
+                diagnostic = _cleanup_owned_artifact(
+                    image_path,
+                    image_identity,
+                    description="OCR temporary PNG",
+                )
+                if diagnostic is not None:
+                    cleanup_errors.append(diagnostic)
+            if snapshot_path is not None and snapshot_identity is not None:
+                diagnostic = _cleanup_owned_artifact(
+                    snapshot_path,
+                    snapshot_identity,
+                    description="Vision helper snapshot",
+                )
+                if diagnostic is not None:
+                    cleanup_errors.append(diagnostic)
+            if helper_descriptor >= 0:
+                os.close(helper_descriptor)
+            if cleanup_errors:
+                diagnostic = "; ".join(cleanup_errors)
+                if primary_error is not None:
+                    _add_cleanup_note(primary_error, diagnostic)
+                else:
+                    raise VisionOcrError(diagnostic)
 
 
 __all__ = [
     "HELPER_TIMEOUT_SECONDS",
     "MAXIMUM_LONG_EDGE_PIXELS",
+    "MAXIMUM_HELPER_BYTES",
     "MAXIMUM_PAGE_PIXELS",
     "MAXIMUM_STDOUT_BYTES",
     "VisionOcrEngine",

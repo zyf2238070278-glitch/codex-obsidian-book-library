@@ -24,6 +24,9 @@ class AppPaths:
     notes: Path
     database: Path
     models: Path
+    ocr: Path
+    ocr_logs: Path
+    vision_helper: Path
 
     @classmethod
     def from_root(cls, root: Path, vault_root: Path | None = None) -> Self:
@@ -45,4 +48,7 @@ class AppPaths:
             notes=library / "30-AI读书笔记",
             database=resolved_root / "data" / "library.sqlite3",
             models=resolved_root / "data" / "models",
+            ocr=resolved_root / "data" / "ocr",
+            ocr_logs=resolved_root / "data" / "ocr" / "logs",
+            vision_helper=resolved_root / "bin" / "book-vision-ocr",
         )

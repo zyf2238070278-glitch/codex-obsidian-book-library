@@ -1,0 +1,804 @@
+import json
+from dataclasses import FrozenInstanceError
+from pathlib import Path
+
+import numpy as np
+import pytest
+
+import book_agent.indexing as indexing_module
+from book_agent.config import AppPaths
+from book_agent.embeddings import NullEmbeddingProvider, decode_vector
+from book_agent.indexing import BookIndexer, IndexResult
+from book_agent.models import ParsedBook, SourceUnit
+from book_agent.storage import Database
+
+
+class _ReadyEmbeddingProvider:
+    available = True
+
+    def embed_passages(self, texts: list[str]) -> np.ndarray:
+        return np.array(
+            [
+                [ordinal, ordinal + 0.5, ordinal + 1.0]
+                for ordinal, _ in enumerate(texts)
+            ],
+            dtype=np.float64,
+        )
+
+
+class _FailingEmbeddingProvider(_ReadyEmbeddingProvider):
+    def embed_passages(self, texts: list[str]) -> np.ndarray:
+        raise RuntimeError("模型暂时不可用")
+
+
+class _WrongCountEmbeddingProvider(_ReadyEmbeddingProvider):
+    def embed_passages(self, texts: list[str]) -> np.ndarray:
+        return np.empty((0, 3), dtype=np.float32)
+
+
+class _InvalidEmbeddingProvider(_ReadyEmbeddingProvider):
+    def __init__(self, case: str) -> None:
+        self.case = case
+
+    def embed_passages(self, texts: list[str]):
+        count = len(texts)
+        if self.case == "empty":
+            return np.empty((count, 0), dtype=np.float32)
+        if self.case == "nan":
+            vectors = np.ones((count, 3), dtype=np.float32)
+            vectors[0, 0] = np.nan
+            return vectors
+        if self.case == "inf":
+            vectors = np.ones((count, 3), dtype=np.float32)
+            vectors[0, 0] = np.inf
+            return vectors
+        if self.case == "two-dimensional-row":
+            return [np.ones((1, 3), dtype=np.float32) for _ in texts]
+        if self.case == "mixed-dimensions":
+            return [
+                np.ones(2 + ordinal, dtype=np.float32)
+                for ordinal, _ in enumerate(texts)
+            ]
+        raise AssertionError(f"unknown case: {self.case}")
+
+
+class _InterruptingEmbeddingProvider(_ReadyEmbeddingProvider):
+    def embed_passages(self, texts: list[str]) -> np.ndarray:
+        raise KeyboardInterrupt("operator cancelled embedding")
+
+
+@pytest.fixture
+def app(tmp_path: Path) -> tuple[AppPaths, Database, _ReadyEmbeddingProvider]:
+    paths = AppPaths.from_root(tmp_path / "app")
+    database = Database(paths.database)
+    database.initialize()
+    paths.originals.mkdir(parents=True)
+    original = paths.originals / "scan.pdf"
+    original.write_bytes(b"source")
+    database.create_book(
+        book_id="a" * 24,
+        title="导入前标题",
+        author=None,
+        source_format="pdf",
+        content_sha256="f" * 64,
+        original_path=str(original),
+    )
+    return paths, database, _ReadyEmbeddingProvider()
+
+
+def _register_book(
+    paths: AppPaths,
+    database: Database,
+    *,
+    book_id: str,
+    source_format: str = "pdf",
+) -> Path:
+    paths.originals.mkdir(parents=True, exist_ok=True)
+    original = paths.originals / f"{book_id}.{source_format}"
+    original.write_bytes(b"source")
+    database.create_book(
+        book_id=book_id,
+        title="导入前标题",
+        author=None,
+        source_format=source_format,
+        content_sha256=book_id.ljust(64, "f"),
+        original_path=str(original),
+    )
+    return original
+
+
+def _two_passage_book() -> ParsedBook:
+    return ParsedBook(
+        title="多段测试",
+        author=None,
+        source_format="txt",
+        units=(
+            SourceUnit("第一段" + "甲" * 1600),
+            SourceUnit("第二段" + "乙" * 1600),
+        ),
+    )
+
+
+def _parsed_for_preflight() -> ParsedBook:
+    return ParsedBook(
+        title="不应写入的标题",
+        author="不应写入的作者",
+        source_format="pdf",
+        units=(SourceUnit("不应发布的正文", page_start=1, page_end=1),),
+    )
+
+
+def _file_snapshot(root: Path) -> dict[Path, bytes]:
+    if not root.exists():
+        return {}
+    return {
+        path.relative_to(root): path.read_bytes()
+        for path in root.rglob("*")
+        if path.is_file()
+    }
+
+
+def _forbid_index_writes(
+    database: Database,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def unexpected_write(*args, **kwargs) -> None:
+        raise AssertionError("index preflight performed a database write")
+
+    for method_name in (
+        "update_book_metadata",
+        "update_book_status",
+        "replace_passages",
+        "set_embeddings",
+    ):
+        monkeypatch.setattr(database, method_name, unexpected_write)
+
+
+def test_indexer_publishes_markdown_passages_and_ready_status(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+) -> None:
+    paths, database, provider = app
+    parsed = ParsedBook(
+        title="扫描测试",
+        author="作者",
+        source_format="pdf",
+        units=(
+            SourceUnit(
+                "第一页正文足够长。",
+                page_start=1,
+                page_end=1,
+            ),
+        ),
+    )
+
+    result = BookIndexer(paths, database, provider).index_parsed_book(
+        book_id="a" * 24,
+        parsed=parsed,
+        original_path=paths.originals / "scan.pdf",
+    )
+
+    assert result.status == "ready"
+    assert database.count_passages("a" * 24) == 1
+    assert result.parsed_path is not None
+    assert "PDF 页 1" in Path(result.parsed_path).read_text(encoding="utf-8")
+    book = database.get_book("a" * 24)
+    assert book is not None
+    assert book["title"] == "扫描测试"
+    assert book["author"] == "作者"
+    assert book["parsed_path"] == result.parsed_path
+    assert result.parsed_path == str(
+        (paths.parsed / ("a" * 24) / "正文.md").absolute()
+    )
+    hits = database.keyword_search("第一页正文", 5)
+    assert len(hits) == 1
+    assert hits[0].page_start == hits[0].page_end == 1
+    assert hits[0].markdown_path == f"书库/20-解析文本/{'a' * 24}/正文.md"
+    embedded = list(database.iter_embeddings(["a" * 24]))
+    assert len(embedded) == result.passage_count == 1
+    np.testing.assert_array_equal(
+        decode_vector(embedded[0][1]),
+        np.array([0.0, 0.5, 1.0], dtype=np.float32),
+    )
+
+
+@pytest.mark.parametrize(
+    "book_id",
+    [
+        True,
+        None,
+        Path("a" * 24),
+        "A" * 24,
+        "a" * 23,
+        "a" * 25,
+        "g" * 24,
+        "a" * 12 + "/" + "b" * 11,
+    ],
+)
+def test_indexer_rejects_invalid_book_ids_before_any_mutation(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+    monkeypatch: pytest.MonkeyPatch,
+    book_id: object,
+) -> None:
+    paths, database, provider = app
+    books_before = database.list_books()
+    passage_count_before = database.count_passages()
+    files_before = _file_snapshot(paths.vault)
+    _forbid_index_writes(database, monkeypatch)
+
+    result = BookIndexer(paths, database, provider).index_parsed_book(
+        book_id=book_id,  # type: ignore[arg-type]
+        parsed=_parsed_for_preflight(),
+        original_path=paths.originals / "scan.pdf",
+    )
+
+    expected = "索引失败：book_id 必须是 24 位小写十六进制字符串。"
+    assert result == IndexResult(
+        status="failed",
+        parsed_path=None,
+        passage_count=0,
+        error=expected,
+        message=expected,
+    )
+    assert database.list_books() == books_before
+    assert database.count_passages() == passage_count_before
+    assert _file_snapshot(paths.vault) == files_before
+
+
+def test_indexer_rejects_path_traversal_without_overwriting_vault_sentinel(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database, provider = app
+    paths.notes.mkdir(parents=True)
+    sentinel = paths.notes / "正文.md"
+    sentinel.write_text("用户笔记哨兵", encoding="utf-8")
+    paths.parsed.mkdir(parents=True)
+    parsed_sentinel = paths.parsed / "保留.md"
+    parsed_sentinel.write_text("解析目录哨兵", encoding="utf-8")
+    books_before = database.list_books()
+    passage_count_before = database.count_passages()
+    _forbid_index_writes(database, monkeypatch)
+
+    result = BookIndexer(paths, database, provider).index_parsed_book(
+        book_id="../30-AI读书笔记",
+        parsed=_parsed_for_preflight(),
+        original_path=paths.originals / "scan.pdf",
+    )
+
+    expected = "索引失败：book_id 必须是 24 位小写十六进制字符串。"
+    assert result.error == result.message == expected
+    assert result.parsed_path is None
+    assert sentinel.read_text(encoding="utf-8") == "用户笔记哨兵"
+    assert parsed_sentinel.read_text(encoding="utf-8") == "解析目录哨兵"
+    assert database.list_books() == books_before
+    assert database.count_passages() == passage_count_before
+
+
+def test_indexer_rejects_unknown_book_before_publishing_or_database_writes(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database, provider = app
+    missing_id = "d" * 24
+    paths.parsed.mkdir(parents=True)
+    parsed_sentinel = paths.parsed / "保留.md"
+    parsed_sentinel.write_text("解析目录哨兵", encoding="utf-8")
+    books_before = database.list_books()
+    passage_count_before = database.count_passages()
+    files_before = _file_snapshot(paths.vault)
+    _forbid_index_writes(database, monkeypatch)
+
+    result = BookIndexer(paths, database, provider).index_parsed_book(
+        book_id=missing_id,
+        parsed=_parsed_for_preflight(),
+        original_path=paths.originals / "scan.pdf",
+    )
+
+    expected = f"索引失败：找不到书籍记录：{missing_id}"
+    assert result.error == result.message == expected
+    assert result.status == "failed"
+    assert result.parsed_path is None
+    assert result.passage_count == 0
+    assert not (paths.parsed / missing_id).exists()
+    assert parsed_sentinel.read_text(encoding="utf-8") == "解析目录哨兵"
+    assert database.list_books() == books_before
+    assert database.count_passages() == passage_count_before
+    assert _file_snapshot(paths.vault) == files_before
+
+
+def test_book_lookup_failure_returns_failed_result_and_marks_record_failed(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database, provider = app
+    book_id = "a" * 24
+    real_get_book = database.get_book
+    real_update_status = database.update_book_status
+    files_before = _file_snapshot(paths.vault)
+    status_updates: list[str] = []
+
+    def fail_lookup(requested_book_id: str) -> None:
+        raise OSError("book lookup unavailable")
+
+    def track_status(requested_book_id: str, status: str, **kwargs) -> None:
+        status_updates.append(status)
+        real_update_status(requested_book_id, status, **kwargs)
+
+    monkeypatch.setattr(database, "get_book", fail_lookup)
+    monkeypatch.setattr(database, "update_book_status", track_status)
+
+    result = BookIndexer(paths, database, provider).index_parsed_book(
+        book_id=book_id,
+        parsed=_parsed_for_preflight(),
+        original_path=paths.originals / "scan.pdf",
+    )
+
+    expected = "导入失败：book lookup unavailable"
+    assert result == IndexResult(
+        status="failed",
+        parsed_path=None,
+        passage_count=0,
+        error=expected,
+        message=expected,
+    )
+    assert status_updates == ["failed"]
+    persisted = real_get_book(book_id)
+    assert persisted is not None
+    assert persisted["title"] == "导入前标题"
+    assert persisted["author"] is None
+    assert persisted["status"] == "failed"
+    assert persisted["error"] == expected
+    assert database.count_passages(book_id) == 0
+    assert _file_snapshot(paths.vault) == files_before
+
+
+def test_interrupted_book_lookup_marks_failed_and_reraises(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database, provider = app
+    book_id = "a" * 24
+    real_get_book = database.get_book
+    real_update_status = database.update_book_status
+    files_before = _file_snapshot(paths.vault)
+    status_updates: list[str] = []
+
+    def interrupt_lookup(requested_book_id: str) -> None:
+        raise KeyboardInterrupt("operator cancelled lookup")
+
+    def track_status(requested_book_id: str, status: str, **kwargs) -> None:
+        status_updates.append(status)
+        real_update_status(requested_book_id, status, **kwargs)
+
+    monkeypatch.setattr(database, "get_book", interrupt_lookup)
+    monkeypatch.setattr(database, "update_book_status", track_status)
+
+    with pytest.raises(KeyboardInterrupt, match="operator cancelled lookup"):
+        BookIndexer(paths, database, provider).index_parsed_book(
+            book_id=book_id,
+            parsed=_parsed_for_preflight(),
+            original_path=paths.originals / "scan.pdf",
+        )
+
+    assert status_updates == ["failed"]
+    persisted = real_get_book(book_id)
+    assert persisted is not None
+    assert persisted["title"] == "导入前标题"
+    assert persisted["author"] is None
+    assert persisted["status"] == "failed"
+    assert persisted["error"] == "导入被中断：operator cancelled lookup"
+    assert database.count_passages(book_id) == 0
+    assert _file_snapshot(paths.vault) == files_before
+
+
+def test_index_result_is_frozen_json_safe_and_strictly_native() -> None:
+    result = IndexResult(
+        status="keyword_only",
+        parsed_path="/vault/正文.md",
+        passage_count=2,
+        error="语义模型未启用",
+        message="可使用关键词检索",
+    )
+
+    serialized = result.to_dict()
+
+    assert type(serialized) is dict
+    assert json.loads(json.dumps(serialized, ensure_ascii=False)) == serialized
+    with pytest.raises(FrozenInstanceError):
+        result.status = "ready"  # type: ignore[misc]
+
+
+@pytest.mark.parametrize(
+    "values",
+    [
+        {
+            "status": True,
+            "parsed_path": None,
+            "passage_count": 0,
+            "error": None,
+            "message": "message",
+        },
+        {
+            "status": "duplicate",
+            "parsed_path": None,
+            "passage_count": 0,
+            "error": None,
+            "message": "message",
+        },
+        {
+            "status": "",
+            "parsed_path": None,
+            "passage_count": 0,
+            "error": None,
+            "message": "message",
+        },
+        {
+            "status": "ready",
+            "parsed_path": Path("正文.md"),
+            "passage_count": 0,
+            "error": None,
+            "message": "message",
+        },
+        {
+            "status": "ready",
+            "parsed_path": None,
+            "passage_count": True,
+            "error": None,
+            "message": "message",
+        },
+        {
+            "status": "ready",
+            "parsed_path": None,
+            "passage_count": -1,
+            "error": None,
+            "message": "message",
+        },
+        {
+            "status": "ready",
+            "parsed_path": None,
+            "passage_count": 0,
+            "error": RuntimeError("not JSON safe"),
+            "message": "message",
+        },
+        {
+            "status": "ready",
+            "parsed_path": None,
+            "passage_count": 0,
+            "error": None,
+            "message": 3,
+        },
+    ],
+)
+def test_index_result_rejects_non_native_or_invalid_values(
+    values: dict[str, object],
+) -> None:
+    with pytest.raises(ValueError):
+        IndexResult(**values)  # type: ignore[arg-type]
+
+
+def test_indexer_fails_when_parsing_produced_no_passages(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+) -> None:
+    paths, database, provider = app
+    parsed = ParsedBook(
+        title="空书",
+        author=None,
+        source_format="pdf",
+        units=(SourceUnit("   \n\n  ", page_start=1, page_end=1),),
+    )
+
+    result = BookIndexer(paths, database, provider).index_parsed_book(
+        book_id="a" * 24,
+        parsed=parsed,
+        original_path=paths.originals / "scan.pdf",
+    )
+
+    expected = "导入失败：解析完成，但没有生成可检索段落。"
+    assert result == IndexResult(
+        status="failed",
+        parsed_path=None,
+        passage_count=0,
+        error=expected,
+        message=expected,
+    )
+    assert database.get_book("a" * 24)["status"] == "failed"
+    assert database.count_passages("a" * 24) == 0
+
+
+def test_indexer_degrades_to_keyword_only_when_provider_is_unavailable(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+) -> None:
+    paths, database, _ = app
+    parsed = ParsedBook(
+        title="仅关键词",
+        author=None,
+        source_format="pdf",
+        units=(SourceUnit("关键词仍然可检索", page_start=2, page_end=2),),
+    )
+
+    result = BookIndexer(
+        paths,
+        database,
+        NullEmbeddingProvider(),
+    ).index_parsed_book(
+        book_id="a" * 24,
+        parsed=parsed,
+        original_path=paths.originals / "scan.pdf",
+    )
+
+    message = (
+        "导入完成；语义模型未启用，当前可使用关键词检索，"
+        "稍后启用模型即可恢复语义索引。"
+    )
+    assert result.status == "keyword_only"
+    assert result.error == result.message == message
+    assert database.get_book("a" * 24)["error"] == message
+    assert database.keyword_search("关键词仍然可检索", 5)
+
+
+@pytest.mark.parametrize(
+    ("provider", "detail"),
+    [
+        (
+            _WrongCountEmbeddingProvider(),
+            "语义向量数量不匹配：应有 1 个，实际得到 0 个。",
+        ),
+        (_FailingEmbeddingProvider(), "模型暂时不可用"),
+    ],
+)
+def test_embedding_failures_degrade_with_existing_message_and_guidance(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+    provider: _ReadyEmbeddingProvider,
+    detail: str,
+) -> None:
+    paths, database, _ = app
+    parsed = ParsedBook(
+        title="语义降级",
+        author=None,
+        source_format="pdf",
+        units=(SourceUnit("语义失败仍可搜索", page_start=3, page_end=3),),
+    )
+
+    result = BookIndexer(paths, database, provider).index_parsed_book(
+        book_id="a" * 24,
+        parsed=parsed,
+        original_path=paths.originals / "scan.pdf",
+    )
+
+    expected = f"语义索引失败，可稍后恢复：{detail}"
+    assert result.status == "keyword_only"
+    assert result.error == result.message == expected
+    assert database.get_book("a" * 24)["error"] == expected
+    assert database.keyword_search("语义失败仍可搜索", 5)
+    assert list(database.iter_embeddings(["a" * 24])) == []
+
+
+@pytest.mark.parametrize(
+    ("case", "detail"),
+    [
+        ("empty", "第 1 个语义向量不能为空。"),
+        ("nan", "第 1 个语义向量必须全部是有限数值。"),
+        ("inf", "第 1 个语义向量必须全部是有限数值。"),
+        ("two-dimensional-row", "第 1 个语义向量必须是一维数组。"),
+        (
+            "mixed-dimensions",
+            "所有语义向量必须维度一致：期望 2，第 2 个为 3。",
+        ),
+    ],
+)
+def test_invalid_vectors_degrade_before_writing_any_embedding(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+    case: str,
+    detail: str,
+) -> None:
+    paths, database, _ = app
+    original = _register_book(
+        paths,
+        database,
+        book_id="b" * 24,
+        source_format="txt",
+    )
+
+    result = BookIndexer(
+        paths,
+        database,
+        _InvalidEmbeddingProvider(case),
+    ).index_parsed_book(
+        book_id="b" * 24,
+        parsed=_two_passage_book(),
+        original_path=original,
+    )
+
+    expected = f"语义索引失败，可稍后恢复：{detail}"
+    assert result.passage_count >= 2
+    assert result.status == "keyword_only"
+    assert result.error == result.message == expected
+    assert database.keyword_search("第一段", 5)
+    assert list(database.iter_embeddings(["b" * 24])) == []
+
+
+@pytest.mark.parametrize("failure_point", ["render", "replace"])
+def test_pipeline_failures_preserve_existing_nonsearchable_behavior(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+    monkeypatch: pytest.MonkeyPatch,
+    failure_point: str,
+) -> None:
+    paths, database, provider = app
+
+    def fail(*args, **kwargs) -> None:
+        raise OSError(f"{failure_point} injected failure")
+
+    if failure_point == "render":
+        monkeypatch.setattr(indexing_module, "render_parsed_book", fail)
+    else:
+        monkeypatch.setattr(database, "replace_passages", fail)
+
+    result = BookIndexer(paths, database, provider).index_parsed_book(
+        book_id="a" * 24,
+        parsed=ParsedBook(
+            title="流水线失败",
+            author=None,
+            source_format="pdf",
+            units=(SourceUnit("不可搜索的内容", page_start=1, page_end=1),),
+        ),
+        original_path=paths.originals / "scan.pdf",
+    )
+
+    assert result.status == "failed"
+    expected = f"导入失败：{failure_point} injected failure"
+    assert result.error == result.message == expected
+    assert database.get_book("a" * 24)["status"] == "failed"
+    assert database.count_passages("a" * 24) == 0
+    assert database.keyword_search("不可搜索的内容", 5) == []
+
+
+def test_final_status_failure_falls_back_to_failed_and_hides_passages(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database, _ = app
+    real_update = database.update_book_status
+    attempts = 0
+
+    def fail_once(*args, **kwargs) -> None:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise OSError("first status write failed")
+        real_update(*args, **kwargs)
+
+    monkeypatch.setattr(database, "update_book_status", fail_once)
+
+    result = BookIndexer(
+        paths,
+        database,
+        NullEmbeddingProvider(),
+    ).index_parsed_book(
+        book_id="a" * 24,
+        parsed=ParsedBook(
+            title="状态失败",
+            author=None,
+            source_format="pdf",
+            units=(SourceUnit("状态失败证据", page_start=1, page_end=1),),
+        ),
+        original_path=paths.originals / "scan.pdf",
+    )
+
+    assert attempts == 2
+    assert result.status == "failed"
+    assert result.error is not None and "语义模型未启用" in result.error
+    assert "状态写入失败：first status write failed" in result.message
+    assert database.count_passages("a" * 24) == result.passage_count == 1
+    assert database.keyword_search("状态失败证据", 5) == []
+
+
+def test_double_status_failure_reports_actual_needs_ocr_state_once(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database, _ = app
+    database.update_book_status("a" * 24, "needs_ocr", error="等待 OCR")
+    attempts = 0
+
+    def always_fail(*args, **kwargs) -> None:
+        nonlocal attempts
+        attempts += 1
+        raise OSError("status database unavailable")
+
+    monkeypatch.setattr(database, "update_book_status", always_fail)
+
+    result = BookIndexer(
+        paths,
+        database,
+        NullEmbeddingProvider(),
+    ).index_parsed_book(
+        book_id="a" * 24,
+        parsed=ParsedBook(
+            title="OCR 已解析",
+            author=None,
+            source_format="pdf",
+            units=(SourceUnit("OCR 完成后的正文", page_start=1, page_end=1),),
+        ),
+        original_path=paths.originals / "scan.pdf",
+    )
+
+    assert attempts == 2
+    assert result.status == "needs_ocr"
+    assert result.error == result.message
+    assert "状态写入失败" in result.message
+    assert "失败状态也无法写入" in result.message
+    assert result.to_dict()["status"] == "needs_ocr"
+    serialized = result.to_dict()
+    assert json.loads(json.dumps(serialized, ensure_ascii=False)) == serialized
+    assert database.get_book("a" * 24)["status"] == "needs_ocr"
+    assert database.count_passages("a" * 24) == result.passage_count == 1
+    assert database.keyword_search("OCR 完成后的正文", 5) == []
+
+
+def test_interruption_marks_failed_hides_passages_and_reraises(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+) -> None:
+    paths, database, _ = app
+
+    with pytest.raises(KeyboardInterrupt, match="operator cancelled embedding"):
+        BookIndexer(
+            paths,
+            database,
+            _InterruptingEmbeddingProvider(),
+        ).index_parsed_book(
+            book_id="a" * 24,
+            parsed=ParsedBook(
+                title="中断",
+                author=None,
+                source_format="pdf",
+                units=(SourceUnit("中断前已提交", page_start=1, page_end=1),),
+            ),
+            original_path=paths.originals / "scan.pdf",
+        )
+
+    book = database.get_book("a" * 24)
+    assert book is not None
+    assert book["status"] == "failed"
+    assert book["error"] == "导入被中断：operator cancelled embedding"
+    assert database.count_passages("a" * 24) == 1
+    assert database.keyword_search("中断前已提交", 5) == []
+
+
+def test_indexer_does_not_copy_or_parse_the_original(
+    tmp_path: Path,
+) -> None:
+    paths = AppPaths.from_root(tmp_path / "app")
+    database = Database(paths.database)
+    database.initialize()
+    paths.vault.mkdir(parents=True)
+    external_original = tmp_path / "external-scan.pdf"
+    external_original.write_bytes(b"not a parseable PDF")
+    database.create_book(
+        book_id="c" * 24,
+        title="待索引",
+        author=None,
+        source_format="pdf",
+        content_sha256="c" * 64,
+        original_path=str(external_original),
+    )
+
+    result = BookIndexer(
+        paths,
+        database,
+        NullEmbeddingProvider(),
+    ).index_parsed_book(
+        book_id="c" * 24,
+        parsed=ParsedBook(
+            title="已在外部解析",
+            author=None,
+            source_format="pdf",
+            units=(
+                SourceUnit("调用方提供的解析结果", page_start=1, page_end=1),
+            ),
+        ),
+        original_path=external_original,
+    )
+
+    assert result.status == "keyword_only"
+    assert not paths.originals.exists()
+    assert external_original.read_bytes() == b"not a parseable PDF"

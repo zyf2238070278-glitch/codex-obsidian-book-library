@@ -1,5 +1,7 @@
 .worktrees/
 .venv/
+dist/
+/bin/book-vision-ocr
 
 # Python and test caches
 __pycache__/

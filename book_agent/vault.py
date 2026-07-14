@@ -302,6 +302,7 @@ class VaultManager:
         )
         project_directories = (
             ("models", self.paths.models),
+            ("ocr_models", self.paths.ocr_models),
             ("database.parent", self.paths.database.parent),
         )
         for label, directory in vault_directories:

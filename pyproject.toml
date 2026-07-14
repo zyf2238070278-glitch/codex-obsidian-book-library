@@ -19,6 +19,10 @@ dev = [
 semantic = [
     "sentence-transformers>=3",
 ]
+ocr = [
+    "rapidocr==3.9.1",
+    "onnxruntime==1.27.0",
+]
 
 [tool.uv]
 package = false

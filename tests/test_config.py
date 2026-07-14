@@ -22,6 +22,7 @@ def test_app_paths_are_rooted_under_project(tmp_path: Path) -> None:
         ocr_reports=resolved_root / "vault" / "书库" / "40-OCR报告",
         database=resolved_root / "data" / "library.sqlite3",
         models=resolved_root / "data" / "models",
+        ocr_models=resolved_root / "data" / "ocr-models",
         ocr=resolved_root / "data" / "ocr",
         ocr_logs=resolved_root / "data" / "ocr" / "logs",
         vision_helper=resolved_root / "bin" / "book-vision-ocr",
@@ -60,6 +61,7 @@ def test_app_paths_keep_external_obsidian_files_separate_from_project_data(
         ocr_reports=absolute_vault / "书库" / "40-OCR报告",
         database=resolved_root / "data" / "library.sqlite3",
         models=resolved_root / "data" / "models",
+        ocr_models=resolved_root / "data" / "ocr-models",
         ocr=resolved_root / "data" / "ocr",
         ocr_logs=resolved_root / "data" / "ocr" / "logs",
         vision_helper=resolved_root / "bin" / "book-vision-ocr",
@@ -84,6 +86,7 @@ def test_app_paths_places_ocr_runtime_under_project_data(tmp_path: Path) -> None
 
     assert paths.ocr == tmp_path.resolve() / "data" / "ocr"
     assert paths.ocr_logs == paths.ocr / "logs"
+    assert paths.ocr_models == tmp_path.resolve() / "data" / "ocr-models"
     assert paths.vision_helper == tmp_path.resolve() / "bin" / "book-vision-ocr"
 
 

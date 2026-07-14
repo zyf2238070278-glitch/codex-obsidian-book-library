@@ -141,6 +141,46 @@ class VisionPageResult:
 
 
 @dataclass(frozen=True)
+class OcrPageResult:
+    """Engine-neutral recognized text and geometry for a single rendered page."""
+
+    engine: str
+    lines: tuple[VisionLine, ...]
+    discarded_observations: int = 0
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.engine, str) or not self.engine.strip():
+            raise ValueError("engine must be a nonblank string")
+        if type(self.lines) is not tuple or not all(
+            type(line) is VisionLine for line in self.lines
+        ):
+            raise ValueError("lines must be a tuple of VisionLine values")
+        if (
+            not _is_int(self.discarded_observations)
+            or self.discarded_observations < 0
+        ):
+            raise ValueError("discarded_observations must be zero or greater")
+
+    def ordered_text(self) -> str:
+        rows = _group_lines(
+            self.lines,
+            vertical_tolerance=_READING_ORDER_VERTICAL_TOLERANCE,
+        )
+        return "\n".join(
+            " ".join(
+                line.text for line in sorted(row, key=lambda item: item.box.x)
+            )
+            for row in rows
+        ).strip()
+
+    @property
+    def mean_confidence(self) -> float:
+        if not self.lines:
+            return 0.0
+        return sum(line.confidence for line in self.lines) / len(self.lines)
+
+
+@dataclass(frozen=True)
 class OcrPageOutcome:
     """The terminal, engine-neutral result for one physical PDF page."""
 

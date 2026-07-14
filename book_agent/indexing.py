@@ -87,7 +87,27 @@ class BookIndexer:
     ) -> IndexResult:
         if not self._valid_book_id(book_id):
             return self._diagnostic_failure(_INVALID_BOOK_ID_MESSAGE)
-        if self.database.get_book(book_id) is None:
+        try:
+            existing = self.database.get_book(book_id)
+        except Exception as error:
+            detail = _error_detail(error)
+            message = f"导入失败：{detail}"
+            return self._finalize(
+                book_id=book_id,
+                status="failed",
+                parsed_path=None,
+                passage_count=0,
+                error=message,
+                message=message,
+            )
+        except BaseException as interruption:
+            self._record_interruption(
+                book_id=book_id,
+                interruption=interruption,
+                parsed_path=None,
+            )
+            raise
+        if existing is None:
             return self._diagnostic_failure(
                 f"索引失败：找不到书籍记录：{book_id}"
             )
@@ -137,18 +157,11 @@ class BookIndexer:
                 message=message,
             )
         except BaseException as interruption:
-            detail = _error_detail(interruption)
-            try:
-                self.database.update_book_status(
-                    book_id,
-                    "failed",
-                    error=f"导入被中断：{detail}",
-                    parsed_path=parsed_path,
-                )
-            except BaseException as status_error:
-                interruption.add_note(
-                    "记录导入中断状态时失败：" + _error_detail(status_error)
-                )
+            self._record_interruption(
+                book_id=book_id,
+                interruption=interruption,
+                parsed_path=parsed_path,
+            )
             raise
 
     @staticmethod
@@ -168,6 +181,26 @@ class BookIndexer:
             error=message,
             message=message,
         )
+
+    def _record_interruption(
+        self,
+        *,
+        book_id: str,
+        interruption: BaseException,
+        parsed_path: str | None,
+    ) -> None:
+        detail = _error_detail(interruption)
+        try:
+            self.database.update_book_status(
+                book_id,
+                "failed",
+                error=f"导入被中断：{detail}",
+                parsed_path=parsed_path,
+            )
+        except BaseException as status_error:
+            interruption.add_note(
+                "记录导入中断状态时失败：" + _error_detail(status_error)
+            )
 
     def _parsed_destination(self, book_id: str) -> Path | None:
         try:

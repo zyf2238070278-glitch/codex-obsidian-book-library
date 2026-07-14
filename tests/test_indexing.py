@@ -306,6 +306,91 @@ def test_indexer_rejects_unknown_book_before_publishing_or_database_writes(
     assert _file_snapshot(paths.vault) == files_before
 
 
+def test_book_lookup_failure_returns_failed_result_and_marks_record_failed(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database, provider = app
+    book_id = "a" * 24
+    real_get_book = database.get_book
+    real_update_status = database.update_book_status
+    files_before = _file_snapshot(paths.vault)
+    status_updates: list[str] = []
+
+    def fail_lookup(requested_book_id: str) -> None:
+        raise OSError("book lookup unavailable")
+
+    def track_status(requested_book_id: str, status: str, **kwargs) -> None:
+        status_updates.append(status)
+        real_update_status(requested_book_id, status, **kwargs)
+
+    monkeypatch.setattr(database, "get_book", fail_lookup)
+    monkeypatch.setattr(database, "update_book_status", track_status)
+
+    result = BookIndexer(paths, database, provider).index_parsed_book(
+        book_id=book_id,
+        parsed=_parsed_for_preflight(),
+        original_path=paths.originals / "scan.pdf",
+    )
+
+    expected = "导入失败：book lookup unavailable"
+    assert result == IndexResult(
+        status="failed",
+        parsed_path=None,
+        passage_count=0,
+        error=expected,
+        message=expected,
+    )
+    assert status_updates == ["failed"]
+    persisted = real_get_book(book_id)
+    assert persisted is not None
+    assert persisted["title"] == "导入前标题"
+    assert persisted["author"] is None
+    assert persisted["status"] == "failed"
+    assert persisted["error"] == expected
+    assert database.count_passages(book_id) == 0
+    assert _file_snapshot(paths.vault) == files_before
+
+
+def test_interrupted_book_lookup_marks_failed_and_reraises(
+    app: tuple[AppPaths, Database, _ReadyEmbeddingProvider],
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    paths, database, provider = app
+    book_id = "a" * 24
+    real_get_book = database.get_book
+    real_update_status = database.update_book_status
+    files_before = _file_snapshot(paths.vault)
+    status_updates: list[str] = []
+
+    def interrupt_lookup(requested_book_id: str) -> None:
+        raise KeyboardInterrupt("operator cancelled lookup")
+
+    def track_status(requested_book_id: str, status: str, **kwargs) -> None:
+        status_updates.append(status)
+        real_update_status(requested_book_id, status, **kwargs)
+
+    monkeypatch.setattr(database, "get_book", interrupt_lookup)
+    monkeypatch.setattr(database, "update_book_status", track_status)
+
+    with pytest.raises(KeyboardInterrupt, match="operator cancelled lookup"):
+        BookIndexer(paths, database, provider).index_parsed_book(
+            book_id=book_id,
+            parsed=_parsed_for_preflight(),
+            original_path=paths.originals / "scan.pdf",
+        )
+
+    assert status_updates == ["failed"]
+    persisted = real_get_book(book_id)
+    assert persisted is not None
+    assert persisted["title"] == "导入前标题"
+    assert persisted["author"] is None
+    assert persisted["status"] == "failed"
+    assert persisted["error"] == "导入被中断：operator cancelled lookup"
+    assert database.count_passages(book_id) == 0
+    assert _file_snapshot(paths.vault) == files_before
+
+
 def test_index_result_is_frozen_json_safe_and_strictly_native() -> None:
     result = IndexResult(
         status="keyword_only",

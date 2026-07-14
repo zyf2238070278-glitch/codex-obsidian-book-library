@@ -1,10 +1,14 @@
 from __future__ import annotations
 
-import sqlite3
+import json
+import math
 import os
+import re
+import sqlite3
 import stat
 from collections.abc import Iterable, Iterator, Mapping, Sequence
 from contextlib import contextmanager
+from datetime import datetime, timedelta, timezone
 from itertools import chain
 from pathlib import Path
 from typing import Any
@@ -50,6 +54,40 @@ CREATE VIRTUAL TABLE IF NOT EXISTS passages_fts USING fts5(
     text,
     tokenize='trigram'
 );
+
+CREATE TABLE IF NOT EXISTS ocr_jobs (
+    book_id TEXT PRIMARY KEY REFERENCES books(book_id) ON DELETE CASCADE,
+    status TEXT NOT NULL CHECK(status IN ('queued','running','paused','failed','completed')),
+    total_pages INTEGER NOT NULL CHECK(total_pages > 0),
+    completed_pages INTEGER NOT NULL DEFAULT 0 CHECK(completed_pages >= 0),
+    current_page INTEGER,
+    language_config TEXT NOT NULL,
+    schema_version INTEGER NOT NULL,
+    pause_requested INTEGER NOT NULL DEFAULT 0 CHECK(pause_requested IN (0,1)),
+    attempt_count INTEGER NOT NULL DEFAULT 0 CHECK(attempt_count >= 0),
+    error TEXT,
+    worker_id TEXT,
+    lease_expires_at TEXT,
+    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    started_at TEXT,
+    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    finished_at TEXT
+);
+
+CREATE TABLE IF NOT EXISTS ocr_pages (
+    book_id TEXT NOT NULL REFERENCES ocr_jobs(book_id) ON DELETE CASCADE,
+    page_number INTEGER NOT NULL CHECK(page_number > 0),
+    page_label TEXT,
+    text TEXT NOT NULL,
+    text_sha256 TEXT NOT NULL,
+    mean_confidence REAL,
+    duration_ms INTEGER NOT NULL CHECK(duration_ms >= 0),
+    completed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(book_id, page_number)
+);
+
+CREATE INDEX IF NOT EXISTS ocr_jobs_queue_idx
+ON ocr_jobs(status, created_at, book_id);
 """
 
 
@@ -67,6 +105,59 @@ _HIT_COLUMNS = """
 """
 
 _SEARCHABLE_STATUSES_SQL = "('ready', 'keyword_only')"
+_BOOK_ID_PATTERN = re.compile(r"[0-9a-f]{24}")
+_SQLITE_INT_MAX = 2**63 - 1
+
+
+def _validate_book_id(book_id: object) -> str:
+    if type(book_id) is not str or _BOOK_ID_PATTERN.fullmatch(book_id) is None:
+        raise ValueError("book_id must be exactly 24 lowercase hexadecimal characters")
+    return book_id
+
+
+def _validate_positive_int(value: object, name: str) -> int:
+    if type(value) is not int or not 0 < value <= _SQLITE_INT_MAX:
+        raise ValueError(f"{name} must be a positive integer")
+    return value
+
+
+def _validate_nonnegative_int(value: object, name: str) -> int:
+    if type(value) is not int or not 0 <= value <= _SQLITE_INT_MAX:
+        raise ValueError(f"{name} must be a nonnegative integer")
+    return value
+
+
+def _validate_nonblank_string(value: object, name: str) -> str:
+    if type(value) is not str or not value.strip():
+        raise ValueError(f"{name} must be a nonblank string")
+    return value
+
+
+def _validate_optional_string(value: object, name: str) -> str | None:
+    if value is not None and type(value) is not str:
+        raise ValueError(f"{name} must be a string or None")
+    return value
+
+
+def _timestamp(value: datetime | None = None) -> str:
+    if value is None:
+        value = datetime.now(timezone.utc)
+    elif type(value) is not datetime:
+        raise ValueError("now must be a datetime or None")
+    if value.tzinfo is None or value.utcoffset() is None:
+        raise ValueError("now must include timezone information")
+    return (
+        value.astimezone(timezone.utc)
+        .isoformat(timespec="microseconds")
+        .replace("+00:00", "Z")
+    )
+
+
+def _lease_timestamp(now: datetime, lease_seconds: int) -> str:
+    try:
+        return _timestamp(now + timedelta(seconds=lease_seconds))
+    except (OverflowError, ValueError) as exc:
+        raise ValueError("lease_seconds exceeds the supported datetime range") from exc
 
 
 def _escape_like(value: str) -> str:
@@ -312,6 +403,449 @@ class Database:
         with self._connection() as connection:
             rows = connection.execute(sql, parameters).fetchall()
         return [dict(row) for row in rows]
+
+    def queue_ocr_job(
+        self,
+        book_id: str,
+        total_pages: int,
+        languages: tuple[str, ...],
+        schema_version: int = 1,
+    ) -> dict[str, Any]:
+        validated_book_id = _validate_book_id(book_id)
+        validated_total_pages = _validate_positive_int(total_pages, "total_pages")
+        if type(languages) is not tuple or not languages or any(
+            type(language) is not str or not language.strip() for language in languages
+        ):
+            raise ValueError(
+                "languages must be a nonempty tuple of nonblank native strings"
+            )
+        if type(schema_version) is not int or schema_version != 1:
+            raise ValueError("schema_version must be 1")
+        language_config = json.dumps(
+            list(languages), ensure_ascii=False, separators=(",", ":")
+        )
+        created_at = _timestamp()
+
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            book = connection.execute(
+                "SELECT source_format, status FROM books WHERE book_id = ?",
+                (validated_book_id,),
+            ).fetchone()
+            if (
+                book is None
+                or book["source_format"] != "pdf"
+                or book["status"] != "needs_ocr"
+            ):
+                raise ValueError(
+                    "OCR jobs require an existing PDF book in needs_ocr status"
+                )
+            existing = connection.execute(
+                "SELECT * FROM ocr_jobs WHERE book_id = ?", (validated_book_id,)
+            ).fetchone()
+            if existing is None:
+                connection.execute(
+                    """
+                    INSERT INTO ocr_jobs (
+                        book_id, status, total_pages, language_config,
+                        schema_version, created_at, updated_at
+                    ) VALUES (?, 'queued', ?, ?, ?, ?, ?)
+                    """,
+                    (
+                        validated_book_id,
+                        validated_total_pages,
+                        language_config,
+                        schema_version,
+                        created_at,
+                        created_at,
+                    ),
+                )
+            else:
+                if (
+                    existing["total_pages"] != validated_total_pages
+                    or existing["language_config"] != language_config
+                    or existing["schema_version"] != schema_version
+                ):
+                    raise ValueError(
+                        "existing OCR job configuration does not match the request"
+                    )
+                if existing["status"] in ("paused", "failed"):
+                    connection.execute(
+                        """
+                        UPDATE ocr_jobs
+                        SET status = 'queued', pause_requested = 0, error = NULL,
+                            worker_id = NULL, lease_expires_at = NULL,
+                            updated_at = ?, finished_at = NULL
+                        WHERE book_id = ?
+                        """,
+                        (created_at, validated_book_id),
+                    )
+                elif existing["status"] not in ("queued", "running"):
+                    raise ValueError(
+                        f"invalid OCR job transition from {existing['status']} to queued"
+                    )
+            row = connection.execute(
+                "SELECT * FROM ocr_jobs WHERE book_id = ?", (validated_book_id,)
+            ).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def claim_next_ocr_job(
+        self,
+        worker_id: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> dict[str, Any] | None:
+        validated_worker_id = _validate_nonblank_string(worker_id, "worker_id")
+        validated_lease_seconds = _validate_positive_int(
+            lease_seconds, "lease_seconds"
+        )
+        now_value = now if now is not None else datetime.now(timezone.utc)
+        now_text = _timestamp(now_value)
+        lease_text = _lease_timestamp(now_value, validated_lease_seconds)
+
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            selected = connection.execute(
+                """
+                SELECT book_id
+                FROM ocr_jobs
+                WHERE status = 'queued'
+                   OR (
+                       status = 'running'
+                       AND lease_expires_at IS NOT NULL
+                       AND lease_expires_at <= ?
+                   )
+                ORDER BY created_at, book_id
+                LIMIT 1
+                """,
+                (now_text,),
+            ).fetchone()
+            if selected is None:
+                return None
+            connection.execute(
+                """
+                UPDATE ocr_jobs
+                SET status = 'running', worker_id = ?, lease_expires_at = ?,
+                    attempt_count = attempt_count + 1,
+                    error = NULL,
+                    started_at = COALESCE(started_at, ?),
+                    updated_at = ?, finished_at = NULL
+                WHERE book_id = ?
+                """,
+                (
+                    validated_worker_id,
+                    lease_text,
+                    now_text,
+                    now_text,
+                    selected["book_id"],
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM ocr_jobs WHERE book_id = ?", (selected["book_id"],)
+            ).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def renew_ocr_lease(
+        self,
+        book_id: str,
+        worker_id: str,
+        lease_seconds: int,
+        now: datetime | None = None,
+    ) -> dict[str, Any]:
+        validated_book_id = _validate_book_id(book_id)
+        validated_worker_id = _validate_nonblank_string(worker_id, "worker_id")
+        validated_lease_seconds = _validate_positive_int(
+            lease_seconds, "lease_seconds"
+        )
+        now_value = now if now is not None else datetime.now(timezone.utc)
+        now_text = _timestamp(now_value)
+        lease_text = _lease_timestamp(now_value, validated_lease_seconds)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE ocr_jobs
+                SET lease_expires_at = ?, updated_at = ?
+                WHERE book_id = ? AND status = 'running' AND worker_id = ?
+                  AND lease_expires_at IS NOT NULL AND lease_expires_at > ?
+                """,
+                (
+                    lease_text,
+                    now_text,
+                    validated_book_id,
+                    validated_worker_id,
+                    now_text,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("OCR lease is expired or worker_id is not its owner")
+            row = connection.execute(
+                "SELECT * FROM ocr_jobs WHERE book_id = ?", (validated_book_id,)
+            ).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def save_ocr_page(
+        self,
+        book_id: str,
+        worker_id: str,
+        page_number: int,
+        page_label: str | None,
+        text: str,
+        text_sha256: str,
+        mean_confidence: float | None,
+        duration_ms: int,
+    ) -> dict[str, Any]:
+        validated_book_id = _validate_book_id(book_id)
+        validated_worker_id = _validate_nonblank_string(worker_id, "worker_id")
+        validated_page_number = _validate_positive_int(page_number, "page_number")
+        validated_page_label = _validate_optional_string(page_label, "page_label")
+        if type(text) is not str:
+            raise ValueError("text must be a native string")
+        validated_hash = _validate_nonblank_string(text_sha256, "text_sha256")
+        if mean_confidence is not None and (
+            type(mean_confidence) not in (int, float)
+            or not 0 <= mean_confidence <= 1
+            or not math.isfinite(mean_confidence)
+        ):
+            raise ValueError("mean_confidence must be None or a finite number from 0 to 1")
+        validated_duration = _validate_nonnegative_int(duration_ms, "duration_ms")
+
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            job = connection.execute(
+                """
+                SELECT status, total_pages, worker_id
+                FROM ocr_jobs WHERE book_id = ?
+                """,
+                (validated_book_id,),
+            ).fetchone()
+            if job is None:
+                raise ValueError(f"Unknown OCR job book_id: {validated_book_id}")
+            if job["status"] != "running":
+                raise ValueError("invalid OCR job transition: page save requires running")
+            if job["worker_id"] != validated_worker_id:
+                raise ValueError("worker_id is not the OCR job owner")
+            if validated_page_number > job["total_pages"]:
+                raise ValueError("page_number must not exceed the job total_pages")
+            connection.execute(
+                """
+                INSERT INTO ocr_pages (
+                    book_id, page_number, page_label, text, text_sha256,
+                    mean_confidence, duration_ms
+                ) VALUES (?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(book_id, page_number) DO UPDATE SET
+                    page_label = excluded.page_label,
+                    text = excluded.text,
+                    text_sha256 = excluded.text_sha256,
+                    mean_confidence = excluded.mean_confidence,
+                    duration_ms = excluded.duration_ms,
+                    completed_at = CURRENT_TIMESTAMP
+                """,
+                (
+                    validated_book_id,
+                    validated_page_number,
+                    validated_page_label,
+                    text,
+                    validated_hash,
+                    mean_confidence,
+                    validated_duration,
+                ),
+            )
+            connection.execute(
+                """
+                UPDATE ocr_jobs
+                SET completed_pages = (
+                        SELECT COUNT(*) FROM ocr_pages WHERE book_id = ?
+                    ),
+                    current_page = ?, updated_at = CURRENT_TIMESTAMP
+                WHERE book_id = ?
+                """,
+                (
+                    validated_book_id,
+                    validated_page_number,
+                    validated_book_id,
+                ),
+            )
+            row = connection.execute(
+                """
+                SELECT * FROM ocr_pages
+                WHERE book_id = ? AND page_number = ?
+                """,
+                (validated_book_id, validated_page_number),
+            ).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def list_ocr_pages(self, book_id: str) -> list[dict[str, Any]]:
+        validated_book_id = _validate_book_id(book_id)
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM ocr_pages WHERE book_id = ? ORDER BY page_number",
+                (validated_book_id,),
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def get_ocr_job(self, book_id: str) -> dict[str, Any] | None:
+        validated_book_id = _validate_book_id(book_id)
+        with self._connection() as connection:
+            row = connection.execute(
+                "SELECT * FROM ocr_jobs WHERE book_id = ?", (validated_book_id,)
+            ).fetchone()
+        return None if row is None else dict(row)
+
+    def list_ocr_jobs(self) -> list[dict[str, Any]]:
+        with self._connection() as connection:
+            rows = connection.execute(
+                "SELECT * FROM ocr_jobs ORDER BY created_at, book_id"
+            ).fetchall()
+        return [dict(row) for row in rows]
+
+    def request_ocr_pause(self, book_id: str) -> dict[str, Any]:
+        validated_book_id = _validate_book_id(book_id)
+        with self._connection() as connection:
+            cursor = connection.execute(
+                """
+                UPDATE ocr_jobs
+                SET pause_requested = 1, updated_at = CURRENT_TIMESTAMP
+                WHERE book_id = ? AND status = 'running'
+                """,
+                (validated_book_id,),
+            )
+            if cursor.rowcount != 1:
+                raise ValueError("invalid OCR job transition: pause request requires running")
+            row = connection.execute(
+                "SELECT * FROM ocr_jobs WHERE book_id = ?", (validated_book_id,)
+            ).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def pause_ocr_job(self, book_id: str, worker_id: str) -> dict[str, Any]:
+        return self._finish_running_ocr_job(
+            book_id,
+            worker_id,
+            status="paused",
+            error=None,
+            current_page=None,
+            require_complete=False,
+        )
+
+    def fail_ocr_job(
+        self,
+        book_id: str,
+        worker_id: str,
+        error: str,
+        current_page: int,
+    ) -> dict[str, Any]:
+        validated_error = _validate_nonblank_string(error, "error")
+        validated_current_page = _validate_positive_int(current_page, "current_page")
+        return self._finish_running_ocr_job(
+            book_id,
+            worker_id,
+            status="failed",
+            error=validated_error,
+            current_page=validated_current_page,
+            require_complete=False,
+        )
+
+    def complete_ocr_job(self, book_id: str, worker_id: str) -> dict[str, Any]:
+        return self._finish_running_ocr_job(
+            book_id,
+            worker_id,
+            status="completed",
+            error=None,
+            current_page=None,
+            require_complete=True,
+        )
+
+    def _finish_running_ocr_job(
+        self,
+        book_id: str,
+        worker_id: str,
+        *,
+        status: str,
+        error: str | None,
+        current_page: int | None,
+        require_complete: bool,
+    ) -> dict[str, Any]:
+        validated_book_id = _validate_book_id(book_id)
+        validated_worker_id = _validate_nonblank_string(worker_id, "worker_id")
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            job = connection.execute(
+                """
+                SELECT j.*, b.status AS book_status
+                FROM ocr_jobs AS j
+                JOIN books AS b ON b.book_id = j.book_id
+                WHERE j.book_id = ?
+                """,
+                (validated_book_id,),
+            ).fetchone()
+            if job is None or job["status"] != "running":
+                raise ValueError(f"invalid OCR job transition to {status}")
+            if job["worker_id"] != validated_worker_id:
+                raise ValueError("worker_id is not the OCR job owner")
+            if current_page is not None and current_page > job["total_pages"]:
+                raise ValueError("current_page must not exceed total_pages")
+            if require_complete and job["completed_pages"] != job["total_pages"]:
+                raise ValueError("cannot complete OCR job until all pages are saved")
+            if require_complete and job["book_status"] not in (
+                "ready",
+                "keyword_only",
+            ):
+                raise ValueError(
+                    "cannot complete OCR job until the book is searchable"
+                )
+            finished_at = _timestamp()
+            connection.execute(
+                """
+                UPDATE ocr_jobs
+                SET status = ?, error = ?,
+                    current_page = COALESCE(?, current_page),
+                    pause_requested = 0, worker_id = NULL,
+                    lease_expires_at = NULL, updated_at = ?,
+                    finished_at = CASE WHEN ? = 'paused' THEN NULL ELSE ? END
+                WHERE book_id = ?
+                """,
+                (
+                    status,
+                    error,
+                    current_page,
+                    finished_at,
+                    status,
+                    finished_at,
+                    validated_book_id,
+                ),
+            )
+            row = connection.execute(
+                "SELECT * FROM ocr_jobs WHERE book_id = ?", (validated_book_id,)
+            ).fetchone()
+        assert row is not None
+        return dict(row)
+
+    def delete_ocr_page_checkpoints(self, book_id: str) -> None:
+        validated_book_id = _validate_book_id(book_id)
+        with self._connection() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            job = connection.execute(
+                """
+                SELECT j.status, b.status AS book_status
+                FROM ocr_jobs AS j
+                JOIN books AS b ON b.book_id = j.book_id
+                WHERE j.book_id = ?
+                """,
+                (validated_book_id,),
+            ).fetchone()
+            if job is None:
+                raise ValueError(f"Unknown OCR job book_id: {validated_book_id}")
+            if job["status"] != "completed":
+                raise ValueError("checkpoint cleanup requires a completed OCR job")
+            if job["book_status"] not in ("ready", "keyword_only"):
+                raise ValueError("checkpoint cleanup requires a searchable book")
+            connection.execute(
+                "DELETE FROM ocr_pages WHERE book_id = ?", (validated_book_id,)
+            )
 
     def count_passages(self, book_id: str | None = None) -> int:
         sql = "SELECT COUNT(*) FROM passages"

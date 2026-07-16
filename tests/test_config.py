@@ -19,8 +19,13 @@ def test_app_paths_are_rooted_under_project(tmp_path: Path) -> None:
         originals=resolved_root / "vault" / "书库" / "10-原始书籍",
         parsed=resolved_root / "vault" / "书库" / "20-解析文本",
         notes=resolved_root / "vault" / "书库" / "30-AI读书笔记",
+        ocr_reports=resolved_root / "vault" / "书库" / "40-OCR报告",
         database=resolved_root / "data" / "library.sqlite3",
         models=resolved_root / "data" / "models",
+        ocr_models=resolved_root / "data" / "ocr-models",
+        ocr=resolved_root / "data" / "ocr",
+        ocr_logs=resolved_root / "data" / "ocr" / "logs",
+        vision_helper=resolved_root / "bin" / "book-vision-ocr",
     )
 
 
@@ -53,8 +58,13 @@ def test_app_paths_keep_external_obsidian_files_separate_from_project_data(
         originals=absolute_vault / "书库" / "10-原始书籍",
         parsed=absolute_vault / "书库" / "20-解析文本",
         notes=absolute_vault / "书库" / "30-AI读书笔记",
+        ocr_reports=absolute_vault / "书库" / "40-OCR报告",
         database=resolved_root / "data" / "library.sqlite3",
         models=resolved_root / "data" / "models",
+        ocr_models=resolved_root / "data" / "ocr-models",
+        ocr=resolved_root / "data" / "ocr",
+        ocr_logs=resolved_root / "data" / "ocr" / "logs",
+        vision_helper=resolved_root / "bin" / "book-vision-ocr",
     )
 
 
@@ -69,3 +79,18 @@ def test_app_paths_do_not_follow_an_external_vault_symlink(tmp_path: Path) -> No
 
     assert paths.vault == alias.absolute()
     assert paths.vault != target.resolve()
+
+
+def test_app_paths_places_ocr_runtime_under_project_data(tmp_path: Path) -> None:
+    paths = AppPaths.from_root(tmp_path)
+
+    assert paths.ocr == tmp_path.resolve() / "data" / "ocr"
+    assert paths.ocr_logs == paths.ocr / "logs"
+    assert paths.ocr_models == tmp_path.resolve() / "data" / "ocr-models"
+    assert paths.vision_helper == tmp_path.resolve() / "bin" / "book-vision-ocr"
+
+
+def test_paths_expose_non_evidence_ocr_reports_directory(tmp_path: Path) -> None:
+    paths = AppPaths.from_root(tmp_path)
+
+    assert paths.ocr_reports == paths.library / "40-OCR报告"

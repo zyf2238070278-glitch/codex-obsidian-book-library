@@ -19,6 +19,10 @@ dev = [
 semantic = [
     "sentence-transformers>=3",
 ]
+ocr = [
+    "rapidocr==3.9.1",
+    "onnxruntime==1.27.0",
+]
 
 [tool.uv]
 package = false
@@ -26,6 +30,9 @@ package = false
 [tool.pytest.ini_options]
 pythonpath = ["."]
 testpaths = ["tests"]
+markers = [
+    "macos_vision: requires macOS, Xcode command-line tools, and Apple Vision; builds helper from source during the test session",
+]
 filterwarnings = [
     "ignore:^builtin type (SwigPyPacked|SwigPyObject|swigvarlink) has no __module__ attribute$:DeprecationWarning",
 ]

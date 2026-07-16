@@ -1,7 +1,11 @@
 from __future__ import annotations
 
 import re
+import stat
+import subprocess
 from pathlib import Path
+
+import pytest
 
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +18,28 @@ DOCUMENT_PATHS = (
     Path("docs/隐私与数据存放.md"),
 )
 
+PUBLIC_INSTALL_DOCS = (
+    Path("README.md"),
+    Path("docs/安装说明.md"),
+    Path("docs/USER_GUIDE.md"),
+    Path("docs/常见问题.md"),
+)
+
+CODEX_FIRST_FLOW = (
+    "git clone https://github.com/zyf2238070278-glitch/codex-obsidian-book-library.git",
+    "请安装并检查这个书库",
+    "完整退出并重启 Codex",
+    "检查书库状态",
+)
+
+STALE_INSTALL_TEXT = (
+    "v0.2.0-beta.1",
+    "约 292 MB",
+    "下载全量 ZIP",
+    "uv sync --extra dev --extra semantic",
+    "/Users/" + "zhaoyunfei/",
+)
+
 RELEASE_TEXT_PATHS = (
     *DOCUMENT_PATHS,
     Path("LICENSE"),
@@ -24,6 +50,13 @@ RELEASE_TEXT_PATHS = (
 )
 
 MODEL_REVISION = "614241f622f53c4eeff9890bdc4f31cfecc418b3"
+PUBLISHER_HOME_PREFIX = "/Users/" + "zhaoyunfei/"
+SHELL_PATH_PLACEHOLDERS = (
+    "<PROJECT_ROOT>",
+    "<OBSIDIAN_VAULT>",
+    "<OUTPUT_DIR>",
+    "<UV_BINARY>",
+)
 
 
 def _read(relative: str | Path) -> str:
@@ -33,6 +66,71 @@ def _read(relative: str | Path) -> str:
 def _assert_contains(text: str, phrases: tuple[str, ...]) -> None:
     for phrase in phrases:
         assert phrase in text, phrase
+
+
+def _contains_publisher_home(path: Path) -> bool:
+    return PUBLISHER_HOME_PREFIX.encode() in path.read_bytes()
+
+
+def test_publisher_home_detector_checks_non_utf8_bytes(tmp_path: Path) -> None:
+    binary = tmp_path / "binary.dat"
+    binary.write_bytes(b"\xff\xfe\x00" + PUBLISHER_HOME_PREFIX.encode())
+
+    assert _contains_publisher_home(binary) is True
+
+
+def test_all_tracked_regular_files_exclude_publisher_home_path() -> None:
+    tracked = subprocess.run(
+        ["git", "ls-files", "-z"],
+        cwd=PROJECT_ROOT,
+        check=True,
+        capture_output=True,
+    ).stdout.split(b"\0")
+    offenders: list[str] = []
+    for encoded_path in tracked:
+        if not encoded_path:
+            continue
+        path = PROJECT_ROOT / encoded_path.decode("utf-8", errors="surrogateescape")
+        if not stat.S_ISREG(path.lstat().st_mode):
+            continue
+        if _contains_publisher_home(path):
+            offenders.append(path.relative_to(PROJECT_ROOT).as_posix())
+
+    assert offenders == []
+
+
+def test_historical_bash_examples_have_no_path_placeholders() -> None:
+    plan_paths = (
+        PROJECT_ROOT / "docs" / "plans",
+        PROJECT_ROOT / "docs" / "superpowers" / "plans",
+    )
+    offenders: list[str] = []
+    for plan_root in plan_paths:
+        for path in plan_root.glob("*.md"):
+            for block in re.findall(
+                r"```(?:bash|sh|zsh)\n(.*?)\n```",
+                path.read_text(encoding="utf-8"),
+                re.DOTALL,
+            ):
+                if any(placeholder in block for placeholder in SHELL_PATH_PLACEHOLDERS):
+                    offenders.append(path.relative_to(PROJECT_ROOT).as_posix())
+
+    assert offenders == []
+
+
+def test_quick_start_uses_clone_and_install_selected_vault_paths() -> None:
+    quick_start = _read("outputs/书库RAG快速开始.md")
+
+    _assert_contains(
+        quick_start,
+        (
+            "当前打开并信任的 Git 克隆目录",
+            "安装时可以选择已有 Vault",
+            "默认使用项目内的 `Obsidian书库/`",
+        ),
+    )
+    assert "<PROJECT_ROOT>" not in quick_start
+    assert "<OBSIDIAN_VAULT>" not in quick_start
 
 
 def test_release_document_and_license_set_is_complete() -> None:
@@ -45,69 +143,113 @@ def test_release_document_and_license_set_is_complete() -> None:
     assert missing == []
 
 
+@pytest.mark.parametrize("path", PUBLIC_INSTALL_DOCS)
+def test_public_install_docs_use_codex_first_flow(path: Path) -> None:
+    text = _read(path)
+    positions = [text.index(item) for item in CODEX_FIRST_FLOW]
+
+    assert positions == sorted(positions)
+    for stale in STALE_INSTALL_TEXT:
+        assert stale not in text
+
+
 def test_readme_gives_the_complete_shortest_macos_path() -> None:
     readme = _read("README.md")
-    manual = readme[readme.index("## 手动下载 ZIP") :]
+    install = readme[readme.index("## Git 安装") :]
 
     steps = (
-        "解压到一个稳定位置",
-        "双击 `install-macos.command`",
-        "完全退出并重启 Codex",
-        "打开整个解压目录",
-        "检查书库状态",
+        *CODEX_FIRST_FLOW,
         "导入这本书",
     )
     _assert_contains(
-        manual,
+        install,
         (
             *steps,
             "Apple Silicon",
+            "macOS 16",
+            "约 500 MB",
             "首次安装需要联网",
-            "约 3 GB",
-            "不要之后随意移动",
-            "安装完成",
-            "信任项目",
+            "无需预装 Homebrew、Python、Xcode 或 uv",
+            "项目本地 Python",
+            "锁定版本",
+            "Apple Vision",
+            "RapidOCR",
+            "打开并信任",
             ".codex/config.toml",
             "PDF",
             "EPUB",
             "Markdown",
             "TXT",
             "Obsidian 只用来浏览",
-            "<解压目录>/Obsidian书库",
+            "<项目目录>/Obsidian书库",
             './install-macos.command --vault "<已有 Vault 的绝对路径>"',
             "书库/00-待导入",
             "书库/10-原始书籍",
             "书库/20-解析文本",
             "书库/30-AI读书笔记",
-            "移动了解压目录",
-            "重新运行安装器",
+            "移动项目目录",
+            "重新运行",
+            "备份",
         ),
     )
-    assert [manual.index(step) for step in steps] == sorted(
-        manual.index(step) for step in steps
+    assert [install.index(step) for step in steps] == sorted(
+        install.index(step) for step in steps
     )
 
 
-def test_readme_gives_copyable_git_clone_install_command() -> None:
+def test_public_docs_explain_online_local_and_recovery_boundaries() -> None:
+    combined = "\n".join(_read(path) for path in PUBLIC_INSTALL_DOCS)
+
+    _assert_contains(
+        combined,
+        (
+            "约 500 MB",
+            "语义模型",
+            "Python 包",
+            "首次安装需要联网",
+            "锁定版本",
+            "项目自带固定版本的 uv",
+            "项目本地 Python",
+            "无需预装 Homebrew、Python、Xcode 或 uv",
+            "Apple Silicon",
+            "macOS 16",
+            "Apple Vision",
+            "RapidOCR",
+            "本机运行",
+            "移动项目目录",
+            "重新运行",
+            "不会删除已有书籍或笔记",
+            "删除整个项目目录",
+            "先备份",
+        ),
+    )
+
+
+def test_readme_gives_copyable_git_clone_command() -> None:
     readme = _read("README.md")
     install = _read("docs/安装说明.md")
-    command = (
-        "git clone https://github.com/zyf2238070278-glitch/"
-        "codex-obsidian-book-library.git && "
-        "cd codex-obsidian-book-library && ./install-from-github.command"
-    )
 
-    assert command in readme
-    assert command in install
-    _assert_contains(
-        readme + "\n" + install,
-        (
-            "~/CodexBookLibrary",
-            "自动下载",
-            "SHA-256",
-            "完全退出并重启 Codex",
-            "打开并信任",
-        ),
+    for text in (readme, install):
+        _assert_contains(
+            text,
+            (
+                CODEX_FIRST_FLOW[0],
+                "cd codex-obsidian-book-library",
+                "打开并信任",
+                "完整退出并重启 Codex",
+            ),
+        )
+
+
+def test_readme_preserves_post_install_book_workflow() -> None:
+    readme = _read("README.md")
+    steps = (
+        "完整退出并重启 Codex",
+        "检查书库状态",
+        "导入这本书",
+    )
+    assert [readme.index(step) for step in steps] == sorted(
+        readme.index(step) for step in steps
     )
 
 
@@ -161,10 +303,14 @@ def test_install_and_privacy_docs_state_runtime_and_data_boundaries() -> None:
         combined,
         (
             "Apple Silicon",
+            "macOS 16",
             "不支持 Intel Mac",
             "不支持 Windows",
-            "首次依赖安装仍然需要联网",
-            "语义模型随安装包提供",
+            "首次安装需要联网",
+            "约 500 MB",
+            "Python 包",
+            "锁定版本",
+            "项目本地 Python",
             "语义检索在本机运行",
             "不代表完全离线",
             "不是零 token",
@@ -196,11 +342,13 @@ def test_faq_answers_the_expected_first_run_questions() -> None:
             "0 本",
             "正常但还没有导入书",
             "更换 Vault",
-            "移动了解压目录",
+            "移动项目目录",
             "Gatekeeper",
             "PDF、EPUB、Markdown 和 TXT",
             "扫描版 PDF",
-            "不提供 OCR",
+            "明确说“开始 OCR 这本书”",
+            "Apple Vision",
+            "RapidOCR",
             "首次安装",
             "比较慢",
         ),

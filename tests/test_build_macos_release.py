@@ -41,6 +41,8 @@ SOURCE_FILES = (
     "docs/安装说明.md",
     "docs/常见问题.md",
     "docs/隐私与数据存放.md",
+    "docs/word/安装说明.docx",
+    "docs/word/使用说明.docx",
     "install-macos.command",
     "installer/__init__.py",
     "installer/install_macos.py",
@@ -52,16 +54,18 @@ SOURCE_FILES = (
 )
 
 FIXED_METADATA = {
-    "version": "0.1.0-beta.1",
-    "tag": "v0.1.0-beta.1",
+    "version": "0.2.0-beta.1",
+    "tag": "v0.2.0-beta.1",
     "project": "codex-obsidian-book-library",
     "model_id": "intfloat/multilingual-e5-small",
     "model_revision": "614241f622f53c4eeff9890bdc4f31cfecc418b3",
     "uv_version": "0.11.26",
     "uv_sha256": "c9300ed8425e2c85230259a172066a32b475bc56f7ebe907783b2459159ea554",
     "python": "3.12",
-    "archive": "codex-obsidian-book-library-v0.1.0-beta.1-macos-arm64-all-in-one.zip",
-    "top_level_directory": "codex-obsidian-book-library-v0.1.0-beta.1-macos-arm64",
+    "archive": "codex-obsidian-book-library-v0.2.0-beta.1-macos-arm64-all-in-one.zip",
+    "top_level_directory": "codex-obsidian-book-library-v0.2.0-beta.1-macos-arm64",
+    "vision_helper_version": "0.2.0",
+    "vision_schema_version": "2",
 }
 
 FIXED_MODEL_FILES = (
@@ -116,6 +120,53 @@ FIXED_MODEL_FILES = (
         "sha256": "a1d6bc8734a6f635dc158508bef000f8e2e5a759c7d92f984b2c86e5ff53425b",
     },
 )
+
+
+@pytest.fixture(autouse=True)
+def _inject_vision_fixture(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    """Supply a synthetic arm64 helper to legacy release fixtures.
+
+    The helper is deliberately a temporary Mach-O-shaped file; no compiled
+    binary or user artifact is added to the repository.
+    """
+
+    helper = tmp_path / "book-vision-ocr"
+    helper.write_bytes(b"\xcf\xfa\xed\xfe" + b"\x00" * 64)
+    helper.chmod(0o755)
+
+    def run_command(
+        argv: list[str],
+        *,
+        cwd: Path,
+        check: bool,
+        capture_output: bool = False,
+        text: bool = False,
+        **_: object,
+    ) -> subprocess.CompletedProcess[str]:
+        assert check is True
+        if Path(argv[0]).name == "lipo":
+            return subprocess.CompletedProcess(argv, 0, "arm64\n", "")
+        if Path(argv[0]).name == "codesign":
+            return subprocess.CompletedProcess(argv, 0, "", "")
+        if argv[-1:] == ["--capabilities"]:
+            return subprocess.CompletedProcess(
+                argv,
+                0,
+                json.dumps({"schema_version": 2, "languages": ["zh-Hans", "en-US"]}),
+                "",
+            )
+        raise AssertionError(f"unexpected validation command: {argv}")
+
+    original = build_macos_release.build_release
+
+    def wrapped(*args: object, **kwargs: object) -> build_macos_release.BuildResult:
+        kwargs.setdefault("vision_helper", helper)
+        kwargs.setdefault("run_command", run_command)
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(build_macos_release, "build_release", wrapped)
 
 
 def _sha256(data: bytes) -> str:
@@ -341,8 +392,9 @@ def test_build_has_one_top_level_and_exact_allowlisted_payload(tmp_path: Path) -
     top = metadata["top_level_directory"]
     expected_payload = {
         *SOURCE_FILES,
-        *(f"data/models/{relative}" for relative in MODEL_FILES),
-        "bin/uv",
+            *(f"data/models/{relative}" for relative in MODEL_FILES),
+            "bin/uv",
+            "bin/book-vision-ocr",
         "RELEASE-MANIFEST.json",
     }
 
@@ -404,7 +456,7 @@ def test_manifest_checksum_and_zip_are_reproducible(tmp_path: Path) -> None:
                 "path": item["path"],
                 "size": len(data),
                 "sha256": _sha256(data),
-                "mode": "0755" if item["path"] in {"install-macos.command", "bin/uv"} else "0644",
+                "mode": "0755" if item["path"] in {"install-macos.command", "bin/uv", "bin/book-vision-ocr"} else "0644",
             }
 
 
@@ -1312,8 +1364,9 @@ def test_unzip_preserves_two_executables_and_normalizes_other_modes(
     for path in root.rglob("*"):
         if path.is_file():
             expected = 0o755 if path.relative_to(root).as_posix() in {
-                "install-macos.command",
-                "bin/uv",
+                    "install-macos.command",
+                    "bin/uv",
+                    "bin/book-vision-ocr",
             } else 0o644
             assert stat.S_IMODE(path.stat().st_mode) == expected
 

@@ -1,6 +1,11 @@
 .worktrees/
 .venv/
 dist/
+/bin/*
+!/bin/uv
+!/bin/book-vision-ocr
+/.codex/config.toml
+/Obsidian书库/
 
 # Python and test caches
 __pycache__/

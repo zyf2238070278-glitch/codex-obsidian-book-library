@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import shutil
+import stat
 import subprocess
 import sys
 import tempfile
@@ -25,6 +26,10 @@ ENABLED_TOOLS = (
     "search_books",
     "get_passages",
     "save_reading_note",
+    "start_ocr",
+    "start_pending_ocr",
+    "ocr_status",
+    "pause_ocr",
 )
 
 VAULT_DIRECTORIES = (
@@ -32,11 +37,25 @@ VAULT_DIRECTORIES = (
     Path("书库/10-原始书籍"),
     Path("书库/20-解析文本"),
     Path("书库/30-AI读书笔记"),
+    Path("书库/40-OCR报告"),
 )
 
 
 class InstallError(RuntimeError):
     """An expected installation failure with a user-facing message."""
+
+
+VISION_HELPER_RELATIVE = Path("bin/book-vision-ocr")
+VISION_HELPER_SCHEMA_VERSION = 2
+VISION_HELPER_LANGUAGES = frozenset({"zh-Hans", "en-US"})
+VISION_HELPER_LIPO = "/usr/bin/lipo"
+VISION_HELPER_CODESIGN = "/usr/bin/codesign"
+VISION_HELPER_MACHO_MAGICS = frozenset({b"\xcf\xfa\xed\xfe", b"\xfe\xed\xfa\xcf"})
+RAPIDOCR_MODEL_FILES = (
+    "PP-OCRv6_det_small.onnx",
+    "PP-OCRv6_rec_small.onnx",
+    "ch_ppocr_mobile_v2.0_cls_mobile.onnx",
+)
 
 
 @dataclass(frozen=True)
@@ -160,6 +179,8 @@ def _sync_environment(
         "--frozen",
         "--extra",
         "semantic",
+        "--extra",
+        "ocr",
         "--python",
         "3.12",
     ]
@@ -192,14 +213,192 @@ def _validate_python(python: Path) -> None:
         raise InstallError("Python 解释器不可执行：%s" % python)
 
 
+def _prepare_semantic_model(
+    *, project_root: Path, python: Path, run_command: Callable[..., Any]
+) -> None:
+    command = [
+        str(python),
+        "-m",
+        "installer.model_assets",
+        "--model-root",
+        str(project_root / "data" / "models"),
+        "--manifest",
+        str(project_root / "distribution" / "model-manifest.json"),
+    ]
+    try:
+        run_command(command, cwd=project_root, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise InstallError(
+            f"语义模型下载或校验失败（退出码 {exc.returncode}）。"
+            "请根据上方错误检查网络、磁盘或模型缓存后重试。"
+        ) from exc
+    except OSError as exc:
+        raise InstallError(f"无法运行语义模型安装：{exc}") from exc
+
+
+def _run_runtime_selftest(
+    *,
+    project_root: Path,
+    vault: Path,
+    python: Path,
+    run_command: Callable[..., Any],
+) -> None:
+    command = [
+        str(python),
+        "-m",
+        "installer.runtime_selftest",
+        "--project-root",
+        str(project_root),
+        "--vault",
+        str(vault),
+    ]
+    try:
+        run_command(command, cwd=project_root, check=True)
+    except subprocess.CalledProcessError as exc:
+        raise InstallError(
+            f"安装自检失败（退出码 {exc.returncode}）。请根据上方错误修复后重试。"
+        ) from exc
+    except OSError as exc:
+        raise InstallError(f"无法运行安装自检：{exc}") from exc
+
+
+def _run_validation_command(
+    runner: Callable[..., Any],
+    argv: list[str],
+    *,
+    cwd: Path,
+) -> Any:
+    """Run a validation command with argv only (never through a shell).
+
+    The small compatibility fallback keeps the injectable runner used by the
+    installer tests useful even when it does not accept capture_output/text.
+    """
+
+    try:
+        return runner(
+            argv,
+            cwd=cwd,
+            check=True,
+            capture_output=True,
+            text=True,
+        )
+    except TypeError as exc:
+        try:
+            return runner(argv, cwd=cwd, check=True)
+        except TypeError:
+            raise exc
+
+
+def _validate_vision_helper(
+    *,
+    project_root: Path,
+    helper: Optional[Path] = None,
+    run_command: Callable[..., Any],
+) -> Path:
+    """Validate the packaged Apple Vision helper before publishing config."""
+
+    helper = helper or (project_root / VISION_HELPER_RELATIVE)
+    try:
+        info = helper.lstat()
+    except OSError as exc:
+        raise InstallError(
+            "缺少 Apple Vision OCR helper：%s。请重新下载完整 macOS 安装包。" % helper
+        ) from exc
+    if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+        raise InstallError("Apple Vision OCR helper 必须是普通文件：%s" % helper)
+    if stat.S_IMODE(info.st_mode) != 0o755 or not os.access(str(helper), os.X_OK):
+        raise InstallError("Apple Vision OCR helper 必须具有 0755 可执行权限：%s" % helper)
+    try:
+        with helper.open("rb") as source:
+            if source.read(4) not in VISION_HELPER_MACHO_MAGICS:
+                raise InstallError("Apple Vision OCR helper 不是 64 位 Mach-O 文件：%s" % helper)
+    except OSError as exc:
+        raise InstallError("无法读取 Apple Vision OCR helper：%s" % helper) from exc
+
+    try:
+        architecture = _run_validation_command(
+            run_command, [VISION_HELPER_LIPO, "-archs", str(helper)], cwd=project_root
+        )
+        if (getattr(architecture, "stdout", "") or "").strip().split() != ["arm64"]:
+            raise InstallError("Apple Vision OCR helper 必须是 arm64：%s" % helper)
+        _run_validation_command(
+            run_command,
+            [VISION_HELPER_CODESIGN, "--verify", "--strict", str(helper)],
+            cwd=project_root,
+        )
+        capabilities = _run_validation_command(
+            run_command, [str(helper), "--capabilities"], cwd=project_root
+        )
+    except InstallError:
+        raise
+    except subprocess.CalledProcessError as exc:
+        raise InstallError("Apple Vision OCR helper 校验失败：退出码 %s" % exc.returncode) from exc
+    except OSError as exc:
+        raise InstallError("无法校验 Apple Vision OCR helper：%s" % exc) from exc
+
+    stderr = getattr(capabilities, "stderr", "") or ""
+    if stderr:
+        raise InstallError("Apple Vision OCR helper capabilities 输出了错误信息。")
+    try:
+        payload = json.loads(getattr(capabilities, "stdout", "") or "")
+    except (TypeError, json.JSONDecodeError) as exc:
+        raise InstallError("Apple Vision OCR helper capabilities 不是有效 JSON。") from exc
+    if type(payload) is not dict or set(payload) != {"schema_version", "languages"}:
+        raise InstallError("Apple Vision OCR helper capabilities schema 不受支持。")
+    if (
+        type(payload.get("schema_version")) is not int
+        or payload.get("schema_version") != VISION_HELPER_SCHEMA_VERSION
+    ):
+        raise InstallError("Apple Vision OCR helper schema 版本不受支持。")
+    languages = payload.get("languages")
+    if (
+        type(languages) is not list
+        or any(type(language) is not str or not language for language in languages)
+        or len(set(languages)) != len(languages)
+        or not VISION_HELPER_LANGUAGES.issubset(languages)
+    ):
+        raise InstallError("Apple Vision OCR helper 不支持中文或英文识别。")
+    return helper
+
+
 def _create_runtime_directories(project_root: Path, vault: Path) -> None:
     try:
         for relative in VAULT_DIRECTORIES:
             (vault / relative).mkdir(parents=True, exist_ok=True)
         (project_root / "data").mkdir(parents=True, exist_ok=True)
         (project_root / "data" / "models").mkdir(parents=True, exist_ok=True)
+        (project_root / "data" / "ocr-models").mkdir(parents=True, exist_ok=True)
     except OSError as exc:
         raise InstallError("无法创建书库目录：%s" % exc) from exc
+
+
+def _install_rapidocr_models(project_root: Path) -> None:
+    """Copy RapidOCR's wheel-bundled models to the stable runtime location."""
+
+    source = (
+        project_root
+        / ".venv"
+        / "lib"
+        / "python3.12"
+        / "site-packages"
+        / "rapidocr"
+        / "models"
+    )
+    destination = project_root / "data" / "ocr-models" / "rapidocr"
+    try:
+        for filename in RAPIDOCR_MODEL_FILES:
+            model = source / filename
+            if not model.is_file() or model.is_symlink():
+                raise InstallError(
+                    "RapidOCR 模型缺失：%s。请重新运行安装脚本。" % filename
+                )
+        destination.mkdir(parents=True, exist_ok=True)
+        for filename in RAPIDOCR_MODEL_FILES:
+            shutil.copy2(source / filename, destination / filename)
+    except InstallError:
+        raise
+    except OSError as exc:
+        raise InstallError("无法准备 RapidOCR 本地模型：%s" % exc) from exc
 
 
 def install(
@@ -209,13 +408,14 @@ def install(
     skip_sync: bool = False,
     codex_config: Optional[Path] = None,
     python: Optional[Path] = None,
+    vision_helper: Optional[Path] = None,
     find_executable: Optional[Callable[[str], Optional[str]]] = None,
     run_command: Optional[Callable[..., Any]] = None,
 ) -> InstallResult:
     """Install dependencies, create runtime directories, and write local config."""
 
     resolved_root = _absolute(Path(project_root))
-    resolved_vault = _absolute(
+    resolved_vault = _absolute_without_symlink_resolution(
         Path(vault) if vault is not None else resolved_root / "Obsidian书库"
     )
     resolved_config = _absolute(
@@ -229,14 +429,42 @@ def install(
         else resolved_root / ".venv" / "bin" / "python"
     )
 
+    command_runner = run_command or subprocess.run
     if not skip_sync:
         uv = _find_uv(resolved_root, find_executable or shutil.which)
         _sync_environment(
             project_root=resolved_root,
             uv=uv,
-            run_command=run_command or subprocess.run,
+            run_command=command_runner,
         )
         _validate_python(resolved_python)
+        _prepare_semantic_model(
+            project_root=resolved_root,
+            python=resolved_python,
+            run_command=command_runner,
+        )
+        _install_rapidocr_models(resolved_root)
+
+    # Validate the native helper before creating runtime directories or writing
+    # Codex configuration.  A failed validation therefore leaves an existing
+    # configuration untouched and never publishes a partial one.
+    _validate_vision_helper(
+        project_root=resolved_root,
+        helper=(
+            _absolute_without_symlink_resolution(Path(vision_helper), resolved_root)
+            if vision_helper is not None
+            else None
+        ),
+        run_command=command_runner,
+    )
+
+    if not skip_sync:
+        _run_runtime_selftest(
+            project_root=resolved_root,
+            vault=resolved_vault,
+            python=resolved_python,
+            run_command=command_runner,
+        )
 
     _create_runtime_directories(resolved_root, resolved_vault)
     try:
@@ -273,11 +501,6 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Obsidian Vault；默认使用 <project-root>/Obsidian书库",
     )
     parser.add_argument(
-        "--skip-sync",
-        action="store_true",
-        help="跳过 uv 依赖安装（仅用于测试或已经准备好的环境）",
-    )
-    parser.add_argument(
         "--codex-config",
         type=Path,
         help="Codex 项目配置；默认使用 <project-root>/.codex/config.toml",
@@ -296,7 +519,6 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
         result = install(
             project_root=args.project_root,
             vault=args.vault,
-            skip_sync=args.skip_sync,
             codex_config=args.codex_config,
             python=args.python,
         )

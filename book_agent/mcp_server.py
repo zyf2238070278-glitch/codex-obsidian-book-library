@@ -8,6 +8,7 @@ from mcp.server.fastmcp import FastMCP
 from pydantic import Field
 
 from book_agent.config import MAX_PREVIEWS
+from book_agent.ocr.service import DEFAULT_PENDING_LIMIT, DEFAULT_STATUS_LIMIT
 from book_agent.tools import build_tools
 
 
@@ -18,6 +19,10 @@ TOOL_NAMES = (
     "search_books",
     "get_passages",
     "save_reading_note",
+    "start_ocr",
+    "start_pending_ocr",
+    "ocr_status",
+    "pause_ocr",
 )
 
 ROOT = Path(os.environ.get("BOOK_LIBRARY_ROOT", os.getcwd())).expanduser().resolve()
@@ -109,6 +114,41 @@ def save_reading_note(
         markdown=markdown,
         passage_ids=passage_ids,
     )
+
+
+@mcp.tool()
+def start_ocr(book_id: str) -> dict[str, Any]:
+    """Explicitly queue or resume OCR for one managed PDF book."""
+
+    return library_tools.start_ocr(book_id)
+
+
+@mcp.tool()
+def start_pending_ocr(
+    limit: int = DEFAULT_PENDING_LIMIT,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Queue a bounded page of pending OCR books."""
+
+    return library_tools.start_pending_ocr(limit=limit, offset=offset)
+
+
+@mcp.tool()
+def ocr_status(
+    book_id: Optional[str] = None,
+    limit: int = DEFAULT_STATUS_LIMIT,
+    offset: int = 0,
+) -> dict[str, Any]:
+    """Inspect bounded OCR progress metadata without returning recognized text."""
+
+    return library_tools.ocr_status(book_id=book_id, limit=limit, offset=offset)
+
+
+@mcp.tool()
+def pause_ocr(book_id: str) -> dict[str, Any]:
+    """Pause one OCR job at a safe page boundary."""
+
+    return library_tools.pause_ocr(book_id)
 
 
 if __name__ == "__main__":

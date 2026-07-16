@@ -1,17 +1,28 @@
 from __future__ import annotations
 
 from collections.abc import Callable, Sequence
+from dataclasses import asdict, is_dataclass
+import json
 import math
 import os
 from pathlib import Path
+import re
 import stat
 from typing import Any
 
 from book_agent.config import AppPaths, MAX_PREVIEWS
 from book_agent.embeddings import E5EmbeddingProvider, NullEmbeddingProvider
 from book_agent.importer import ImportService
+from book_agent.indexing import BookIndexer
 from book_agent.models import SearchHit
 from book_agent.notes import NoteService
+from book_agent.ocr.models import OcrJobSummary
+from book_agent.ocr.service import (
+    DEFAULT_PENDING_LIMIT,
+    DEFAULT_STATUS_LIMIT,
+    MAXIMUM_RESULT_LIMIT,
+    OcrService,
+)
 from book_agent.retrieval import Retriever
 from book_agent.storage import Database
 from book_agent.vault import VaultManager
@@ -31,10 +42,11 @@ _BOOK_FIELDS = (
 )
 _ISSUE_ACTIONS = {
     "processing": "等待导入完成；若长期停留，请检查源文件后重新导入。",
-    "needs_ocr": "请先对原文件执行 OCR，再重新导入。",
+    "needs_ocr": "请明确说“开始 OCR 这本书”后再进行本机识别。",
     "failed": "请根据 error 修复源文件或本地依赖后重新导入。",
 }
 _ISSUE_STATUSES = {*_ISSUE_ACTIONS, "keyword_only"}
+_OCR_BOOK_ID = re.compile(r"[0-9a-f]{24}\Z")
 
 
 def _error_payload(error: Exception) -> dict[str, object]:
@@ -44,6 +56,58 @@ def _error_payload(error: Exception) -> dict[str, object]:
         "error": message,
         "error_type": error.__class__.__name__,
     }
+
+
+def _normalize_ocr_value(value: object) -> object:
+    if isinstance(value, OcrJobSummary) or is_dataclass(value):
+        payload: dict[str, object] = asdict(value)
+        percent = getattr(value, "percent_complete", None)
+        if percent is not None:
+            payload["percent_complete"] = percent
+        return _normalize_ocr_value(payload)
+    if isinstance(value, dict):
+        blocked = {"text", "ocr_text", "page_text", "content", "lines"}
+        return {
+            str(key): _normalize_ocr_value(item)
+            for key, item in value.items()
+            if str(key).lower() not in blocked
+        }
+    if isinstance(value, (list, tuple)):
+        return [_normalize_ocr_value(item) for item in value]
+    return value
+
+
+def _ocr_payload(value: object) -> dict[str, Any]:
+    """Convert an OCR service result to bounded, JSON-safe metadata only."""
+
+    normalized = _normalize_ocr_value(value)
+    if not isinstance(normalized, dict):
+        raise TypeError("OCR service returned an unsupported result")
+    payload: dict[str, Any] = normalized
+    # OCR status intentionally never exposes page text.  Validate the complete
+    # response before returning so a bad provider cannot leak non-JSON values.
+    json.dumps(payload, ensure_ascii=False, allow_nan=False)
+    return payload
+
+
+def _validate_ocr_book_id(book_id: object) -> str:
+    if type(book_id) is not str or _OCR_BOOK_ID.fullmatch(book_id) is None:
+        raise ValueError("book_id 必须是 24 位小写十六进制字符串。")
+    return book_id
+
+
+def _validate_ocr_limit(value: object, *, name: str) -> int:
+    if type(value) is not int or not 1 <= value <= MAXIMUM_RESULT_LIMIT:
+        raise ValueError(
+            f"{name} 必须是 1 到 {MAXIMUM_RESULT_LIMIT} 之间的整数。"
+        )
+    return value
+
+
+def _validate_ocr_offset(value: object) -> int:
+    if type(value) is not int or value < 0:
+        raise ValueError("offset 必须是非负整数。")
+    return value
 
 
 def _book_metadata(book: dict[str, Any]) -> dict[str, object]:
@@ -118,6 +182,8 @@ class LibraryTools:
         retriever: Retriever,
         notes: NoteService,
         embedding_provider: object,
+        indexer: BookIndexer | None = None,
+        ocr_service: OcrService | Any | None = None,
     ) -> None:
         self.paths = paths
         self.database = database
@@ -125,6 +191,8 @@ class LibraryTools:
         self.retriever = retriever
         self.notes = notes
         self.embedding_provider = embedding_provider
+        self.indexer = indexer
+        self.ocr_service = ocr_service
 
     @staticmethod
     def _guard(operation: Callable[[], dict[str, Any]]) -> dict[str, Any]:
@@ -264,6 +332,74 @@ class LibraryTools:
 
         return self._guard(operation)
 
+    def start_ocr(self, book_id: str) -> dict[str, Any]:
+        """Explicitly queue or resume OCR for one managed PDF."""
+
+        def operation() -> dict[str, Any]:
+            if self.ocr_service is None:
+                raise RuntimeError("OCR 服务未配置。")
+            validated_id = _validate_ocr_book_id(book_id)
+            return {"ok": True, **_ocr_payload(self.ocr_service.start_ocr(validated_id))}
+
+        return self._guard(operation)
+
+    def start_pending_ocr(
+        self,
+        limit: int = DEFAULT_PENDING_LIMIT,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Queue a bounded page of eligible OCR books."""
+
+        def operation() -> dict[str, Any]:
+            if self.ocr_service is None:
+                raise RuntimeError("OCR 服务未配置。")
+            safe_limit = _validate_ocr_limit(limit, name="limit")
+            safe_offset = _validate_ocr_offset(offset)
+            return {
+                "ok": True,
+                **_ocr_payload(
+                    self.ocr_service.start_pending_ocr(
+                        limit=safe_limit,
+                        offset=safe_offset,
+                    )
+                ),
+            }
+
+        return self._guard(operation)
+
+    def ocr_status(
+        self,
+        book_id: str | None = None,
+        limit: int = DEFAULT_STATUS_LIMIT,
+        offset: int = 0,
+    ) -> dict[str, Any]:
+        """Return bounded OCR metadata and progress, never page text."""
+
+        def operation() -> dict[str, Any]:
+            if self.ocr_service is None:
+                raise RuntimeError("OCR 服务未配置。")
+            safe_limit = _validate_ocr_limit(limit, name="limit")
+            safe_offset = _validate_ocr_offset(offset)
+            if book_id is not None:
+                validated_id = _validate_ocr_book_id(book_id)
+                result = self.ocr_service.status(validated_id)
+            else:
+                result = self.ocr_service.status(limit=safe_limit, offset=safe_offset)
+            return {"ok": True, **_ocr_payload(result)}
+
+        return self._guard(operation)
+
+    def pause_ocr(self, book_id: str) -> dict[str, Any]:
+        """Pause one OCR job at a safe page boundary."""
+
+        def operation() -> dict[str, Any]:
+            if self.ocr_service is None:
+                raise RuntimeError("OCR 服务未配置。")
+            validated_id = _validate_ocr_book_id(book_id)
+            return {"ok": True, **_ocr_payload(self.ocr_service.pause(validated_id))}
+
+        return self._guard(operation)
+
     @staticmethod
     def _preview(hit: SearchHit) -> dict[str, object]:
         text = hit.text
@@ -342,11 +478,18 @@ def build_tools(
         local_e5 = E5EmbeddingProvider(paths.models)
         provider = local_e5 if local_e5.available else NullEmbeddingProvider()
 
+    indexer = BookIndexer(
+        paths,
+        database,
+        provider,
+        vault_root_identity=explicit_vault_identity,
+    )
     importer = ImportService(
         paths,
         database,
         provider,
         vault_root_identity=explicit_vault_identity,
+        indexer=indexer,
     )
     retriever = Retriever(database, provider)
     notes = NoteService(
@@ -354,6 +497,7 @@ def build_tools(
         database,
         vault_root_identity=explicit_vault_identity,
     )
+    ocr_service = OcrService(paths, database)
     return LibraryTools(
         paths=paths,
         database=database,
@@ -361,4 +505,6 @@ def build_tools(
         retriever=retriever,
         notes=notes,
         embedding_provider=provider,
+        indexer=indexer,
+        ocr_service=ocr_service,
     )

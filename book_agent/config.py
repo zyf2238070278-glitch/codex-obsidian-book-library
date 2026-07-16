@@ -22,8 +22,13 @@ class AppPaths:
     originals: Path
     parsed: Path
     notes: Path
+    ocr_reports: Path
     database: Path
     models: Path
+    ocr_models: Path
+    ocr: Path
+    ocr_logs: Path
+    vision_helper: Path
 
     @classmethod
     def from_root(cls, root: Path, vault_root: Path | None = None) -> Self:
@@ -43,6 +48,11 @@ class AppPaths:
             originals=library / "10-原始书籍",
             parsed=library / "20-解析文本",
             notes=library / "30-AI读书笔记",
+            ocr_reports=library / "40-OCR报告",
             database=resolved_root / "data" / "library.sqlite3",
             models=resolved_root / "data" / "models",
+            ocr_models=resolved_root / "data" / "ocr-models",
+            ocr=resolved_root / "data" / "ocr",
+            ocr_logs=resolved_root / "data" / "ocr" / "logs",
+            vision_helper=resolved_root / "bin" / "book-vision-ocr",
         )

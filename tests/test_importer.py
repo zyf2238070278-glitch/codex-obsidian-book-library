@@ -12,10 +12,12 @@ import fitz
 import numpy as np
 import pytest
 
+import book_agent.indexing as indexing_module
 import book_agent.importer as importer_module
 from book_agent.config import AppPaths
 from book_agent.embeddings import NullEmbeddingProvider, decode_vector, encode_vector
 from book_agent.importer import ImportResult, ImportService, sha256_file
+from book_agent.indexing import IndexResult
 from book_agent.storage import Database
 
 
@@ -502,6 +504,52 @@ def test_available_provider_marks_ready_and_persists_every_embedding(
         )
 
 
+def test_importer_copies_and_parses_before_using_an_injected_indexer(
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+) -> None:
+    paths, database = app
+    source = _write_txt(tmp_path / "injected-indexer.txt", marker="委托边界")
+
+    class RecordingIndexer:
+        def __init__(self) -> None:
+            self.calls: list[tuple[str, object, Path]] = []
+
+        def __bool__(self) -> bool:
+            return False
+
+        def index_parsed_book(self, *, book_id, parsed, original_path):
+            self.calls.append((book_id, parsed, Path(original_path)))
+            return IndexResult(
+                status="ready",
+                parsed_path="/injected/正文.md",
+                passage_count=7,
+                error=None,
+                message="injected index complete",
+            )
+
+    indexer = RecordingIndexer()
+
+    result = ImportService(
+        paths,
+        database,
+        NullEmbeddingProvider(),
+        indexer=indexer,  # type: ignore[arg-type]
+    ).import_book(source, title="注入标题", author="注入作者")
+
+    assert result.status == "ready"
+    assert result.passage_count == 7
+    assert result.message == "injected index complete"
+    assert len(indexer.calls) == 1
+    delegated_book_id, parsed, delegated_original = indexer.calls[0]
+    assert delegated_book_id == result.book_id
+    assert parsed.title == "注入标题"
+    assert parsed.author == "注入作者"
+    assert delegated_original == Path(result.original_path)
+    assert delegated_original.is_file()
+    assert delegated_original.read_bytes() == source.read_bytes()
+
+
 def test_keyword_only_reimport_with_available_provider_recovers_embeddings(
     app: tuple[AppPaths, Database], tmp_path: Path
 ) -> None:
@@ -917,7 +965,7 @@ def test_main_pipeline_failures_leave_no_partial_passages(
         raise OSError(f"{failure_point} injected failure")
 
     if failure_point == "render":
-        monkeypatch.setattr(importer_module, "render_parsed_book", fail)
+        monkeypatch.setattr(indexing_module, "render_parsed_book", fail)
     else:
         monkeypatch.setattr(database, "replace_passages", fail)
 
@@ -1010,11 +1058,21 @@ def test_double_status_failure_reports_actual_processing_state_and_hides_passage
 
 
 def test_keyboard_interrupt_marks_failed_hides_committed_passages_and_reraises(
-    app: tuple[AppPaths, Database], tmp_path: Path
+    app: tuple[AppPaths, Database],
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     paths, database = app
     source = _write_txt(tmp_path / "interrupted.txt", marker="中断前已提交")
     book_id = sha256_file(source)[:24]
+    real_update = database.update_book_status
+    status_updates: list[str] = []
+
+    def track_update(book_id: str, status: str, **kwargs) -> None:
+        status_updates.append(status)
+        real_update(book_id, status, **kwargs)
+
+    monkeypatch.setattr(database, "update_book_status", track_update)
 
     with pytest.raises(KeyboardInterrupt, match="operator cancelled"):
         ImportService(paths, database, _InterruptingEmbeddingProvider()).import_book(
@@ -1027,6 +1085,7 @@ def test_keyboard_interrupt_marks_failed_hides_committed_passages_and_reraises(
     assert database.count_passages(book_id) > 0
     assert database.keyword_search("中断前已提交", 5) == []
     assert database.get_neighbors(book_id, 0, 10) == []
+    assert status_updates == ["failed"]
 
 
 @pytest.mark.parametrize(

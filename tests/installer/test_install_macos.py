@@ -127,8 +127,8 @@ def test_install_light_ocr_runtime_uses_pinned_macos_arm64_package(
     )
     (project_root / "package.json").write_text("{}", encoding="utf-8")
     (project_root / "package-lock.json").write_text("{}", encoding="utf-8")
-    node = tmp_path / "bin" / "node"
-    npm = tmp_path / "bin" / "npm"
+    node = project_root / "runtime" / "node" / "bin" / "node"
+    npm = project_root / "runtime" / "node" / "bin" / "npm"
     _create_executable(node)
     _create_executable(npm)
     calls: list[list[str]] = []
@@ -149,7 +149,9 @@ def test_install_light_ocr_runtime_uses_pinned_macos_arm64_package(
 
     installed_node = install_macos._install_light_ocr_runtime(
         project_root,
-        find_executable=lambda name: str(node if name == "node" else npm),
+        find_executable=lambda _name: (_ for _ in ()).throw(
+            AssertionError("pinned runtime must not search PATH")
+        ),
         run_command=runner,
     )
 
@@ -165,25 +167,150 @@ def test_install_light_ocr_runtime_rejects_unsupported_node(tmp_path: Path) -> N
     )
     (project_root / "package.json").write_text("{}", encoding="utf-8")
     (project_root / "package-lock.json").write_text("{}", encoding="utf-8")
-    node = tmp_path / "node"
-    npm = tmp_path / "npm"
+    node = project_root / "runtime" / "node" / "bin" / "node"
+    npm = project_root / "runtime" / "node" / "bin" / "npm"
     _create_executable(node)
     _create_executable(npm)
 
     with pytest.raises(install_macos.InstallError, match="Node.js 22 或 24"):
         install_macos._install_light_ocr_runtime(
             project_root,
-            find_executable=lambda name: str(node if name == "node" else npm),
+            find_executable=lambda _name: (_ for _ in ()).throw(
+                AssertionError("pinned runtime must not search PATH")
+            ),
             run_command=lambda command, **kwargs: subprocess.CompletedProcess(
                 command, 0, "v23.0.0\n", ""
             ),
         )
 
 
+def test_install_light_ocr_runtime_bootstraps_node_when_path_has_none(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project_root = tmp_path / "Book Library Release"
+    (project_root / "scripts").mkdir(parents=True)
+    (project_root / "scripts" / "light_ocr_worker.mjs").write_text(
+        "// worker", encoding="utf-8"
+    )
+    (project_root / "package.json").write_text("{}", encoding="utf-8")
+    (project_root / "package-lock.json").write_text("{}", encoding="utf-8")
+    calls: list[list[str]] = []
+    prepared: list[Path] = []
+
+    def prepare(root: Path) -> Path:
+        prepared.append(root)
+        runtime = root / "runtime" / "node"
+        _create_executable(runtime / "bin" / "node")
+        _create_executable(runtime / "bin" / "npm")
+        return runtime
+
+    monkeypatch.setattr(install_macos, "ensure_node_runtime", prepare, raising=False)
+
+    def runner(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        if command[-1] == "--version":
+            return subprocess.CompletedProcess(command, 0, "v24.15.0\n", "")
+        if command[-2:] == ["-p", "process.arch"]:
+            return subprocess.CompletedProcess(command, 0, "arm64\n", "")
+        for relative in install_macos.LIGHT_OCR_REQUIRED_RUNTIME_FILES:
+            path = project_root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"runtime")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    installed_node = install_macos._install_light_ocr_runtime(
+        project_root,
+        find_executable=lambda _name: None,
+        run_command=runner,
+    )
+
+    expected_runtime = project_root / "runtime" / "node"
+    assert prepared == [project_root]
+    assert installed_node == (expected_runtime / "bin" / "node").resolve()
+    assert calls[-1] == [
+        str((expected_runtime / "bin" / "npm").resolve()),
+        "ci",
+        "--omit=dev",
+        "--ignore-scripts",
+    ]
+
+
+def test_install_light_ocr_runtime_prefers_pinned_runtime_over_path_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project_root = tmp_path / "Book Library Release"
+    (project_root / "scripts").mkdir(parents=True)
+    (project_root / "scripts" / "light_ocr_worker.mjs").write_text(
+        "// worker", encoding="utf-8"
+    )
+    (project_root / "package.json").write_text("{}", encoding="utf-8")
+    (project_root / "package-lock.json").write_text("{}", encoding="utf-8")
+    path_node = tmp_path / "path-bin" / "node"
+    path_npm = tmp_path / "path-bin" / "npm"
+    _create_executable(path_node)
+    _create_executable(path_npm)
+    prepared: list[Path] = []
+
+    def prepare(root: Path) -> Path:
+        prepared.append(root)
+        runtime = root / "runtime" / "node"
+        _create_executable(runtime / "bin" / "node")
+        _create_executable(runtime / "bin" / "npm")
+        return runtime
+
+    monkeypatch.setattr(install_macos, "ensure_node_runtime", prepare)
+
+    def runner(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if command[-1] == "--version":
+            return subprocess.CompletedProcess(command, 0, "v24.15.0\n", "")
+        if command[-2:] == ["-p", "process.arch"]:
+            return subprocess.CompletedProcess(command, 0, "arm64\n", "")
+        for relative in install_macos.LIGHT_OCR_REQUIRED_RUNTIME_FILES:
+            path = project_root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"runtime")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    installed_node = install_macos._install_light_ocr_runtime(
+        project_root,
+        find_executable=lambda name: str(path_node if name == "node" else path_npm),
+        run_command=runner,
+    )
+
+    assert prepared == [project_root]
+    assert installed_node == (
+        project_root / "runtime" / "node" / "bin" / "node"
+    ).resolve()
+
+
 def test_default_project_root_is_distribution_root() -> None:
     assert install_macos.default_project_root() == Path(
         install_macos.__file__
     ).resolve().parents[1]
+
+
+def test_installer_script_loads_node_runtime_from_unrelated_directory(
+    tmp_path: Path,
+) -> None:
+    script = Path(install_macos.__file__).resolve()
+    environment = os.environ.copy()
+    environment["PYTHONPATH"] = ""
+
+    completed = subprocess.run(
+        [sys.executable, str(script), "--help"],
+        cwd=tmp_path,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert "安装 Codex + Obsidian 本地书库" in completed.stdout
 
 
 def test_install_uses_default_vault_and_creates_runtime_directories(

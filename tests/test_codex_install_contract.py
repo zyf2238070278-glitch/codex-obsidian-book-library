@@ -69,6 +69,7 @@ def test_machine_specific_codex_config_is_generated_not_tracked() -> None:
     ignore = (ROOT / ".gitignore").read_text(encoding="utf-8")
     assert "/.codex/config.toml" in ignore
     assert "/Obsidian书库/" in ignore
+    assert "/runtime/" in ignore
 
 
 def test_agents_gives_codex_one_install_route() -> None:

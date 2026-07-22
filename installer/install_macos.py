@@ -16,6 +16,13 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
+try:
+    from installer.node_runtime import NodeRuntimeError, ensure_node_runtime
+except ModuleNotFoundError as exc:
+    if exc.name != "installer":
+        raise
+    from node_runtime import NodeRuntimeError, ensure_node_runtime
+
 
 EXIT_SUCCESS = 0
 EXIT_INSTALL_ERROR = 1
@@ -444,11 +451,12 @@ def _install_light_ocr_runtime(
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
             raise InstallError("Light OCR 安装文件必须是普通文件：%s" % source)
 
-    bundled_node = project_root / "runtime" / "node" / "bin" / "node"
-    node_text = str(bundled_node) if bundled_node.is_file() else find_executable("node")
-    npm_text = find_executable("npm")
-    if not node_text or not npm_text:
-        raise InstallError("Light OCR 需要 Node.js 22 或 24 以及 npm。")
+    try:
+        bundled_root = ensure_node_runtime(project_root)
+    except NodeRuntimeError as exc:
+        raise InstallError(f"Node.js 自动安装失败：{exc}") from exc
+    node_text = str(bundled_root / "bin" / "node")
+    npm_text = str(bundled_root / "bin" / "npm")
     node = Path(node_text).expanduser().resolve()
     npm = Path(npm_text).expanduser().resolve()
     for executable, label in ((node, "Node.js"), (npm, "npm")):

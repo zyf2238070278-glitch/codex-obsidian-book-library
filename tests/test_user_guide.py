@@ -48,6 +48,12 @@ def test_user_guide_has_the_required_exact_sections() -> None:
 def test_user_guide_covers_setup_and_codex_reload() -> None:
     guide = _guide()
 
+    assert (
+        "git clone https://github.com/zyf2238070278-glitch/"
+        "codex-obsidian-book-library.git && "
+        "cd codex-obsidian-book-library && ./install-from-github.command"
+    ) in guide
+
     positions = [guide.index(phrase) for phrase in CODEX_FIRST_FLOW]
     assert positions == sorted(positions)
     for phrase in (
@@ -58,6 +64,7 @@ def test_user_guide_covers_setup_and_codex_reload() -> None:
         "项目本地 Python",
         "锁定版本",
         "无需预装 Homebrew、Python、Xcode 或 uv",
+        "无需预装 Node.js",
     ):
         assert phrase in guide
     for stale in (
@@ -87,6 +94,8 @@ def test_user_guide_explains_local_runtime_and_repair() -> None:
         "语义模型和 OCR 模型",
         "Apple Vision",
         "RapidOCR",
+        "Light OCR",
+        "无需预装 Node.js",
         "本机运行",
         "移动项目目录",
         "重新运行",

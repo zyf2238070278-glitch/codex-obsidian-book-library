@@ -4,22 +4,21 @@
 
 当前版本支持 macOS 16 或更高版本的 Apple Silicon（M 系列）Mac，不支持 Intel Mac 或 Windows。支持 PDF、EPUB、Markdown 和 TXT；扫描版 PDF 可在用户明确授权后按 Apple Vision、RapidOCR、Light OCR 的顺序在本机识别。
 
-## Git 安装（推荐）
+## Git 安装（终端一行，推荐）
 
-1. 在终端运行精确的克隆命令，然后进入项目目录：
+1. 打开终端，完整复制下面这一行并按回车；它会克隆仓库并自动运行安装器：
 
    ```bash
-   git clone https://github.com/zyf2238070278-glitch/codex-obsidian-book-library.git
-   cd codex-obsidian-book-library
+   git clone https://github.com/zyf2238070278-glitch/codex-obsidian-book-library.git && cd codex-obsidian-book-library && ./install-from-github.command
    ```
 
-2. 在 Codex 中打开并信任整个 `codex-obsidian-book-library` 项目，新建任务并说：“请安装并检查这个书库”。
-3. 安装成功后，完整退出并重启 Codex，再打开同一项目。
+2. 看到“安装完成”后，在 Codex 中打开并信任整个 `codex-obsidian-book-library` 项目。如果安装曾中断，也可以新建任务说：“请安装并检查这个书库”。
+3. 完整退出并重启 Codex，再打开同一项目。
 4. 重启后新建任务并说：“检查书库状态”。状态正常后，可以附加书籍并说“导入这本书”。
 
-这条流程只支持 macOS 16 或更高版本的 Apple Silicon（M 系列）Mac。首次安装需要联网：安装器会下载约 500 MB 的语义模型及 Python 包，实际流量会随包缓存状态略有变化。项目自带固定版本的 uv、Apple Vision 工具，并在项目内创建项目本地 Python、安装锁定版本的依赖以及准备 RapidOCR 模型；本机无需预装 Homebrew、Python、Xcode 或 uv。安装完成后，语义检索、Apple Vision 和 RapidOCR 都在本机运行。
+这条流程只支持 macOS 16 或更高版本的 Apple Silicon（M 系列）Mac。首次安装需要联网：安装器会下载约 500 MB 的语义模型及 Python 包，并下载经过 SHA-256 校验的固定 Node.js 与 Light OCR 运行包；实际流量会随包缓存状态略有变化。项目自带固定版本的 uv、Apple Vision 工具，并在项目内创建项目本地 Python、安装锁定版本的依赖以及准备 RapidOCR 模型；本机无需预装 Homebrew、Python、Xcode 或 uv，也无需预装 Node.js。安装完成后，语义检索、Apple Vision、RapidOCR 和 Light OCR 都在本机运行。
 
-Codex 只运行项目根目录的 `install-macos.command`。如果你需要手动重试，也可以在项目根目录运行它；不要自行拼接 Python、pip、uv 或模型下载命令。
+一行命令中的 `install-from-github.command` 只会转交给项目根目录的 `install-macos.command`。如果需要手动重试，也可以在项目根目录运行任一入口；不要自行拼接 Python、pip、uv、npm 或模型下载命令。
 
 ## 书库怎么用
 

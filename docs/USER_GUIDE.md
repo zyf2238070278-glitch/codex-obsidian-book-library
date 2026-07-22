@@ -6,20 +6,19 @@
 
 按下面四步完成首次设置：
 
-1. 在终端运行精确的克隆命令，然后进入项目目录：
+1. 在终端完整复制下面这一行并按回车，它会克隆仓库并自动运行安装器：
 
    ```bash
-   git clone https://github.com/zyf2238070278-glitch/codex-obsidian-book-library.git
-   cd codex-obsidian-book-library
+   git clone https://github.com/zyf2238070278-glitch/codex-obsidian-book-library.git && cd codex-obsidian-book-library && ./install-from-github.command
    ```
 
-2. 在 Codex 中打开并信任整个项目，新建任务并说：“请安装并检查这个书库”。
-3. 安装成功后，完整退出并重启 Codex，再打开同一项目。
+2. 看到“安装完成”后，在 Codex 中打开并信任整个项目。如果安装曾中断，也可以新建任务说：“请安装并检查这个书库”。
+3. 完整退出并重启 Codex，再打开同一项目。
 4. 重启后新建任务并说：“检查书库状态”。
 
-当前版本支持 macOS 16 或更高版本的 Apple Silicon（M 系列）Mac。首次安装需要联网，会下载约 500 MB 的语义模型及 Python 包。项目自带固定版本的 uv 和 Apple Vision 工具，在项目内创建项目本地 Python，按锁文件安装锁定版本的依赖，并准备语义模型和 OCR 模型；本机无需预装 Homebrew、Python、Xcode 或 uv。
+当前版本支持 macOS 16 或更高版本的 Apple Silicon（M 系列）Mac。首次安装需要联网，会下载约 500 MB 的语义模型及 Python 包，并下载校验过的固定 Node.js 与 Light OCR 运行包。项目自带固定版本的 uv 和 Apple Vision 工具，在项目内创建项目本地 Python，按锁文件安装锁定版本的依赖，并准备语义模型和 OCR 模型；本机无需预装 Homebrew、Python、Xcode 或 uv，也无需预装 Node.js。
 
-安装器会在发布配置前检查依赖、384 维语义向量、Apple Vision、RapidOCR 和 MCP 的 `library_status`。用户不需要手工运行 Python、pip、uv 或模型下载命令。安装完成后，语义检索和 OCR 在本机运行；和 Codex 对话仍需正常联网。
+安装器会在发布配置前检查依赖、384 维语义向量、Apple Vision、RapidOCR、Light OCR 和 MCP 的 `library_status`。用户不需要手工运行 Python、pip、uv、npm 或模型下载命令。安装完成后，语义检索和 OCR 在本机运行；和 Codex 对话仍需正常联网。
 
 书库的 SQLite 索引、语义向量和本地模型保存在项目的 `data/`，项目本地 Python 和依赖保存在 `.venv/`；这些运行数据不会写入 Obsidian。以后一般不必重复安装。移动项目目录后，在 Codex 中打开并信任新位置，重新运行“请安装并检查这个书库”，成功后再次完整退出并重启 Codex。修复或移动时重新运行不会删除已有书籍或笔记。
 

@@ -32,6 +32,12 @@ CODEX_FIRST_FLOW = (
     "检查书库状态",
 )
 
+ONE_LINE_INSTALL = (
+    "git clone https://github.com/zyf2238070278-glitch/"
+    "codex-obsidian-book-library.git && "
+    "cd codex-obsidian-book-library && ./install-from-github.command"
+)
+
 STALE_INSTALL_TEXT = (
     "v0.2.0-beta.1",
     "约 292 MB",
@@ -170,6 +176,7 @@ def test_readme_gives_the_complete_shortest_macos_path() -> None:
             "约 500 MB",
             "首次安装需要联网",
             "无需预装 Homebrew、Python、Xcode 或 uv",
+            "无需预装 Node.js",
             "项目本地 Python",
             "锁定版本",
             "Apple Vision",
@@ -211,6 +218,7 @@ def test_public_docs_explain_online_local_and_recovery_boundaries() -> None:
             "项目自带固定版本的 uv",
             "项目本地 Python",
             "无需预装 Homebrew、Python、Xcode 或 uv",
+            "无需预装 Node.js",
             "Apple Silicon",
             "macOS 16",
             "Apple Vision",
@@ -230,6 +238,7 @@ def test_readme_gives_copyable_git_clone_command() -> None:
     install = _read("docs/安装说明.md")
 
     for text in (readme, install):
+        assert ONE_LINE_INSTALL in text
         _assert_contains(
             text,
             (
@@ -309,6 +318,7 @@ def test_install_and_privacy_docs_state_runtime_and_data_boundaries() -> None:
             "首次安装需要联网",
             "约 500 MB",
             "Python 包",
+            "无需预装 Node.js",
             "锁定版本",
             "项目本地 Python",
             "语义检索在本机运行",

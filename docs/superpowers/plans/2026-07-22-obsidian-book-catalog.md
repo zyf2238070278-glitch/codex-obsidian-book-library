@@ -137,12 +137,11 @@ def sync_book_catalog() -> dict[str, Any]:
 ### Task 5: Backfill and verify the active Obsidian library
 
 **Files:**
-- Create at runtime: `/Users/zhaoyunfei/Documents/Obsidian_workspace/书库/50-书目卡片/*.md`
-- Create at runtime: `/Users/zhaoyunfei/Documents/Obsidian_workspace/书库/书库总览.base`
+- Create at runtime: `<OBSIDIAN_VAULT>/书库/50-书目卡片/*.md`
+- Create at runtime: `<OBSIDIAN_VAULT>/书库/书库总览.base`
 
 - [ ] **Step 1: Snapshot original-file names and SHA-256 values without modifying them**
 - [ ] **Step 2: Run the catalog sync against the configured active database/vault**
 - [ ] **Step 3: Assert 13 cards exist and category counts are `3,3,3,1,1,1,1`**
 - [ ] **Step 4: Validate every existing source/parsed/report link target and confirm original hashes are unchanged**
 - [ ] **Step 5: Open `书库总览.base` in Obsidian and visually confirm grouped rows are readable**
-

@@ -1,6 +1,7 @@
 .worktrees/
 .venv/
 node_modules/
+/runtime/
 dist/
 /bin/*
 !/bin/uv

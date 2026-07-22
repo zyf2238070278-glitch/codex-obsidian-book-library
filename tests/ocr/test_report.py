@@ -22,10 +22,13 @@ def test_report_lists_only_skipped_physical_pages(tmp_path: Path) -> None:
                 "detail": "render failed",
             }
         ],
+        outcome_counts={"recognized": 90, "blank": 2, "image_only": 7, "skipped": 1},
     )
 
     text = report.read_text(encoding="utf-8")
     assert report.parent == paths.ocr_reports
     assert "PDF 第 4 页" in text
     assert "render failed" in text
+    assert "识别文字页：90" in text
+    assert "纯图片页：7" in text
     assert "原文" not in text

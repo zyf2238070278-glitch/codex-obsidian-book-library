@@ -1,0 +1,15 @@
+{
+  "name": "local-obsidian-book-rag-runtime",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": "22 || 24"
+  },
+  "scripts": {
+    "test:light-ocr": "node --test tests/node/light_ocr_worker.test.mjs"
+  },
+  "dependencies": {
+    "@arcships/light-ocr": "0.3.0"
+  }
+}

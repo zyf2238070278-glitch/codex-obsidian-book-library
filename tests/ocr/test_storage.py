@@ -174,7 +174,7 @@ def test_initialize_migrates_existing_ocr_pages_without_losing_text(
 def test_page_outcomes_are_checkpointed_counted_and_skips_are_bounded(
     db: Database,
 ) -> None:
-    _claim(db, total_pages=3)
+    _claim(db, total_pages=4)
 
     recognized = db.save_ocr_page_result(
         BOOK_A,
@@ -217,12 +217,25 @@ def test_page_outcomes_are_checkpointed_counted_and_skips_are_bounded(
         22,
         now=NOW,
     )
+    image_only = db.save_ocr_page_result(
+        BOOK_A,
+        "worker-a",
+        4,
+        "iv",
+        OcrPageOutcome("image_only", None, "no_text_expected"),
+        None,
+        None,
+        None,
+        8,
+        now=NOW,
+    )
 
     assert recognized["text"] == "可检索文字"
-    assert blank["text"] == skipped["text"] == ""
+    assert blank["text"] == skipped["text"] == image_only["text"] == ""
     assert db.ocr_page_outcome_counts(BOOK_A) == {
         "recognized": 1,
         "blank": 1,
+        "image_only": 1,
         "skipped": 1,
     }
     assert db.list_skipped_ocr_pages(BOOK_A) == [

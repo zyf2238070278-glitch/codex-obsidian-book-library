@@ -31,6 +31,8 @@ class AppPaths:
     ocr: Path
     ocr_logs: Path
     vision_helper: Path
+    light_ocr_worker: Path
+    light_ocr_package: Path
 
     @classmethod
     def from_root(cls, root: Path, vault_root: Path | None = None) -> Self:
@@ -59,4 +61,12 @@ class AppPaths:
             ocr=resolved_root / "data" / "ocr",
             ocr_logs=resolved_root / "data" / "ocr" / "logs",
             vision_helper=resolved_root / "bin" / "book-vision-ocr",
+            light_ocr_worker=resolved_root / "scripts" / "light_ocr_worker.mjs",
+            light_ocr_package=(
+                resolved_root
+                / "node_modules"
+                / "@arcships"
+                / "light-ocr"
+                / "package.json"
+            ),
         )

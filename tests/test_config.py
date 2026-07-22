@@ -28,6 +28,8 @@ def test_app_paths_are_rooted_under_project(tmp_path: Path) -> None:
         ocr=resolved_root / "data" / "ocr",
         ocr_logs=resolved_root / "data" / "ocr" / "logs",
         vision_helper=resolved_root / "bin" / "book-vision-ocr",
+        light_ocr_worker=resolved_root / "scripts" / "light_ocr_worker.mjs",
+        light_ocr_package=resolved_root / "node_modules" / "@arcships" / "light-ocr" / "package.json",
     )
 
 
@@ -69,6 +71,8 @@ def test_app_paths_keep_external_obsidian_files_separate_from_project_data(
         ocr=resolved_root / "data" / "ocr",
         ocr_logs=resolved_root / "data" / "ocr" / "logs",
         vision_helper=resolved_root / "bin" / "book-vision-ocr",
+        light_ocr_worker=resolved_root / "scripts" / "light_ocr_worker.mjs",
+        light_ocr_package=resolved_root / "node_modules" / "@arcships" / "light-ocr" / "package.json",
     )
 
 
@@ -92,6 +96,10 @@ def test_app_paths_places_ocr_runtime_under_project_data(tmp_path: Path) -> None
     assert paths.ocr_logs == paths.ocr / "logs"
     assert paths.ocr_models == tmp_path.resolve() / "data" / "ocr-models"
     assert paths.vision_helper == tmp_path.resolve() / "bin" / "book-vision-ocr"
+    assert paths.light_ocr_worker == tmp_path.resolve() / "scripts" / "light_ocr_worker.mjs"
+    assert paths.light_ocr_package == (
+        tmp_path.resolve() / "node_modules" / "@arcships" / "light-ocr" / "package.json"
+    )
 
 
 def test_paths_expose_non_evidence_ocr_reports_directory(tmp_path: Path) -> None:

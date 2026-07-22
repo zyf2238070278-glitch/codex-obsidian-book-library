@@ -644,7 +644,7 @@ class Database:
             validated_hash = _validate_nonblank_string(text_sha256, "text_sha256")
         else:
             if text is not None or text_sha256 is not None:
-                raise ValueError("blank and skipped pages must not provide text or hashes")
+                raise ValueError("non-recognized pages must not provide text or hashes")
             validated_text = ""
             validated_hash = ""
         if mean_confidence is not None and (
@@ -772,7 +772,10 @@ class Database:
 
     def ocr_page_outcome_counts(self, book_id: str) -> dict[str, int]:
         validated_book_id = _validate_book_id(book_id)
-        counts = {outcome: 0 for outcome in ("recognized", "blank", "skipped")}
+        counts = {
+            outcome: 0
+            for outcome in ("recognized", "blank", "image_only", "skipped")
+        }
         with self._connection() as connection:
             rows = connection.execute(
                 """

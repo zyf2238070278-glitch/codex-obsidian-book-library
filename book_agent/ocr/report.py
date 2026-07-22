@@ -12,12 +12,25 @@ def write_ocr_report(
     book_id: str,
     title: str,
     skipped_pages: Iterable[Mapping[str, object]],
+    outcome_counts: Mapping[str, int] | None = None,
 ) -> Path:
     """Write bounded operational metadata, never OCR text, into Obsidian."""
 
     if not paths.ocr_reports.is_dir():
         paths.ocr_reports.mkdir(parents=True, exist_ok=True)
     lines = [f"# OCR 处理报告：{title}", "", f"书籍 ID：`{book_id}`", ""]
+    if outcome_counts is not None:
+        lines.extend(
+            [
+                "## 页面结果",
+                "",
+                f"- 识别文字页：{int(outcome_counts.get('recognized', 0))}",
+                f"- 空白页：{int(outcome_counts.get('blank', 0))}",
+                f"- 纯图片页：{int(outcome_counts.get('image_only', 0))}",
+                f"- 跳过页：{int(outcome_counts.get('skipped', 0))}",
+                "",
+            ]
+        )
     rows = list(skipped_pages)
     if not rows:
         lines.extend(["## 结果", "", "没有跳过的 PDF 页面。", ""])

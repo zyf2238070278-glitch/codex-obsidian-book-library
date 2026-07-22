@@ -21,6 +21,7 @@ EXPECTED_TOOL_NAMES = (
     "start_pending_ocr",
     "ocr_status",
     "pause_ocr",
+    "sync_book_catalog",
 )
 
 

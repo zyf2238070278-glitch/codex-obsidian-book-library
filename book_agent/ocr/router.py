@@ -41,17 +41,19 @@ def _result_fields(result: Any) -> tuple[str, tuple[Any, ...], float | None]:
 
 
 class LocalOcrRouter:
-    """Bounded local fallback order: Apple Vision, then RapidOCR."""
+    """Bounded local fallback order: Apple Vision, RapidOCR, then Light OCR."""
 
     def __init__(
         self,
         *,
         vision: VisionPageEngine,
         rapid: ImagePageEngine,
+        light: ImagePageEngine | None = None,
         renderer: RenderPlanner | None = None,
     ) -> None:
         self._vision = vision
         self._rapid = rapid
+        self._light = light
         self._renderer = RenderPlanner() if renderer is None else renderer
 
     @staticmethod
@@ -86,10 +88,14 @@ class LocalOcrRouter:
     def recognize_page(self, pdf: Path, *, page_index: int) -> OcrPageDecision:
         attempts: list[str] = []
         errors: list[str] = []
+        saw_nonempty_result = False
         try:
             attempts.append("standard:apple_vision")
+            vision_result = self._vision.recognize_page(pdf, page_index=page_index)
+            vision_text, _, _ = _result_fields(vision_result)
+            saw_nonempty_result = bool(vision_text.strip())
             accepted = self._accepted(
-                self._vision.recognize_page(pdf, page_index=page_index),
+                vision_result,
                 engine="apple_vision",
                 strategy="standard",
                 ink_ratio=0.1,
@@ -104,11 +110,24 @@ class LocalOcrRouter:
         directory: tempfile.TemporaryDirectory[str] | None = None
         try:
             directory, image, ink_ratio = self._render_image(pdf, page_index)
-            for engine_name, engine, strategy in (("rapidocr", self._rapid, "enhanced"),):
+            engines: tuple[tuple[str, ImagePageEngine, str], ...] = (
+                (("rapidocr", self._rapid, "enhanced"),)
+                if self._light is None
+                else (
+                    ("rapidocr", self._rapid, "enhanced"),
+                    ("light_ocr", self._light, "enhanced"),
+                )
+            )
+            terminal_empty = False
+            for engine_name, engine, strategy in engines:
                 try:
                     attempts.append(f"{strategy}:{engine_name}")
+                    result = engine.recognize_image(image)
+                    text, _, _ = _result_fields(result)
+                    terminal_empty = not bool(text.strip())
+                    saw_nonempty_result = saw_nonempty_result or not terminal_empty
                     accepted = self._accepted(
-                        engine.recognize_image(image),
+                        result,
                         engine=engine_name,
                         strategy=strategy,
                         ink_ratio=ink_ratio,
@@ -118,7 +137,17 @@ class LocalOcrRouter:
                         return accepted
                     errors.append(f"{engine_name}: low quality")
                 except Exception as exc:
+                    terminal_empty = False
                     errors.append(f"{engine_name}: {str(exc)[:160] or exc.__class__.__name__}")
+            if terminal_empty and not saw_nonempty_result:
+                verdict = assess_page("", (), ink_ratio, terminal=True)
+                if verdict.accepted and verdict.outcome is not None:
+                    return OcrPageDecision(
+                        verdict.outcome,
+                        "",
+                        None,
+                        tuple(attempts),
+                    )
         except Exception as exc:
             errors.append(f"render: {str(exc)[:160] or exc.__class__.__name__}")
         finally:

@@ -22,3 +22,16 @@ def test_control_character_heavy_text_is_rejected() -> None:
     verdict = assess_page(text="\x00\x01\ufffd\ufffd", lines=(), image_ink_ratio=0.1)
 
     assert verdict.accepted is False
+
+
+def test_terminal_empty_visual_page_is_image_only() -> None:
+    verdict = assess_page(
+        text="",
+        lines=(),
+        image_ink_ratio=0.08,
+        terminal=True,
+    )
+
+    assert verdict.accepted is True
+    assert verdict.outcome is not None
+    assert verdict.outcome.status == "image_only"

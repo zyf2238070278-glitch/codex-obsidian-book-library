@@ -25,3 +25,12 @@ license reference based on the upstream model-card metadata; it is not
 presented as a verbatim upstream license file.
 
 模型权重随 all-in-one ZIP 分发，安装后从本机 `data/models` 加载。模型名称、固定 revision 和来源链接用于标识所分发的确切权重；上游模型卡中的说明和归属仍然适用。
+
+## @arcships/light-ocr 0.3.0
+
+- Components: `@arcships/light-ocr`, `@arcships/light-ocr-darwin-arm64`, and `@arcships/light-ocr-model-ppocrv6-small` 0.3.0
+- Upstream: https://github.com/arcships/light-ocr/tree/v0.3.0
+- License: Apache-2.0
+- License and notice files: installed with each package beneath `node_modules/@arcships/`
+
+Light OCR is the third local OCR fallback on Apple Silicon macOS. Its native runtime and PP-OCRv6 Small model remain on the local machine and do not download models while recognizing pages.

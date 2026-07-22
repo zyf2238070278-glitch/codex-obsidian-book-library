@@ -117,6 +117,69 @@ def test_install_rapidocr_models_copies_pinned_models_from_venv(tmp_path: Path) 
     }
 
 
+def test_install_light_ocr_runtime_uses_pinned_macos_arm64_package(
+    tmp_path: Path,
+) -> None:
+    project_root = tmp_path / "Book Library Release"
+    (project_root / "scripts").mkdir(parents=True)
+    (project_root / "scripts" / "light_ocr_worker.mjs").write_text(
+        "// worker", encoding="utf-8"
+    )
+    (project_root / "package.json").write_text("{}", encoding="utf-8")
+    (project_root / "package-lock.json").write_text("{}", encoding="utf-8")
+    node = tmp_path / "bin" / "node"
+    npm = tmp_path / "bin" / "npm"
+    _create_executable(node)
+    _create_executable(npm)
+    calls: list[list[str]] = []
+
+    def runner(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        calls.append(command)
+        if command[-1] == "--version":
+            return subprocess.CompletedProcess(command, 0, "v24.4.1\n", "")
+        if command[-2:] == ["-p", "process.arch"]:
+            return subprocess.CompletedProcess(command, 0, "arm64\n", "")
+        for relative in install_macos.LIGHT_OCR_REQUIRED_RUNTIME_FILES:
+            path = project_root / relative
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_bytes(b"runtime")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    installed_node = install_macos._install_light_ocr_runtime(
+        project_root,
+        find_executable=lambda name: str(node if name == "node" else npm),
+        run_command=runner,
+    )
+
+    assert installed_node == node.resolve()
+    assert calls[-1] == [str(npm.resolve()), "ci", "--omit=dev", "--ignore-scripts"]
+
+
+def test_install_light_ocr_runtime_rejects_unsupported_node(tmp_path: Path) -> None:
+    project_root = tmp_path / "Book Library Release"
+    (project_root / "scripts").mkdir(parents=True)
+    (project_root / "scripts" / "light_ocr_worker.mjs").write_text(
+        "// worker", encoding="utf-8"
+    )
+    (project_root / "package.json").write_text("{}", encoding="utf-8")
+    (project_root / "package-lock.json").write_text("{}", encoding="utf-8")
+    node = tmp_path / "node"
+    npm = tmp_path / "npm"
+    _create_executable(node)
+    _create_executable(npm)
+
+    with pytest.raises(install_macos.InstallError, match="Node.js 22 或 24"):
+        install_macos._install_light_ocr_runtime(
+            project_root,
+            find_executable=lambda name: str(node if name == "node" else npm),
+            run_command=lambda command, **kwargs: subprocess.CompletedProcess(
+                command, 0, "v23.0.0\n", ""
+            ),
+        )
+
+
 def test_default_project_root_is_distribution_root() -> None:
     assert install_macos.default_project_root() == Path(
         install_macos.__file__

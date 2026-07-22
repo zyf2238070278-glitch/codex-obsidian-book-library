@@ -281,11 +281,13 @@ class OcrWorker:
             checkpoints = self.database.list_ocr_pages(book_id)
             skipped_pages = self.database.list_skipped_ocr_pages(book_id)
             if skipped_pages:
+                outcome_counts = self.database.ocr_page_outcome_counts(book_id)
                 write_ocr_report(
                     self.paths,
                     book_id=book_id,
                     title=str(book.get("title") or original.stem),
                     skipped_pages=skipped_pages,
+                    outcome_counts=outcome_counts,
                 )
             units = tuple(
                 SourceUnit(

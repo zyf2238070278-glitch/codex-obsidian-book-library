@@ -40,6 +40,8 @@ def assess_page(
     text: str,
     lines: Iterable[VisionLine],
     image_ink_ratio: float,
+    *,
+    terminal: bool = False,
 ) -> QualityVerdict:
     """Make bounded, deterministic fallback decisions for one OCR attempt."""
 
@@ -63,6 +65,13 @@ def assess_page(
                 outcome=OcrPageOutcome("blank", None, "blank_page"),
                 score=1.0,
                 reason="blank_page",
+            )
+        if terminal:
+            return QualityVerdict(
+                accepted=True,
+                outcome=OcrPageOutcome("image_only", None, "no_text_expected"),
+                score=1.0,
+                reason="no_text_expected",
             )
         return QualityVerdict(False, None, 0.0, "unexpected_empty_text")
 

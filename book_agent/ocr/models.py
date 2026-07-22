@@ -10,8 +10,8 @@ VISION_RESPONSE_SCHEMA_VERSION = 2
 _READING_ORDER_VERTICAL_TOLERANCE = 0.0125
 _OcrStatus = Literal["queued", "running", "paused", "failed", "completed"]
 _OCR_STATUSES = ("queued", "running", "paused", "failed", "completed")
-_PageOutcomeStatus = Literal["recognized", "blank", "skipped"]
-_PAGE_OUTCOMES = ("recognized", "blank", "skipped")
+_PageOutcomeStatus = Literal["recognized", "blank", "image_only", "skipped"]
+_PAGE_OUTCOMES = ("recognized", "blank", "image_only", "skipped")
 
 
 def _is_int(value: object) -> bool:

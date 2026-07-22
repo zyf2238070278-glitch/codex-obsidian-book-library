@@ -72,7 +72,7 @@ def _summary(**overrides: object) -> OcrJobSummary:
     return OcrJobSummary(**values)  # type: ignore[arg-type]
 
 
-def test_ocr_page_outcome_accepts_recognized_blank_and_skipped_pages() -> None:
+def test_ocr_page_outcome_accepts_recognized_blank_image_only_and_skipped_pages() -> None:
     assert OcrPageOutcome(
         status="recognized",
         engine="apple_vision",
@@ -83,6 +83,11 @@ def test_ocr_page_outcome_accepts_recognized_blank_and_skipped_pages() -> None:
         engine=None,
         strategy="blank_page",
     ).status == "blank"
+    assert OcrPageOutcome(
+        status="image_only",
+        engine=None,
+        strategy="no_text_expected",
+    ).status == "image_only"
     assert OcrPageOutcome(
         status="skipped",
         engine=None,

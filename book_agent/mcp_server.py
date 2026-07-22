@@ -66,13 +66,6 @@ def list_books(status: Optional[str] = None) -> dict[str, Any]:
 
 
 @mcp.tool()
-def sync_book_catalog() -> dict[str, Any]:
-    """Synchronize Obsidian catalog metadata without returning book text."""
-
-    return library_tools.sync_book_catalog()
-
-
-@mcp.tool()
 def library_status(book_id: Optional[str] = None) -> dict[str, Any]:
     """Inspect local index health and actionable issues without returning book text."""
 
@@ -157,6 +150,13 @@ def pause_ocr(book_id: str) -> dict[str, Any]:
     """Pause one OCR job at a safe page boundary."""
 
     return library_tools.pause_ocr(book_id)
+
+
+@mcp.tool()
+def sync_book_catalog() -> dict[str, Any]:
+    """Synchronize Obsidian catalog metadata without returning book text."""
+
+    return library_tools.sync_book_catalog()
 
 
 if __name__ == "__main__":

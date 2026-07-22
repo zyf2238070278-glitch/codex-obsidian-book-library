@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
 import shutil
 import stat
 import subprocess
@@ -58,6 +59,13 @@ RAPIDOCR_MODEL_FILES = (
     "PP-OCRv6_rec_small.onnx",
     "ch_ppocr_mobile_v2.0_cls_mobile.onnx",
 )
+LIGHT_OCR_REQUIRED_RUNTIME_FILES = (
+    Path("node_modules/@arcships/light-ocr/package.json"),
+    Path("node_modules/@arcships/light-ocr-darwin-arm64/native/light_ocr_node.node"),
+    Path("node_modules/@arcships/light-ocr-model-ppocrv6-small/bundle/manifest.json"),
+    Path("node_modules/@arcships/light-ocr-model-ppocrv6-small/bundle/det/inference.onnx"),
+    Path("node_modules/@arcships/light-ocr-model-ppocrv6-small/bundle/rec/inference.onnx"),
+)
 
 
 @dataclass(frozen=True)
@@ -66,6 +74,7 @@ class InstallResult:
     vault: Path
     config: Path
     python: Path
+    light_ocr_node: Path | None = None
 
 
 def default_project_root() -> Path:
@@ -97,9 +106,18 @@ def _toml_string(value: object) -> str:
 
 
 def render_codex_config(
-    *, project_root: Path, vault: Path, python: Path
+    *,
+    project_root: Path,
+    vault: Path,
+    python: Path,
+    light_ocr_node: Path | None = None,
 ) -> str:
     tools = ",\n".join("  %s" % _toml_string(tool) for tool in ENABLED_TOOLS)
+    light_ocr_environment = (
+        "BOOK_LIBRARY_LIGHT_OCR_NODE = %s\n" % _toml_string(light_ocr_node)
+        if light_ocr_node is not None
+        else ""
+    )
     return """[mcp_servers.book_library]
 command = {python}
 args = ["-m", "book_agent.mcp_server"]
@@ -117,11 +135,13 @@ BOOK_LIBRARY_ROOT = {project_root}
 BOOK_LIBRARY_OBSIDIAN_VAULT = {vault}
 HF_HUB_OFFLINE = "1"
 TRANSFORMERS_OFFLINE = "1"
+{light_ocr_environment}
 """.format(
         python=_toml_string(python),
         project_root=_toml_string(project_root),
         vault=_toml_string(vault),
         tools=tools,
+        light_ocr_environment=light_ocr_environment,
     )
 
 
@@ -403,6 +423,85 @@ def _install_rapidocr_models(project_root: Path) -> None:
         raise InstallError("无法准备 RapidOCR 本地模型：%s" % exc) from exc
 
 
+def _install_light_ocr_runtime(
+    project_root: Path,
+    *,
+    find_executable: Callable[[str], Optional[str]],
+    run_command: Callable[..., Any],
+) -> Path:
+    """Install and validate the pinned macOS Apple Silicon Light OCR runtime."""
+
+    required_sources = (
+        project_root / "package.json",
+        project_root / "package-lock.json",
+        project_root / "scripts" / "light_ocr_worker.mjs",
+    )
+    for source in required_sources:
+        try:
+            info = source.lstat()
+        except OSError as exc:
+            raise InstallError("Light OCR 安装文件缺失：%s" % source) from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise InstallError("Light OCR 安装文件必须是普通文件：%s" % source)
+
+    bundled_node = project_root / "runtime" / "node" / "bin" / "node"
+    node_text = str(bundled_node) if bundled_node.is_file() else find_executable("node")
+    npm_text = find_executable("npm")
+    if not node_text or not npm_text:
+        raise InstallError("Light OCR 需要 Node.js 22 或 24 以及 npm。")
+    node = Path(node_text).expanduser().resolve()
+    npm = Path(npm_text).expanduser().resolve()
+    for executable, label in ((node, "Node.js"), (npm, "npm")):
+        if not executable.is_file() or not os.access(executable, os.X_OK):
+            raise InstallError("%s 不存在或不可执行：%s" % (label, executable))
+
+    try:
+        version = _run_validation_command(
+            run_command, [str(node), "--version"], cwd=project_root
+        )
+        match = re.fullmatch(
+            r"v(\d+)\.\d+\.\d+",
+            (getattr(version, "stdout", "") or "").strip(),
+        )
+        if match is None or int(match.group(1)) not in {22, 24}:
+            raise InstallError("Light OCR 需要 Node.js 22 或 24。")
+        architecture = _run_validation_command(
+            run_command,
+            [str(node), "-p", "process.arch"],
+            cwd=project_root,
+        )
+        if (getattr(architecture, "stdout", "") or "").strip() != "arm64":
+            raise InstallError("当前 macOS 版 Light OCR 只支持 arm64。")
+        child_environment = os.environ.copy()
+        child_environment["PATH"] = str(node.parent) + os.pathsep + child_environment.get(
+            "PATH", ""
+        )
+        run_command(
+            [str(npm), "ci", "--omit=dev", "--ignore-scripts"],
+            cwd=project_root,
+            check=True,
+            env=child_environment,
+        )
+    except InstallError:
+        raise
+    except subprocess.CalledProcessError as exc:
+        raise InstallError(
+            "Light OCR 依赖安装失败（退出码 %s）。" % exc.returncode
+        ) from exc
+    except OSError as exc:
+        raise InstallError("无法安装 Light OCR：%s" % exc) from exc
+
+    for relative in LIGHT_OCR_REQUIRED_RUNTIME_FILES:
+        path = project_root / relative
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise InstallError("Light OCR 运行文件缺失：%s" % relative) from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
+            raise InstallError("Light OCR 运行文件必须是普通文件：%s" % relative)
+    return node
+
+
 def install(
     *,
     project_root: Path,
@@ -430,6 +529,7 @@ def install(
         if python is not None
         else resolved_root / ".venv" / "bin" / "python"
     )
+    light_ocr_node: Path | None = None
 
     command_runner = run_command or subprocess.run
     if not skip_sync:
@@ -446,6 +546,12 @@ def install(
             run_command=command_runner,
         )
         _install_rapidocr_models(resolved_root)
+        if (resolved_root / "package.json").is_file():
+            light_ocr_node = _install_light_ocr_runtime(
+                resolved_root,
+                find_executable=find_executable or shutil.which,
+                run_command=command_runner,
+            )
 
     # Validate the native helper before creating runtime directories or writing
     # Codex configuration.  A failed validation therefore leaves an existing
@@ -476,6 +582,7 @@ def install(
                 project_root=resolved_root,
                 vault=resolved_vault,
                 python=resolved_python,
+                light_ocr_node=light_ocr_node,
             ),
         )
     except OSError as exc:
@@ -486,6 +593,7 @@ def install(
         vault=resolved_vault,
         config=resolved_config,
         python=resolved_python,
+        light_ocr_node=light_ocr_node,
     )
 
 

@@ -8,9 +8,11 @@ from book_agent.ocr.models import BoundingBox, OcrPageResult, VisionLine
 from book_agent.ocr.router import LocalOcrRouter
 
 
-def _pdf(path: Path) -> Path:
+def _pdf(path: Path, *, visual: bool = False) -> Path:
     document = fitz.open()
-    document.new_page(width=100, height=100)
+    page = document.new_page(width=100, height=100)
+    if visual:
+        page.draw_rect(fitz.Rect(10, 10, 90, 90), color=(0, 0, 0), fill=(0, 0, 0))
     document.save(path)
     document.close()
     return path
@@ -78,3 +80,54 @@ def test_router_returns_skipped_after_all_local_strategies_fail(tmp_path: Path) 
     assert decision.outcome.status == "skipped"
     assert decision.text == ""
     assert "vision unavailable" in (decision.outcome.detail or "")
+
+
+def test_router_uses_light_after_rapid_low_quality(tmp_path: Path) -> None:
+    rapid = _ImageEngine(_result("\ufffd\ufffd", engine="rapidocr"))
+    light = _ImageEngine(_result("Light text", engine="light_ocr"))
+
+    decision = LocalOcrRouter(
+        vision=_Vision(RuntimeError("vision unavailable")),
+        rapid=rapid,
+        light=light,
+    ).recognize_page(_pdf(tmp_path / "book.pdf"), page_index=0)
+
+    assert decision.outcome.engine == "light_ocr"
+    assert decision.text == "Light text"
+    assert decision.attempts == (
+        "standard:apple_vision",
+        "enhanced:rapidocr",
+        "enhanced:light_ocr",
+    )
+    assert rapid.called is True
+    assert light.called is True
+
+
+def test_router_stops_before_light_when_rapid_is_accepted(tmp_path: Path) -> None:
+    light = _ImageEngine(AssertionError("must not run"))
+
+    decision = LocalOcrRouter(
+        vision=_Vision(RuntimeError("vision unavailable")),
+        rapid=_ImageEngine(_result("Rapid text", engine="rapidocr")),
+        light=light,
+    ).recognize_page(_pdf(tmp_path / "book.pdf"), page_index=0)
+
+    assert decision.outcome.engine == "rapidocr"
+    assert light.called is False
+
+
+def test_router_classifies_visual_page_with_three_empty_results_as_image_only(
+    tmp_path: Path,
+) -> None:
+    empty_rapid = OcrPageResult(engine="rapidocr", lines=())
+    empty_light = OcrPageResult(engine="light_ocr", lines=())
+
+    decision = LocalOcrRouter(
+        vision=_Vision(OcrPageResult(engine="apple_vision", lines=())),
+        rapid=_ImageEngine(empty_rapid),
+        light=_ImageEngine(empty_light),
+    ).recognize_page(_pdf(tmp_path / "book.pdf", visual=True), page_index=0)
+
+    assert decision.outcome.status == "image_only"
+    assert decision.outcome.strategy == "no_text_expected"
+    assert decision.text == ""

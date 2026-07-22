@@ -45,6 +45,7 @@ def test_ensure_layout_creates_all_user_directories(tmp_path: Path) -> None:
     assert paths.parsed.is_dir()
     assert paths.notes.is_dir()
     assert paths.ocr_reports.is_dir()
+    assert paths.catalog_cards.is_dir()
     assert paths.models.is_dir()
     assert paths.database.parent.is_dir()
 
@@ -67,6 +68,7 @@ def test_ensure_layout_splits_external_vault_from_project_data(
         paths.parsed,
         paths.notes,
         paths.ocr_reports,
+        paths.catalog_cards,
     ):
         assert directory.is_dir()
         assert directory.is_relative_to(obsidian_vault)

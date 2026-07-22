@@ -23,6 +23,8 @@ class AppPaths:
     parsed: Path
     notes: Path
     ocr_reports: Path
+    catalog_cards: Path
+    catalog_base: Path
     database: Path
     models: Path
     ocr_models: Path
@@ -49,6 +51,8 @@ class AppPaths:
             parsed=library / "20-解析文本",
             notes=library / "30-AI读书笔记",
             ocr_reports=library / "40-OCR报告",
+            catalog_cards=library / "50-书目卡片",
+            catalog_base=library / "书库总览.base",
             database=resolved_root / "data" / "library.sqlite3",
             models=resolved_root / "data" / "models",
             ocr_models=resolved_root / "data" / "ocr-models",

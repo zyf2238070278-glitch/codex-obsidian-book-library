@@ -20,6 +20,8 @@ def test_app_paths_are_rooted_under_project(tmp_path: Path) -> None:
         parsed=resolved_root / "vault" / "书库" / "20-解析文本",
         notes=resolved_root / "vault" / "书库" / "30-AI读书笔记",
         ocr_reports=resolved_root / "vault" / "书库" / "40-OCR报告",
+        catalog_cards=resolved_root / "vault" / "书库" / "50-书目卡片",
+        catalog_base=resolved_root / "vault" / "书库" / "书库总览.base",
         database=resolved_root / "data" / "library.sqlite3",
         models=resolved_root / "data" / "models",
         ocr_models=resolved_root / "data" / "ocr-models",
@@ -59,6 +61,8 @@ def test_app_paths_keep_external_obsidian_files_separate_from_project_data(
         parsed=absolute_vault / "书库" / "20-解析文本",
         notes=absolute_vault / "书库" / "30-AI读书笔记",
         ocr_reports=absolute_vault / "书库" / "40-OCR报告",
+        catalog_cards=absolute_vault / "书库" / "50-书目卡片",
+        catalog_base=absolute_vault / "书库" / "书库总览.base",
         database=resolved_root / "data" / "library.sqlite3",
         models=resolved_root / "data" / "models",
         ocr_models=resolved_root / "data" / "ocr-models",
@@ -94,3 +98,10 @@ def test_paths_expose_non_evidence_ocr_reports_directory(tmp_path: Path) -> None
     paths = AppPaths.from_root(tmp_path)
 
     assert paths.ocr_reports == paths.library / "40-OCR报告"
+
+
+def test_paths_expose_catalog_cards_and_base(tmp_path: Path) -> None:
+    paths = AppPaths.from_root(tmp_path)
+
+    assert paths.catalog_cards == paths.library / "50-书目卡片"
+    assert paths.catalog_base == paths.library / "书库总览.base"

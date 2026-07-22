@@ -299,6 +299,7 @@ class VaultManager:
             ("parsed", self.paths.parsed),
             ("notes", self.paths.notes),
             ("ocr_reports", self.paths.ocr_reports),
+            ("catalog_cards", self.paths.catalog_cards),
         )
         project_directories = (
             ("models", self.paths.models),

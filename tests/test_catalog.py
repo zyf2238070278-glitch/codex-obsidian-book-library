@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from book_agent.catalog import CatalogService, classify_book
 from book_agent.config import AppPaths
 from book_agent.storage import Database
@@ -120,6 +122,19 @@ def test_sync_book_rejects_malformed_existing_user_categories(tmp_path: Path) ->
         assert "primary_category" in str(exc)
     else:  # pragma: no cover - assertion helper
         raise AssertionError("malformed category must be rejected")
+
+
+def test_sync_book_rejects_catalog_directory_symlink(tmp_path: Path) -> None:
+    service, paths, _ = _catalog(tmp_path)
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    paths.catalog_cards.rmdir()
+    paths.catalog_cards.symlink_to(outside, target_is_directory=True)
+
+    with pytest.raises(ValueError, match="symlink|safely"):
+        service.sync_book(_book(paths))
+
+    assert list(outside.iterdir()) == []
 
 
 def test_sync_all_is_idempotent_and_writes_four_base_views(tmp_path: Path) -> None:

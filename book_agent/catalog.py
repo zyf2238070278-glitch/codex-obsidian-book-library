@@ -3,8 +3,8 @@ from __future__ import annotations
 import json
 import os
 import re
+import secrets
 import stat
-import tempfile
 from collections.abc import Mapping
 from dataclasses import dataclass
 from pathlib import Path
@@ -12,6 +12,7 @@ from typing import Any
 
 from book_agent.config import AppPaths
 from book_agent.storage import Database
+from book_agent.vault import _managed_directory_beneath
 
 
 _TITLE_CATEGORY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
@@ -164,24 +165,22 @@ class CatalogService:
         title = str(book.get("title") or "").strip()
         if not title:
             raise ValueError("title must not be blank")
-        self.paths.catalog_cards.mkdir(parents=True, exist_ok=True)
-        card = self._card_path(title, book_id)
-        if card.exists():
-            info = card.lstat()
-            if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
-                raise ValueError("existing catalog card must be a regular file")
-            primary, custom = _user_categories(card.read_text(encoding="utf-8"))
-        else:
-            author_value = book.get("author")
-            primary = classify_book(
-                title,
-                None if author_value is None else str(author_value),
-                preview,
-            )
-            custom = ()
-        content = self._render(book, primary=primary, custom=custom)
-        self._write_atomically(card, content)
-        return card
+        with self._catalog_directory(create=True) as (directory, directory_fd):
+            card_name = self._card_name(title, book_id, directory_fd)
+            existing = self._read_card(directory_fd, card_name)
+            if existing is not None:
+                primary, custom = _user_categories(existing)
+            else:
+                author_value = book.get("author")
+                primary = classify_book(
+                    title,
+                    None if author_value is None else str(author_value),
+                    preview,
+                )
+                custom = ()
+            content = self._render(book, primary=primary, custom=custom)
+            self._write_atomically(directory_fd, card_name, content)
+            return directory / card_name
 
     def sync_all(self) -> CatalogSyncResult:
         self._validate_vault_root()
@@ -191,8 +190,8 @@ class CatalogService:
         errors: list[str] = []
         for book in books:
             book_id = str(book.get("book_id") or "")
-            existed = bool(list(self.paths.catalog_cards.glob(f"*-{book_id}.md")))
             try:
+                existed = self._card_exists(book_id)
                 self.sync_book(book, preview=self._preview(book.get("parsed_path")))
             except (OSError, UnicodeError, ValueError) as exc:
                 errors.append(f"{book_id}: {str(exc)[:240] or exc.__class__.__name__}")
@@ -201,7 +200,7 @@ class CatalogService:
                 updated += 1
             else:
                 created += 1
-        self._write_atomically(self.paths.catalog_base, self._base_content())
+        self.write_base()
         return CatalogSyncResult(
             total=len(books),
             created=created,
@@ -209,6 +208,16 @@ class CatalogService:
             failed=len(errors),
             errors=tuple(errors),
         )
+
+    def write_base(self) -> Path:
+        self._validate_vault_root()
+        with self._library_directory(create=True) as (directory, directory_fd):
+            self._write_atomically(
+                directory_fd,
+                self.paths.catalog_base.name,
+                self._base_content(),
+            )
+            return directory / self.paths.catalog_base.name
 
     @staticmethod
     def _preview(value: object) -> str:
@@ -296,14 +305,74 @@ views:
       - source_link
 """
 
-    def _card_path(self, title: str, book_id: str) -> Path:
-        matches = list(self.paths.catalog_cards.glob(f"*-{book_id}.md"))
+    def _catalog_directory(self, *, create: bool):
+        return _managed_directory_beneath(
+            self.paths.vault,
+            self.paths.catalog_cards,
+            "catalog cards",
+            create=create,
+            create_root=False,
+            root_label="vault root",
+            expected_root_identity=self._vault_root_identity,
+        )
+
+    def _library_directory(self, *, create: bool):
+        return _managed_directory_beneath(
+            self.paths.vault,
+            self.paths.library,
+            "library",
+            create=create,
+            create_root=False,
+            root_label="vault root",
+            expected_root_identity=self._vault_root_identity,
+        )
+
+    @staticmethod
+    def _matching_card_names(directory_fd: int, book_id: str) -> list[str]:
+        suffix = f"-{book_id}.md"
+        return sorted(
+            name
+            for name in os.listdir(directory_fd)
+            if isinstance(name, str) and name.endswith(suffix)
+        )
+
+    def _card_exists(self, book_id: str) -> bool:
+        with self._catalog_directory(create=True) as (_, directory_fd):
+            return bool(self._matching_card_names(directory_fd, book_id))
+
+    def _card_name(self, title: str, book_id: str, directory_fd: int) -> str:
+        matches = self._matching_card_names(directory_fd, book_id)
         if len(matches) > 1:
             raise ValueError(f"multiple catalog cards exist for book_id {book_id}")
         if matches:
             return matches[0]
         safe_title = _UNSAFE_FILENAME.sub("_", title).strip(" .")[:80] or "未命名书籍"
-        return self.paths.catalog_cards / f"{safe_title}-{book_id}.md"
+        return f"{safe_title}-{book_id}.md"
+
+    @staticmethod
+    def _read_card(directory_fd: int, name: str) -> str | None:
+        try:
+            descriptor = os.open(
+                name,
+                os.O_RDONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                dir_fd=directory_fd,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError as exc:
+            raise ValueError("existing catalog card cannot be opened safely") from exc
+        try:
+            info = os.fstat(descriptor)
+            if not stat.S_ISREG(info.st_mode) or info.st_nlink != 1:
+                raise ValueError("existing catalog card must be a regular file")
+            with os.fdopen(descriptor, "r", encoding="utf-8") as source:
+                descriptor = -1
+                return source.read()
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
 
     def _vault_link(self, value: object) -> str:
         if not isinstance(value, str) or not value.strip():
@@ -366,27 +435,38 @@ views:
         return "\n".join(lines)
 
     @staticmethod
-    def _write_atomically(path: Path, content: str) -> None:
-        temporary_name: str | None = None
+    def _write_atomically(directory_fd: int, name: str, content: str) -> None:
+        temporary_name = f".{name}.{secrets.token_hex(12)}.tmp"
+        descriptor: int | None = None
         try:
-            with tempfile.NamedTemporaryFile(
-                mode="w",
-                encoding="utf-8",
-                dir=path.parent,
-                prefix=f".{path.name}.",
-                suffix=".tmp",
-                delete=False,
-            ) as temporary:
-                temporary_name = temporary.name
+            descriptor = os.open(
+                temporary_name,
+                os.O_CREAT
+                | os.O_EXCL
+                | os.O_WRONLY
+                | getattr(os, "O_CLOEXEC", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                dir_fd=directory_fd,
+            )
+            with os.fdopen(descriptor, "w", encoding="utf-8") as temporary:
+                descriptor = None
                 temporary.write(content)
                 temporary.flush()
                 os.fsync(temporary.fileno())
-            os.replace(temporary_name, path)
-            temporary_name = None
+            os.replace(
+                temporary_name,
+                name,
+                src_dir_fd=directory_fd,
+                dst_dir_fd=directory_fd,
+            )
+            temporary_name = ""
         finally:
-            if temporary_name is not None:
+            if descriptor is not None:
+                os.close(descriptor)
+            if temporary_name:
                 try:
-                    Path(temporary_name).unlink()
+                    os.unlink(temporary_name, dir_fd=directory_fd)
                 except FileNotFoundError:
                     pass
 

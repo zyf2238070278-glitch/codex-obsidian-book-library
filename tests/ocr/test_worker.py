@@ -139,12 +139,21 @@ def test_worker_continues_after_skipped_page_and_indexes_other_pages(tmp_path):
 def test_page_fails_after_two_retries_and_worker_can_continue(tmp_path):
     paths, database, _pdf, book_id = _app(tmp_path, pages=1)
     engine = _Engine({1: RuntimeError("synthetic engine failure")})
-    worker = OcrWorker(paths, database, engine, _Indexer(database, book_id), worker_id="worker-a")
+    catalog = _Catalog()
+    worker = OcrWorker(
+        paths,
+        database,
+        engine,
+        _Indexer(database, book_id),
+        worker_id="worker-a",
+        catalog=catalog,
+    )
 
     assert worker.run_once() is True
     assert engine.requested_pages == [1, 1, 1]
     assert database.get_ocr_job(book_id)["status"] == "failed"
     assert database.list_ocr_pages(book_id) == []
+    assert catalog.book_ids == [book_id]
 
 
 def test_invalid_ocr_payload_never_becomes_page_text(tmp_path):

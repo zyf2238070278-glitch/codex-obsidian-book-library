@@ -60,7 +60,7 @@ current = os.stat('.')
 if (current.st_dev, current.st_ino) != (expected_device, expected_inode):
     raise SystemExit(74)
 fcntl.fcntl(fd, fcntl.F_SETFD, fcntl.fcntl(fd, fcntl.F_GETFD) | fcntl.FD_CLOEXEC)
-allowed = ('PATH', 'LANG', 'LC_ALL', 'BOOK_LIBRARY_ROOT', 'BOOK_LIBRARY_OBSIDIAN_VAULT')
+allowed = ('PATH', 'LANG', 'LC_ALL', 'BOOK_LIBRARY_ROOT', 'BOOK_LIBRARY_OBSIDIAN_VAULT', 'BOOK_LIBRARY_LIGHT_OCR_NODE')
 environment = {key: os.environ[key] for key in allowed if key in os.environ}
 if set(environment) != set(allowed):
     raise SystemExit(78)
@@ -149,6 +149,7 @@ class OcrService:
         paths: AppPaths,
         database: Database,
         *,
+        catalog: Any | None = None,
         popen_factory: _PopenFactory | None = None,
         now_factory: Callable[[], datetime] = _utc_now,
         pid_probe: Callable[[int], bool] = _pid_exists,
@@ -168,6 +169,7 @@ class OcrService:
             raise RuntimeError("OCR worker launch requires an absolute Python executable")
         self.paths = paths
         self.database = database
+        self.catalog = catalog
         self._popen = subprocess.Popen if popen_factory is None else popen_factory
         self._now_factory = now_factory
         self._pid_probe = pid_probe
@@ -193,6 +195,7 @@ class OcrService:
             if status_value == "running":
                 status_value = self._requeue_stale_running(validated_id)
             if status_value == "queued":
+                self._sync_catalog(validated_id)
                 self._ensure_worker_started()
             return self._summary_for(validated_id)
 
@@ -204,6 +207,7 @@ class OcrService:
             DEFAULT_LANGUAGES,
             schema_version=OCR_SCHEMA_VERSION,
         )
+        self._sync_catalog(validated_id)
         self._ensure_worker_started()
         return self._summary_for(validated_id)
 
@@ -248,6 +252,7 @@ class OcrService:
                         schema_version=OCR_SCHEMA_VERSION,
                     )
                 summary = self._summary_for(book_id)
+                self._sync_catalog(book_id)
                 jobs.append(_summary_payload(summary))
                 should_ensure_worker = should_ensure_worker or summary.status == "queued"
             except Exception as exc:
@@ -347,7 +352,21 @@ class OcrService:
                     raise ValueError(f"Unsupported OCR job status: {status}")
         finally:
             connection.close()
+        self._sync_catalog(validated_id)
         return self._summary_for(validated_id)
+
+    def _sync_catalog(self, book_id: str) -> None:
+        if self.catalog is None:
+            return
+        book = self.database.get_book(book_id)
+        if book is None:
+            return
+        try:
+            self.catalog.sync_book(book)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except (OSError, UnicodeError, ValueError):
+            pass
 
     def _validate_eligible_book(self, book: Mapping[str, object]) -> None:
         source_format = book.get("source_format")
@@ -791,7 +810,25 @@ class OcrService:
             "LC_ALL": "C.UTF-8",
             "BOOK_LIBRARY_ROOT": ".",
             "BOOK_LIBRARY_OBSIDIAN_VAULT": str(self.paths.vault.absolute()),
+            "BOOK_LIBRARY_LIGHT_OCR_NODE": self._validated_light_ocr_node(),
         }
+
+    @staticmethod
+    def _validated_light_ocr_node() -> str:
+        configured = os.environ.get("BOOK_LIBRARY_LIGHT_OCR_NODE", "").strip()
+        if not configured:
+            return ""
+        candidate = Path(configured).expanduser()
+        if not candidate.is_absolute():
+            return ""
+        try:
+            resolved = candidate.resolve(strict=True)
+            info = resolved.lstat()
+        except OSError:
+            return ""
+        if not stat.S_ISREG(info.st_mode) or not os.access(resolved, os.X_OK):
+            return ""
+        return str(resolved)
 
     def _bound_worker_argv(self, root_fd: int) -> list[str]:
         device, inode = self._root_identity

@@ -525,7 +525,7 @@ def build_tools(
         database,
         vault_root_identity=explicit_vault_identity,
     )
-    ocr_service = OcrService(paths, database)
+    ocr_service = OcrService(paths, database, catalog=catalog)
     return LibraryTools(
         paths=paths,
         database=database,

@@ -166,7 +166,7 @@ class LightOcrEngine:
                 [str(self.node), str(self.worker)],
                 stdin=subprocess.PIPE,
                 stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stderr=subprocess.DEVNULL,
                 text=True,
                 encoding="utf-8",
                 bufsize=1,

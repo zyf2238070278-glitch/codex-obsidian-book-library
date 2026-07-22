@@ -30,8 +30,21 @@ def test_terminal_empty_visual_page_is_image_only() -> None:
         lines=(),
         image_ink_ratio=0.08,
         terminal=True,
+        image_only_hint=True,
     )
 
     assert verdict.accepted is True
     assert verdict.outcome is not None
     assert verdict.outcome.status == "image_only"
+
+
+def test_terminal_empty_page_without_visual_evidence_remains_rejected() -> None:
+    verdict = assess_page(
+        text="",
+        lines=(),
+        image_ink_ratio=0.08,
+        terminal=True,
+    )
+
+    assert verdict.accepted is False
+    assert verdict.outcome is None

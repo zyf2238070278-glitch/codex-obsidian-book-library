@@ -165,10 +165,7 @@ class ImportService:
                     book,
                     preview=CatalogService._preview(book.get("parsed_path")),
                 )
-                self.catalog._write_atomically(
-                    self.paths.catalog_base,
-                    self.catalog._base_content(),
-                )
+                self.catalog.write_base()
         except (OSError, UnicodeError, ValueError) as exc:
             detail = str(exc).strip() or exc.__class__.__name__
             return replace(

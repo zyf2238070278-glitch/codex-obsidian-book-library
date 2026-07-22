@@ -8,11 +8,17 @@ from book_agent.ocr.models import BoundingBox, OcrPageResult, VisionLine
 from book_agent.ocr.router import LocalOcrRouter
 
 
-def _pdf(path: Path, *, visual: bool = False) -> Path:
+def _pdf(path: Path, *, visual: bool = False, text: bool = False) -> Path:
     document = fitz.open()
     page = document.new_page(width=100, height=100)
     if visual:
-        page.draw_rect(fitz.Rect(10, 10, 90, 90), color=(0, 0, 0), fill=(0, 0, 0))
+        page.draw_rect(
+            fitz.Rect(10, 10, 90, 90),
+            color=(0.5, 0.2, 0.8),
+            fill=(0.5, 0.2, 0.8),
+        )
+    if text:
+        page.insert_text((8, 52), "TEXT PAGE 123", fontsize=11, color=(0, 0, 0))
     document.save(path)
     document.close()
     return path
@@ -131,3 +137,15 @@ def test_router_classifies_visual_page_with_three_empty_results_as_image_only(
     assert decision.outcome.status == "image_only"
     assert decision.outcome.strategy == "no_text_expected"
     assert decision.text == ""
+
+
+def test_router_keeps_text_like_page_with_empty_results_as_skipped(
+    tmp_path: Path,
+) -> None:
+    decision = LocalOcrRouter(
+        vision=_Vision(OcrPageResult(engine="apple_vision", lines=())),
+        rapid=_ImageEngine(OcrPageResult(engine="rapidocr", lines=())),
+        light=_ImageEngine(OcrPageResult(engine="light_ocr", lines=())),
+    ).recognize_page(_pdf(tmp_path / "book.pdf", text=True), page_index=0)
+
+    assert decision.outcome.status == "skipped"

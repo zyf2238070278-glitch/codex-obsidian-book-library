@@ -683,6 +683,7 @@ def test_detached_launcher_uses_exact_safe_process_contract(app) -> None:
         "LC_ALL": "C.UTF-8",
         "BOOK_LIBRARY_ROOT": ".",
         "BOOK_LIBRARY_OBSIDIAN_VAULT": str(paths.vault.absolute()),
+        "BOOK_LIBRARY_LIGHT_OCR_NODE": "",
     }
     log = paths.ocr_logs / "worker.log"
     assert stat.S_IMODE(log.stat().st_mode) == 0o600
@@ -717,6 +718,7 @@ def test_macos_bootstrap_executes_worker_from_renamed_original_root(
         "LC_ALL": "C.UTF-8",
         "BOOK_LIBRARY_ROOT": ".",
         "BOOK_LIBRARY_OBSIDIAN_VAULT": str(tmp_path / "vault"),
+        "BOOK_LIBRARY_LIGHT_OCR_NODE": "",
     }
     try:
         completed = subprocess.run(
@@ -743,6 +745,47 @@ def test_macos_bootstrap_executes_worker_from_renamed_original_root(
     assert payload["source"] == "original"
     assert payload["inode"] == identity.st_ino
     assert payload["orig_argv"][-3:] == [sys.executable, "-m", "book_agent.ocr_worker"]
+
+
+def test_worker_environment_preserves_validated_light_ocr_node(
+    app, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    service, _, _, _ = app
+    node = tmp_path / "node"
+    node.write_text("#!/bin/sh\n", encoding="utf-8")
+    node.chmod(0o755)
+    monkeypatch.setenv("BOOK_LIBRARY_LIGHT_OCR_NODE", str(node))
+
+    environment = service._worker_environment()
+
+    assert environment["BOOK_LIBRARY_LIGHT_OCR_NODE"] == str(node.resolve())
+
+
+def test_queue_and_pause_refresh_catalog_status(tmp_path: Path) -> None:
+    paths = AppPaths.from_root(tmp_path / "project", tmp_path / "vault")
+    paths.originals.mkdir(parents=True)
+    database = Database(paths.database, root=paths.root)
+    database.initialize()
+    _book(database, paths, BOOK_A)
+    catalog_updates: list[str] = []
+
+    class Catalog:
+        def sync_book(self, book: dict[str, object]) -> Path:
+            catalog_updates.append(str(book["book_id"]))
+            return Path("card.md")
+
+    service = OcrService(
+        paths,
+        database,
+        catalog=Catalog(),
+        popen_factory=RecordingPopen(),
+        pid_probe=lambda _: True,
+    )
+
+    service.start_ocr(BOOK_A)
+    service.pause(BOOK_A)
+
+    assert catalog_updates == [BOOK_A, BOOK_A]
 
 
 def test_launcher_cwd_fd_stays_on_original_root_during_path_replacement(

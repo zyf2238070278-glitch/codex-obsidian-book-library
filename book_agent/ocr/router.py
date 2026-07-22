@@ -78,12 +78,45 @@ class LocalOcrRouter:
             return 0.0
         return sum(value < 245 for value in samples) / len(samples)
 
-    def _render_image(self, pdf: Path, page_index: int) -> tuple[tempfile.TemporaryDirectory[str], Path, float]:
+    @staticmethod
+    def _image_only_hint(pixmap: Any) -> bool:
+        """Conservatively distinguish continuous-tone imagery from text glyphs."""
+
+        samples = bytes(pixmap.samples)
+        channels = int(getattr(pixmap, "n", 0))
+        if channels <= 0 or not samples:
+            return False
+        pixel_count = len(samples) // channels
+        step = max(1, pixel_count // 100_000)
+        observed = midtones = chromatic = ink = 0
+        for pixel_index in range(0, pixel_count, step):
+            offset = pixel_index * channels
+            if channels >= 3:
+                red, green, blue = samples[offset : offset + 3]
+            else:
+                red = green = blue = samples[offset]
+            luminance = (299 * red + 587 * green + 114 * blue) // 1000
+            observed += 1
+            midtones += 20 < luminance < 235
+            chromatic += max(red, green, blue) - min(red, green, blue) >= 24
+            ink += luminance < 245
+        if observed == 0 or ink / observed <= 0.01:
+            return False
+        return midtones / observed >= 0.20 or chromatic / observed >= 0.12
+
+    def _render_image(
+        self, pdf: Path, page_index: int
+    ) -> tuple[tempfile.TemporaryDirectory[str], Path, float, bool]:
         rendered = self._renderer.render(pdf, page_index)
         directory = tempfile.TemporaryDirectory(prefix="book-ocr-page-")
         image = Path(directory.name) / "page.png"
         rendered.pixmap.save(image)
-        return directory, image, self._ink_ratio(rendered.pixmap.samples)
+        return (
+            directory,
+            image,
+            self._ink_ratio(rendered.pixmap.samples),
+            self._image_only_hint(rendered.pixmap),
+        )
 
     def recognize_page(self, pdf: Path, *, page_index: int) -> OcrPageDecision:
         attempts: list[str] = []
@@ -109,7 +142,9 @@ class LocalOcrRouter:
 
         directory: tempfile.TemporaryDirectory[str] | None = None
         try:
-            directory, image, ink_ratio = self._render_image(pdf, page_index)
+            directory, image, ink_ratio, image_only_hint = self._render_image(
+                pdf, page_index
+            )
             engines: tuple[tuple[str, ImagePageEngine, str], ...] = (
                 (("rapidocr", self._rapid, "enhanced"),)
                 if self._light is None
@@ -140,7 +175,13 @@ class LocalOcrRouter:
                     terminal_empty = False
                     errors.append(f"{engine_name}: {str(exc)[:160] or exc.__class__.__name__}")
             if terminal_empty and not saw_nonempty_result:
-                verdict = assess_page("", (), ink_ratio, terminal=True)
+                verdict = assess_page(
+                    "",
+                    (),
+                    ink_ratio,
+                    terminal=True,
+                    image_only_hint=image_only_hint,
+                )
                 if verdict.accepted and verdict.outcome is not None:
                     return OcrPageDecision(
                         verdict.outcome,

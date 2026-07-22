@@ -42,6 +42,7 @@ def assess_page(
     image_ink_ratio: float,
     *,
     terminal: bool = False,
+    image_only_hint: bool = False,
 ) -> QualityVerdict:
     """Make bounded, deterministic fallback decisions for one OCR attempt."""
 
@@ -66,7 +67,7 @@ def assess_page(
                 score=1.0,
                 reason="blank_page",
             )
-        if terminal:
+        if terminal and image_only_hint:
             return QualityVerdict(
                 accepted=True,
                 outcome=OcrPageOutcome("image_only", None, "no_text_expected"),

@@ -226,6 +226,7 @@ class OcrWorker:
                                 physical_page,
                                 now=self.clock(),
                             )
+                            self._sync_catalog(book_id)
                             return
                         continue
                     # The engine may have taken long enough for the managed PDF
@@ -268,6 +269,7 @@ class OcrWorker:
                 current = self.database.get_ocr_job(book_id)
                 if current and current.get("pause_requested"):
                     self.database.pause_ocr_job(book_id, self.worker_id, now=self.clock())
+                    self._sync_catalog(book_id)
                     return
 
             # Close the final page-level TOCTOU window before indexing.
@@ -321,16 +323,11 @@ class OcrWorker:
                     total,
                     now=self.clock(),
                 )
+                self._sync_catalog(book_id)
                 return
             self.database.complete_ocr_job(book_id, self.worker_id, now=self.clock())
             self.database.delete_ocr_page_checkpoints(book_id)
-            if self.catalog is not None:
-                refreshed = self.database.get_book(book_id)
-                if refreshed is not None:
-                    try:
-                        self.catalog.sync_book(refreshed)
-                    except (OSError, UnicodeError, ValueError):
-                        pass
+            self._sync_catalog(book_id)
         finally:
             document.close()
 
@@ -431,6 +428,20 @@ class OcrWorker:
         except (KeyboardInterrupt, SystemExit):
             raise
         except Exception:
+            pass
+        self._sync_catalog(book_id)
+
+    def _sync_catalog(self, book_id: str) -> None:
+        if self.catalog is None:
+            return
+        refreshed = self.database.get_book(book_id)
+        if refreshed is None:
+            return
+        try:
+            self.catalog.sync_book(refreshed)
+        except (KeyboardInterrupt, SystemExit):
+            raise
+        except (OSError, UnicodeError, ValueError):
             pass
 
     def _index_with_heartbeat(self, book_id: str, parsed: ParsedBook, original: Path) -> Any:

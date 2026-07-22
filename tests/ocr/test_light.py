@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import io
 import json
+import subprocess
 from pathlib import Path
 
 import pytest
@@ -127,9 +128,11 @@ def test_light_adapter_close_is_idempotent() -> None:
 def test_light_adapter_defaults_worker_to_cpu_provider(tmp_path: Path) -> None:
     process = _Process([{"id": "request-1", "ok": True, "lines": []}])
     observed_environment: dict[str, str] = {}
+    observed_stderr: list[object] = []
 
     def factory(*args: object, **kwargs: object) -> _Process:
         observed_environment.update(kwargs["env"])  # type: ignore[arg-type]
+        observed_stderr.append(kwargs["stderr"])
         return process
 
     engine = LightOcrEngine(
@@ -143,3 +146,4 @@ def test_light_adapter_defaults_worker_to_cpu_provider(tmp_path: Path) -> None:
     engine.recognize_image(_image(tmp_path))
 
     assert observed_environment["LIGHT_OCR_EXECUTION"] == "cpu"
+    assert observed_stderr == [subprocess.DEVNULL]

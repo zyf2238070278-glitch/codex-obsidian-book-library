@@ -33,17 +33,20 @@ def _passing_probes(events: list[str]):
     def vision(path: Path) -> None:
         events.append(f"vision:{path}")
 
+    def light_ocr(path: Path) -> None:
+        events.append(f"light_ocr:{path}")
+
     def mcp(path: Path, vault: Path) -> None:
         events.append(f"mcp:{path}:{vault}")
 
-    return imports, embedding, rapidocr, vision, mcp
+    return imports, embedding, rapidocr, vision, light_ocr, mcp
 
 
 def test_run_selftest_calls_probes_in_exact_order_and_returns_dimensions(
     tmp_path: Path,
 ) -> None:
     events: list[str] = []
-    imports, embedding, rapidocr, vision, mcp = _passing_probes(events)
+    imports, embedding, rapidocr, vision, light_ocr, mcp = _passing_probes(events)
 
     result = runtime_selftest.run_selftest(
         project_root=tmp_path,
@@ -52,6 +55,7 @@ def test_run_selftest_calls_probes_in_exact_order_and_returns_dimensions(
         embedding_probe=embedding,
         rapidocr_probe=rapidocr,
         vision_probe=vision,
+        light_ocr_probe=light_ocr,
         mcp_probe=mcp,
     )
 
@@ -61,6 +65,7 @@ def test_run_selftest_calls_probes_in_exact_order_and_returns_dimensions(
         f"embedding:{tmp_path / 'data' / 'models'}",
         f"rapidocr:{tmp_path / 'data' / 'ocr-models' / 'rapidocr'}",
         f"vision:{tmp_path / 'bin' / 'book-vision-ocr'}",
+        f"light_ocr:{tmp_path}",
         f"mcp:{tmp_path}:{tmp_path / 'Custom Vault'}",
     ]
 
@@ -69,7 +74,7 @@ def test_run_selftest_rejects_wrong_embedding_dimension_without_later_probes(
     tmp_path: Path,
 ) -> None:
     events: list[str] = []
-    imports, _, rapidocr, vision, mcp = _passing_probes(events)
+    imports, _, rapidocr, vision, light_ocr, mcp = _passing_probes(events)
 
     with pytest.raises(
         runtime_selftest.SelfTestError,
@@ -82,6 +87,7 @@ def test_run_selftest_rejects_wrong_embedding_dimension_without_later_probes(
             embedding_probe=lambda path: events.append(f"embedding:{path}") or 768,
             rapidocr_probe=rapidocr,
             vision_probe=vision,
+            light_ocr_probe=light_ocr,
             mcp_probe=mcp,
         )
 
@@ -97,13 +103,14 @@ def test_run_selftest_defaults_mcp_to_project_obsidian_vault(tmp_path: Path) -> 
         embedding_probe=lambda _: 384,
         rapidocr_probe=lambda _: None,
         vision_probe=lambda _: None,
+        light_ocr_probe=lambda _: None,
         mcp_probe=lambda root, vault: observed.append((root, vault)),
     )
 
     assert observed == [(tmp_path, tmp_path / "Obsidian书库")]
 
 
-@pytest.mark.parametrize("failed_index", range(5))
+@pytest.mark.parametrize("failed_index", range(6))
 def test_run_selftest_maps_each_probe_exception_and_stops(
     tmp_path: Path, failed_index: int
 ) -> None:
@@ -128,7 +135,8 @@ def test_run_selftest_maps_each_probe_exception_and_stops(
             embedding_probe=probe(1, 384),
             rapidocr_probe=probe(2),
             vision_probe=probe(3),
-            mcp_probe=probe(4),
+            light_ocr_probe=probe(4),
+            mcp_probe=probe(5),
         )
 
     assert events == [str(index) for index in range(failed_index + 1)]
@@ -270,6 +278,66 @@ def test_vision_probe_rejects_invalid_capabilities(
 
     with pytest.raises(runtime_selftest.SelfTestError, match="Vision OCR"):
         runtime_selftest._probe_vision(helper)
+
+
+def test_light_ocr_probe_starts_worker_and_closes_engine(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    node = tmp_path / "runtime" / "node" / "bin" / "node"
+    worker = tmp_path / "scripts" / "light_ocr_worker.mjs"
+    node.parent.mkdir(parents=True)
+    worker.parent.mkdir(parents=True)
+    node.write_bytes(b"node")
+    node.chmod(0o755)
+    worker.write_text("// worker", encoding="utf-8")
+    calls: list[tuple[list[str], dict[str, object]]] = []
+
+    def run(argv: list[str], **kwargs: object) -> subprocess.CompletedProcess[str]:
+        calls.append((argv, kwargs))
+        return subprocess.CompletedProcess(argv, 0, "", "")
+
+    monkeypatch.setattr(runtime_selftest.subprocess, "run", run)
+
+    runtime_selftest._probe_light_ocr(tmp_path)
+
+    assert calls == [
+        (
+            [str(node), str(worker)],
+            {
+                "cwd": tmp_path,
+                "input": '{"op":"close"}\n',
+                "capture_output": True,
+                "text": True,
+                "check": False,
+                "timeout": 120,
+            },
+        )
+    ]
+
+
+@pytest.mark.parametrize(
+    "completed",
+    [
+        subprocess.CompletedProcess(["node"], 7, "", "engine failed"),
+        subprocess.CompletedProcess(["node"], 0, "unexpected", ""),
+    ],
+)
+def test_light_ocr_probe_rejects_worker_failure(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    completed: subprocess.CompletedProcess[str],
+) -> None:
+    node = tmp_path / "runtime" / "node" / "bin" / "node"
+    worker = tmp_path / "scripts" / "light_ocr_worker.mjs"
+    node.parent.mkdir(parents=True)
+    worker.parent.mkdir(parents=True)
+    node.write_bytes(b"node")
+    node.chmod(0o755)
+    worker.write_text("// worker", encoding="utf-8")
+    monkeypatch.setattr(runtime_selftest.subprocess, "run", lambda *a, **k: completed)
+
+    with pytest.raises(runtime_selftest.SelfTestError, match="Light OCR"):
+        runtime_selftest._probe_light_ocr(tmp_path)
 
 
 def test_mcp_probe_calls_library_status_with_actual_vault(

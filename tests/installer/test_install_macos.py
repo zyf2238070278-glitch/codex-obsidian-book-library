@@ -119,6 +119,7 @@ def test_install_rapidocr_models_copies_pinned_models_from_venv(tmp_path: Path) 
 
 def test_install_light_ocr_runtime_uses_pinned_macos_arm64_package(
     tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     project_root = tmp_path / "Book Library Release"
     (project_root / "scripts").mkdir(parents=True)
@@ -131,6 +132,11 @@ def test_install_light_ocr_runtime_uses_pinned_macos_arm64_package(
     npm = project_root / "runtime" / "node" / "bin" / "npm"
     _create_executable(node)
     _create_executable(npm)
+    monkeypatch.setattr(
+        install_macos,
+        "ensure_node_runtime",
+        lambda _root: project_root / "runtime" / "node",
+    )
     calls: list[list[str]] = []
 
     def runner(
@@ -138,11 +144,11 @@ def test_install_light_ocr_runtime_uses_pinned_macos_arm64_package(
     ) -> subprocess.CompletedProcess[str]:
         calls.append(command)
         if command[-1] == "--version":
-            return subprocess.CompletedProcess(command, 0, "v24.4.1\n", "")
+            return subprocess.CompletedProcess(command, 0, "v24.15.0\n", "")
         if command[-2:] == ["-p", "process.arch"]:
             return subprocess.CompletedProcess(command, 0, "arm64\n", "")
         for relative in install_macos.LIGHT_OCR_REQUIRED_RUNTIME_FILES:
-            path = project_root / relative
+            path = Path(kwargs["cwd"]) / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"runtime")
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -156,10 +162,14 @@ def test_install_light_ocr_runtime_uses_pinned_macos_arm64_package(
     )
 
     assert installed_node == node.resolve()
-    assert calls[-1] == [str(npm.resolve()), "ci", "--omit=dev", "--ignore-scripts"]
+    assert calls[-2] == [str(npm.resolve()), "ci", "--omit=dev", "--ignore-scripts"]
+    assert calls[-1][0] == str(node.resolve())
+    assert calls[-1][1].endswith("scripts/light_ocr_worker.mjs")
 
 
-def test_install_light_ocr_runtime_rejects_unsupported_node(tmp_path: Path) -> None:
+def test_install_light_ocr_runtime_rejects_unsupported_node(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
     project_root = tmp_path / "Book Library Release"
     (project_root / "scripts").mkdir(parents=True)
     (project_root / "scripts" / "light_ocr_worker.mjs").write_text(
@@ -171,15 +181,20 @@ def test_install_light_ocr_runtime_rejects_unsupported_node(tmp_path: Path) -> N
     npm = project_root / "runtime" / "node" / "bin" / "npm"
     _create_executable(node)
     _create_executable(npm)
+    monkeypatch.setattr(
+        install_macos,
+        "ensure_node_runtime",
+        lambda _root: project_root / "runtime" / "node",
+    )
 
-    with pytest.raises(install_macos.InstallError, match="Node.js 22 或 24"):
+    with pytest.raises(install_macos.InstallError, match="固定的 Node.js 24.15.0"):
         install_macos._install_light_ocr_runtime(
             project_root,
             find_executable=lambda _name: (_ for _ in ()).throw(
                 AssertionError("pinned runtime must not search PATH")
             ),
             run_command=lambda command, **kwargs: subprocess.CompletedProcess(
-                command, 0, "v23.0.0\n", ""
+                command, 0, "v24.4.1\n", ""
             ),
         )
 
@@ -215,7 +230,7 @@ def test_install_light_ocr_runtime_bootstraps_node_when_path_has_none(
         if command[-2:] == ["-p", "process.arch"]:
             return subprocess.CompletedProcess(command, 0, "arm64\n", "")
         for relative in install_macos.LIGHT_OCR_REQUIRED_RUNTIME_FILES:
-            path = project_root / relative
+            path = Path(kwargs["cwd"]) / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"runtime")
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -229,7 +244,7 @@ def test_install_light_ocr_runtime_bootstraps_node_when_path_has_none(
     expected_runtime = project_root / "runtime" / "node"
     assert prepared == [project_root]
     assert installed_node == (expected_runtime / "bin" / "node").resolve()
-    assert calls[-1] == [
+    assert calls[-2] == [
         str((expected_runtime / "bin" / "npm").resolve()),
         "ci",
         "--omit=dev",
@@ -270,7 +285,7 @@ def test_install_light_ocr_runtime_prefers_pinned_runtime_over_path_node(
         if command[-2:] == ["-p", "process.arch"]:
             return subprocess.CompletedProcess(command, 0, "arm64\n", "")
         for relative in install_macos.LIGHT_OCR_REQUIRED_RUNTIME_FILES:
-            path = project_root / relative
+            path = Path(kwargs["cwd"]) / relative
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_bytes(b"runtime")
         return subprocess.CompletedProcess(command, 0, "", "")
@@ -285,6 +300,123 @@ def test_install_light_ocr_runtime_prefers_pinned_runtime_over_path_node(
     assert installed_node == (
         project_root / "runtime" / "node" / "bin" / "node"
     ).resolve()
+
+
+def test_light_ocr_startup_failure_preserves_existing_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project_root = tmp_path / "Release"
+    (project_root / "scripts").mkdir(parents=True)
+    (project_root / "scripts" / "light_ocr_worker.mjs").write_text(
+        "// worker", encoding="utf-8"
+    )
+    (project_root / "package.json").write_text("{}", encoding="utf-8")
+    (project_root / "package-lock.json").write_text("{}", encoding="utf-8")
+    node = project_root / "runtime" / "node" / "bin" / "node"
+    npm = project_root / "runtime" / "node" / "bin" / "npm"
+    _create_executable(node)
+    _create_executable(npm)
+    monkeypatch.setattr(
+        install_macos,
+        "ensure_node_runtime",
+        lambda _root: project_root / "runtime" / "node",
+    )
+    live = project_root / "node_modules"
+    live.mkdir()
+    (live / "working-runtime.txt").write_bytes(b"keep exactly")
+
+    def runner(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if command[-1] == "--version":
+            return subprocess.CompletedProcess(command, 0, "v24.15.0\n", "")
+        if command[-2:] == ["-p", "process.arch"]:
+            return subprocess.CompletedProcess(command, 0, "arm64\n", "")
+        if Path(command[0]) == npm.resolve():
+            for relative in install_macos.LIGHT_OCR_REQUIRED_RUNTIME_FILES:
+                path = Path(kwargs["cwd"]) / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"candidate")
+            return subprocess.CompletedProcess(command, 0, "", "")
+        raise subprocess.CalledProcessError(23, command)
+
+    with pytest.raises(install_macos.InstallError, match="Light OCR 启动自检"):
+        install_macos._install_light_ocr_runtime(
+            project_root,
+            find_executable=lambda _name: None,
+            run_command=runner,
+        )
+
+    assert (live / "working-runtime.txt").read_bytes() == b"keep exactly"
+
+
+def test_light_ocr_publication_failure_rolls_back_existing_dependencies(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project_root = tmp_path / "Release"
+    (project_root / "scripts").mkdir(parents=True)
+    (project_root / "scripts" / "light_ocr_worker.mjs").write_text(
+        "// worker", encoding="utf-8"
+    )
+    (project_root / "package.json").write_text("{}", encoding="utf-8")
+    (project_root / "package-lock.json").write_text("{}", encoding="utf-8")
+    node = project_root / "runtime" / "node" / "bin" / "node"
+    npm = project_root / "runtime" / "node" / "bin" / "npm"
+    _create_executable(node)
+    _create_executable(npm)
+    monkeypatch.setattr(
+        install_macos,
+        "ensure_node_runtime",
+        lambda _root: project_root / "runtime" / "node",
+    )
+    live = project_root / "node_modules"
+    live.mkdir()
+    (live / "working-runtime.txt").write_bytes(b"keep exactly")
+
+    def runner(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if command[-1] == "--version":
+            return subprocess.CompletedProcess(command, 0, "v24.15.0\n", "")
+        if command[-2:] == ["-p", "process.arch"]:
+            return subprocess.CompletedProcess(command, 0, "arm64\n", "")
+        if Path(command[0]) == npm.resolve():
+            for relative in install_macos.LIGHT_OCR_REQUIRED_RUNTIME_FILES:
+                path = Path(kwargs["cwd"]) / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"candidate")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    original_replace = install_macos.os.replace
+    failed = False
+
+    def replace(
+        source: object, destination: object, *args: object, **kwargs: object
+    ) -> None:
+        nonlocal failed
+        source_path = Path(source)
+        destination_path = Path(destination)
+        if (
+            not failed
+            and source_path.name == "node_modules"
+            and source_path.parent.name.startswith(".light-ocr-install-")
+            and destination_path == live
+        ):
+            failed = True
+            raise OSError("simulated publication failure")
+        original_replace(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(install_macos.os, "replace", replace)
+
+    with pytest.raises(install_macos.InstallError, match="发布 Light OCR"):
+        install_macos._install_light_ocr_runtime(
+            project_root,
+            find_executable=lambda _name: None,
+            run_command=runner,
+        )
+
+    assert (live / "working-runtime.txt").read_bytes() == b"keep exactly"
+    assert not list(project_root.glob(".node_modules-backup-*"))
 
 
 def test_default_project_root_is_distribution_root() -> None:

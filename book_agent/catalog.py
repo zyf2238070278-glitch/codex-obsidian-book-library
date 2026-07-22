@@ -52,6 +52,7 @@ def classify_book(title: str, author: str | None, preview: str) -> str:
 
 _BOOK_ID = re.compile(r"[0-9a-f]{24}")
 _UNSAFE_FILENAME = re.compile(r'[\\/:*?"<>|\x00-\x1f]')
+_MAX_FILENAME_BYTES = 255
 
 
 @dataclass(frozen=True)
@@ -346,8 +347,13 @@ views:
             raise ValueError(f"multiple catalog cards exist for book_id {book_id}")
         if matches:
             return matches[0]
-        safe_title = _UNSAFE_FILENAME.sub("_", title).strip(" .")[:80] or "未命名书籍"
-        return f"{safe_title}-{book_id}.md"
+        suffix = f"-{book_id}.md"
+        title_budget = _MAX_FILENAME_BYTES - len(suffix.encode("utf-8"))
+        sanitized = _UNSAFE_FILENAME.sub("_", title).strip(" .") or "未命名书籍"
+        safe_title = sanitized.encode("utf-8")[:title_budget].decode(
+            "utf-8", errors="ignore"
+        ).strip(" .") or "未命名书籍"
+        return f"{safe_title}{suffix}"
 
     @staticmethod
     def _read_card(directory_fd: int, name: str) -> str | None:

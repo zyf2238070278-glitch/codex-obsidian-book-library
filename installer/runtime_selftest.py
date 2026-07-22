@@ -135,6 +135,45 @@ def _probe_vision(helper: Path) -> None:
         raise SelfTestError("Vision OCR helper 不支持中文或英文识别。")
 
 
+def _probe_light_ocr(project_root: Path) -> None:
+    node = project_root / "runtime" / "node" / "bin" / "node"
+    worker = project_root / "scripts" / "light_ocr_worker.mjs"
+    for path, label, executable in (
+        (node, "Node.js", True),
+        (worker, "worker", False),
+    ):
+        try:
+            info = path.lstat()
+        except OSError as exc:
+            raise SelfTestError(f"Light OCR {label} 不可用：{path}") from exc
+        if (
+            not stat.S_ISREG(info.st_mode)
+            or path.is_symlink()
+            or info.st_size <= 0
+            or (executable and not os.access(path, os.X_OK))
+        ):
+            raise SelfTestError(f"Light OCR {label} 不可用：{path}")
+
+    try:
+        completed = subprocess.run(
+            [str(node), str(worker)],
+            cwd=project_root,
+            input='{"op":"close"}\n',
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=120,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        raise SelfTestError(f"Light OCR 启动自检无法运行：{exc}") from exc
+    if completed.returncode != 0:
+        raise SelfTestError(
+            f"Light OCR 启动自检失败：退出码 {completed.returncode}"
+        )
+    if completed.stdout or completed.stderr:
+        raise SelfTestError("Light OCR 启动自检产生了意外输出。")
+
+
 def _load_mcp_runtime() -> tuple[object, type, type, Callable[..., object]]:
     import anyio
     from mcp import ClientSession, StdioServerParameters
@@ -221,6 +260,7 @@ def run_selftest(
     embedding_probe: Callable[[Path], int] = _probe_embedding,
     rapidocr_probe: Callable[[Path], None] = _probe_rapidocr,
     vision_probe: Callable[[Path], None] = _probe_vision,
+    light_ocr_probe: Callable[[Path], None] = _probe_light_ocr,
     mcp_probe: Callable[[Path, Path], None] = _probe_mcp,
 ) -> SelfTestResult:
     selected_vault = vault if vault is not None else project_root / "Obsidian书库"
@@ -231,6 +271,7 @@ def run_selftest(
             raise SelfTestError(f"语义模型维度错误：预期 384，实际 {dimensions}")
         rapidocr_probe(project_root / "data" / "ocr-models" / "rapidocr")
         vision_probe(project_root / "bin" / "book-vision-ocr")
+        light_ocr_probe(project_root)
         mcp_probe(project_root, selected_vault)
     except SelfTestError:
         raise

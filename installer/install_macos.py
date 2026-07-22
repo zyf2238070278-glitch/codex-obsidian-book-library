@@ -7,6 +7,7 @@ import argparse
 import json
 import os
 import re
+import secrets
 import shutil
 import stat
 import subprocess
@@ -17,11 +18,15 @@ from pathlib import Path
 from typing import Any, Callable, Optional, Sequence
 
 try:
-    from installer.node_runtime import NodeRuntimeError, ensure_node_runtime
+    from installer.node_runtime import (
+        NODE_RUNTIME_VERSION,
+        NodeRuntimeError,
+        ensure_node_runtime,
+    )
 except ModuleNotFoundError as exc:
     if exc.name != "installer":
         raise
-    from node_runtime import NodeRuntimeError, ensure_node_runtime
+    from node_runtime import NODE_RUNTIME_VERSION, NodeRuntimeError, ensure_node_runtime
 
 
 EXIT_SUCCESS = 0
@@ -467,12 +472,12 @@ def _install_light_ocr_runtime(
         version = _run_validation_command(
             run_command, [str(node), "--version"], cwd=project_root
         )
-        match = re.fullmatch(
-            r"v(\d+)\.\d+\.\d+",
-            (getattr(version, "stdout", "") or "").strip(),
-        )
-        if match is None or int(match.group(1)) not in {22, 24}:
-            raise InstallError("Light OCR 需要 Node.js 22 或 24。")
+        if (getattr(version, "stdout", "") or "").strip() != (
+            f"v{NODE_RUNTIME_VERSION}"
+        ):
+            raise InstallError(
+                f"Light OCR 需要固定的 Node.js {NODE_RUNTIME_VERSION}。"
+            )
         architecture = _run_validation_command(
             run_command,
             [str(node), "-p", "process.arch"],
@@ -480,34 +485,165 @@ def _install_light_ocr_runtime(
         )
         if (getattr(architecture, "stdout", "") or "").strip() != "arm64":
             raise InstallError("当前 macOS 版 Light OCR 只支持 arm64。")
-        child_environment = os.environ.copy()
-        child_environment["PATH"] = str(node.parent) + os.pathsep + child_environment.get(
-            "PATH", ""
-        )
-        run_command(
-            [str(npm), "ci", "--omit=dev", "--ignore-scripts"],
-            cwd=project_root,
-            check=True,
-            env=child_environment,
-        )
     except InstallError:
         raise
-    except subprocess.CalledProcessError as exc:
-        raise InstallError(
-            "Light OCR 依赖安装失败（退出码 %s）。" % exc.returncode
-        ) from exc
+    except OSError as exc:
+        raise InstallError("无法验证 Light OCR 的 Node.js：%s" % exc) from exc
+
+    child_environment = os.environ.copy()
+    child_environment["PATH"] = str(node.parent) + os.pathsep + child_environment.get(
+        "PATH", ""
+    )
+    try:
+        root_info = project_root.lstat()
+    except OSError as exc:
+        raise InstallError("Light OCR 项目目录不可用：%s" % exc) from exc
+    if stat.S_ISLNK(root_info.st_mode) or not stat.S_ISDIR(root_info.st_mode):
+        raise InstallError("Light OCR 项目目录必须是真实目录。")
+    root_identity = (root_info.st_dev, root_info.st_ino)
+
+    try:
+        with tempfile.TemporaryDirectory(
+            prefix=".light-ocr-install-", dir=project_root
+        ) as temporary:
+            staging_root = Path(temporary)
+            shutil.copy2(project_root / "package.json", staging_root / "package.json")
+            shutil.copy2(
+                project_root / "package-lock.json", staging_root / "package-lock.json"
+            )
+            staged_worker = staging_root / "scripts" / "light_ocr_worker.mjs"
+            staged_worker.parent.mkdir()
+            shutil.copy2(
+                project_root / "scripts" / "light_ocr_worker.mjs", staged_worker
+            )
+            try:
+                run_command(
+                    [str(npm), "ci", "--omit=dev", "--ignore-scripts"],
+                    cwd=staging_root,
+                    check=True,
+                    env=child_environment,
+                )
+            except subprocess.CalledProcessError as exc:
+                raise InstallError(
+                    "Light OCR 依赖安装失败（退出码 %s）。" % exc.returncode
+                ) from exc
+            _validate_light_ocr_runtime(staging_root)
+            try:
+                run_command(
+                    [str(node), str(staged_worker)],
+                    cwd=staging_root,
+                    check=True,
+                    env=child_environment,
+                    input='{"op":"close"}\n',
+                    text=True,
+                    capture_output=True,
+                    timeout=120,
+                )
+            except subprocess.CalledProcessError as exc:
+                raise InstallError(
+                    "Light OCR 启动自检失败（退出码 %s）。" % exc.returncode
+                ) from exc
+            except subprocess.TimeoutExpired as exc:
+                raise InstallError("Light OCR 启动自检超时。") from exc
+            _publish_light_ocr_dependencies(
+                project_root=project_root,
+                candidate=staging_root / "node_modules",
+                root_identity=root_identity,
+            )
+    except InstallError:
+        raise
     except OSError as exc:
         raise InstallError("无法安装 Light OCR：%s" % exc) from exc
 
+    _validate_light_ocr_runtime(project_root)
+    return node
+
+
+def _validate_light_ocr_runtime(root: Path) -> None:
+    node_modules = root / "node_modules"
+    try:
+        node_modules_info = node_modules.lstat()
+    except OSError as exc:
+        raise InstallError("Light OCR 运行目录缺失。") from exc
+    if stat.S_ISLNK(node_modules_info.st_mode) or not stat.S_ISDIR(
+        node_modules_info.st_mode
+    ):
+        raise InstallError("Light OCR 运行目录必须是真实目录。")
+
     for relative in LIGHT_OCR_REQUIRED_RUNTIME_FILES:
-        path = project_root / relative
+        path = root / relative
+        current = path.parent
+        while current != root:
+            try:
+                parent_info = current.lstat()
+            except OSError as exc:
+                raise InstallError("Light OCR 运行文件缺失：%s" % relative) from exc
+            if stat.S_ISLNK(parent_info.st_mode) or not stat.S_ISDIR(
+                parent_info.st_mode
+            ):
+                raise InstallError("Light OCR 运行目录包含无效链接：%s" % relative)
+            current = current.parent
         try:
             info = path.lstat()
         except OSError as exc:
             raise InstallError("Light OCR 运行文件缺失：%s" % relative) from exc
         if stat.S_ISLNK(info.st_mode) or not stat.S_ISREG(info.st_mode):
             raise InstallError("Light OCR 运行文件必须是普通文件：%s" % relative)
-    return node
+
+
+def _publish_light_ocr_dependencies(
+    *,
+    project_root: Path,
+    candidate: Path,
+    root_identity: tuple[int, int],
+) -> None:
+    live = project_root / "node_modules"
+    backup: Path | None = None
+    try:
+        root_info = project_root.lstat()
+        if (
+            stat.S_ISLNK(root_info.st_mode)
+            or not stat.S_ISDIR(root_info.st_mode)
+            or (root_info.st_dev, root_info.st_ino) != root_identity
+        ):
+            raise InstallError("Light OCR 项目目录在安装期间发生变化。")
+        candidate_info = candidate.lstat()
+        if stat.S_ISLNK(candidate_info.st_mode) or not stat.S_ISDIR(
+            candidate_info.st_mode
+        ):
+            raise InstallError("Light OCR 暂存依赖目录无效。")
+
+        try:
+            live_info = live.lstat()
+        except FileNotFoundError:
+            live_info = None
+        if live_info is not None:
+            if stat.S_ISLNK(live_info.st_mode) or not stat.S_ISDIR(live_info.st_mode):
+                raise InstallError("现有 Light OCR 依赖目录必须是真实目录。")
+            backup = project_root / f".node_modules-backup-{secrets.token_hex(12)}"
+            os.replace(live, backup)
+        try:
+            root_info = project_root.lstat()
+            if (
+                stat.S_ISLNK(root_info.st_mode)
+                or not stat.S_ISDIR(root_info.st_mode)
+                or (root_info.st_dev, root_info.st_ino) != root_identity
+            ):
+                raise InstallError("Light OCR 项目目录在发布期间发生变化。")
+            if live.exists() or live.is_symlink():
+                raise InstallError("Light OCR 依赖目录在发布期间发生变化。")
+            os.replace(candidate, live)
+        except BaseException:
+            if backup is not None and not live.exists() and not live.is_symlink():
+                os.replace(backup, live)
+                backup = None
+            raise
+        if backup is not None:
+            shutil.rmtree(backup)
+    except InstallError:
+        raise
+    except OSError as exc:
+        raise InstallError("无法发布 Light OCR 依赖：%s" % exc) from exc
 
 
 def install(

@@ -87,6 +87,17 @@ def test_sync_book_creates_links_and_initial_category(tmp_path: Path) -> None:
     assert "[[书库/10-原始书籍/世界摄影史.pdf|打开原始书籍]]" in text
 
 
+def test_sync_book_limits_catalog_filename_by_utf8_bytes(tmp_path: Path) -> None:
+    service, paths, _ = _catalog(tmp_path)
+    book = _book(paths)
+    book["title"] = "摄影艺术" * 40
+
+    card = service.sync_book(book)
+
+    assert len(card.name.encode("utf-8")) <= 255
+    assert card.name.endswith(f"-{'a' * 24}.md")
+
+
 def test_sync_book_preserves_user_categories_and_updates_system_fields(
     tmp_path: Path,
 ) -> None:

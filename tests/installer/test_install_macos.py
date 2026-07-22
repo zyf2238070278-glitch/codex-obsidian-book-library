@@ -199,6 +199,33 @@ def test_install_light_ocr_runtime_rejects_unsupported_node(
         )
 
 
+def test_install_light_ocr_runtime_maps_node_probe_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project_root = tmp_path / "Book Library Release"
+    (project_root / "scripts").mkdir(parents=True)
+    (project_root / "scripts" / "light_ocr_worker.mjs").write_text(
+        "// worker", encoding="utf-8"
+    )
+    (project_root / "package.json").write_text("{}", encoding="utf-8")
+    (project_root / "package-lock.json").write_text("{}", encoding="utf-8")
+    runtime = project_root / "runtime" / "node"
+    _create_executable(runtime / "bin" / "node")
+    _create_executable(runtime / "bin" / "npm")
+    monkeypatch.setattr(install_macos, "ensure_node_runtime", lambda _root: runtime)
+
+    with pytest.raises(
+        install_macos.InstallError, match="Node.js 验证失败（退出码 19）"
+    ):
+        install_macos._install_light_ocr_runtime(
+            project_root,
+            find_executable=lambda _name: None,
+            run_command=lambda command, **kwargs: (_ for _ in ()).throw(
+                subprocess.CalledProcessError(19, command)
+            ),
+        )
+
+
 def test_install_light_ocr_runtime_bootstraps_node_when_path_has_none(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -417,6 +444,60 @@ def test_light_ocr_publication_failure_rolls_back_existing_dependencies(
 
     assert (live / "working-runtime.txt").read_bytes() == b"keep exactly"
     assert not list(project_root.glob(".node_modules-backup-*"))
+
+
+def test_light_ocr_success_ignores_old_backup_cleanup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    project_root = tmp_path / "Release"
+    (project_root / "scripts").mkdir(parents=True)
+    (project_root / "scripts" / "light_ocr_worker.mjs").write_text(
+        "// worker", encoding="utf-8"
+    )
+    (project_root / "package.json").write_text("{}", encoding="utf-8")
+    (project_root / "package-lock.json").write_text("{}", encoding="utf-8")
+    runtime = project_root / "runtime" / "node"
+    node = runtime / "bin" / "node"
+    npm = runtime / "bin" / "npm"
+    _create_executable(node)
+    _create_executable(npm)
+    monkeypatch.setattr(install_macos, "ensure_node_runtime", lambda _root: runtime)
+    live = project_root / "node_modules"
+    live.mkdir()
+    (live / "old.txt").write_bytes(b"old")
+
+    def runner(
+        command: list[str], **kwargs: object
+    ) -> subprocess.CompletedProcess[str]:
+        if command[-1] == "--version":
+            return subprocess.CompletedProcess(command, 0, "v24.15.0\n", "")
+        if command[-2:] == ["-p", "process.arch"]:
+            return subprocess.CompletedProcess(command, 0, "arm64\n", "")
+        if Path(command[0]) == npm.resolve():
+            for relative in install_macos.LIGHT_OCR_REQUIRED_RUNTIME_FILES:
+                path = Path(kwargs["cwd"]) / relative
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_bytes(b"candidate")
+        return subprocess.CompletedProcess(command, 0, "", "")
+
+    original_rmtree = install_macos.shutil.rmtree
+
+    def rmtree(path: object, *args: object, **kwargs: object) -> None:
+        if Path(path).name.startswith(".node_modules-backup-"):
+            raise OSError("cleanup denied")
+        original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(install_macos.shutil, "rmtree", rmtree)
+
+    installed = install_macos._install_light_ocr_runtime(
+        project_root,
+        find_executable=lambda _name: None,
+        run_command=runner,
+    )
+
+    assert installed == node.resolve()
+    assert not (live / "old.txt").exists()
+    assert (live / "@arcships" / "light-ocr" / "package.json").is_file()
 
 
 def test_default_project_root_is_distribution_root() -> None:

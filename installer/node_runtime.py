@@ -282,7 +282,12 @@ def ensure_node_runtime(
                     backup = None
                 raise
             if backup is not None:
-                shutil.rmtree(backup)
+                try:
+                    shutil.rmtree(backup)
+                except OSError:
+                    # Publication already succeeded; retain the recoverable
+                    # hidden backup instead of turning cleanup into failure.
+                    pass
     except NodeRuntimeError:
         raise
     except OSError as exc:

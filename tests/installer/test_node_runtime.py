@@ -158,6 +158,35 @@ def test_failed_runtime_repair_preserves_existing_tree(tmp_path: Path) -> None:
     assert node.read_bytes() == b"existing damaged runtime"
 
 
+def test_successful_runtime_repair_ignores_backup_cleanup_failure(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    payload = _archive_bytes()
+    arguments = {
+        "url": "https://example.invalid/node.tar.gz",
+        "sha256": hashlib.sha256(payload).hexdigest(),
+        "tree_sha256": _tree_digest(_expected_tree(tmp_path)),
+        "opener": lambda *_args, **_kwargs: io.BytesIO(payload),
+    }
+    root = node_runtime.ensure_node_runtime(tmp_path, **arguments)
+    node = root / "bin" / "node"
+    node.write_bytes(b"damaged")
+    node.chmod(0o755)
+    original_rmtree = node_runtime.shutil.rmtree
+
+    def rmtree(path: object, *args: object, **kwargs: object) -> None:
+        if Path(path).name.startswith(".node-backup-"):
+            raise OSError("cleanup denied")
+        original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(node_runtime.shutil, "rmtree", rmtree)
+
+    repaired = node_runtime.ensure_node_runtime(tmp_path, **arguments)
+
+    assert repaired == root
+    assert node.read_bytes() == b"node"
+
+
 def test_ensure_node_runtime_rejects_symlinked_runtime_parent(tmp_path: Path) -> None:
     outside = tmp_path / "outside"
     outside.mkdir()

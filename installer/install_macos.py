@@ -487,6 +487,10 @@ def _install_light_ocr_runtime(
             raise InstallError("当前 macOS 版 Light OCR 只支持 arm64。")
     except InstallError:
         raise
+    except subprocess.CalledProcessError as exc:
+        raise InstallError(
+            "Node.js 验证失败（退出码 %s）。" % exc.returncode
+        ) from exc
     except OSError as exc:
         raise InstallError("无法验证 Light OCR 的 Node.js：%s" % exc) from exc
 
@@ -639,7 +643,12 @@ def _publish_light_ocr_dependencies(
                 backup = None
             raise
         if backup is not None:
-            shutil.rmtree(backup)
+            try:
+                shutil.rmtree(backup)
+            except OSError:
+                # The validated candidate is already live. A stale hidden backup
+                # is preferable to falsely reporting that installation failed.
+                pass
     except InstallError:
         raise
     except OSError as exc:

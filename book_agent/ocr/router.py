@@ -89,6 +89,7 @@ class LocalOcrRouter:
         pixel_count = len(samples) // channels
         step = max(1, pixel_count // 100_000)
         observed = midtones = chromatic = ink = 0
+        tone_bins: dict[tuple[int, int, int], int] = {}
         for pixel_index in range(0, pixel_count, step):
             offset = pixel_index * channels
             if channels >= 3:
@@ -100,9 +101,17 @@ class LocalOcrRouter:
             midtones += 20 < luminance < 235
             chromatic += max(red, green, blue) - min(red, green, blue) >= 24
             ink += luminance < 245
+            tone = (red // 32, green // 32, blue // 32)
+            tone_bins[tone] = tone_bins.get(tone, 0) + 1
         if observed == 0 or ink / observed <= 0.01:
             return False
-        return midtones / observed >= 0.20 or chromatic / observed >= 0.12
+        significant_threshold = max(2, int(observed * 0.02))
+        significant_tones = sum(
+            count >= significant_threshold for count in tone_bins.values()
+        )
+        return significant_tones >= 3 and (
+            midtones / observed >= 0.20 or chromatic / observed >= 0.12
+        )
 
     def _render_image(
         self, pdf: Path, page_index: int

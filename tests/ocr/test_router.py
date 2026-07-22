@@ -8,17 +8,38 @@ from book_agent.ocr.models import BoundingBox, OcrPageResult, VisionLine
 from book_agent.ocr.router import LocalOcrRouter
 
 
-def _pdf(path: Path, *, visual: bool = False, text: bool = False) -> Path:
+def _pdf(
+    path: Path,
+    *,
+    visual: bool = False,
+    text: bool = False,
+    gray_text: bool = False,
+) -> Path:
     document = fitz.open()
     page = document.new_page(width=100, height=100)
     if visual:
-        page.draw_rect(
-            fitz.Rect(10, 10, 90, 90),
-            color=(0.5, 0.2, 0.8),
-            fill=(0.5, 0.2, 0.8),
+        colors = (
+            (0.8, 0.2, 0.2),
+            (0.2, 0.7, 0.3),
+            (0.2, 0.4, 0.9),
+            (0.8, 0.7, 0.2),
+            (0.6, 0.3, 0.8),
         )
+        for index, color in enumerate(colors):
+            page.draw_rect(
+                fitz.Rect(5 + index * 18, 10, 23 + index * 18, 90),
+                color=color,
+                fill=color,
+            )
     if text:
         page.insert_text((8, 52), "TEXT PAGE 123", fontsize=11, color=(0, 0, 0))
+    if gray_text:
+        page.draw_rect(
+            fitz.Rect(0, 0, 100, 100),
+            color=(0.72, 0.72, 0.72),
+            fill=(0.72, 0.72, 0.72),
+        )
+        page.insert_text((8, 52), "AGED TEXT 123", fontsize=11, color=(0, 0, 0))
     document.save(path)
     document.close()
     return path
@@ -147,5 +168,17 @@ def test_router_keeps_text_like_page_with_empty_results_as_skipped(
         rapid=_ImageEngine(OcrPageResult(engine="rapidocr", lines=())),
         light=_ImageEngine(OcrPageResult(engine="light_ocr", lines=())),
     ).recognize_page(_pdf(tmp_path / "book.pdf", text=True), page_index=0)
+
+    assert decision.outcome.status == "skipped"
+
+
+def test_router_keeps_gray_paper_text_with_empty_results_as_skipped(
+    tmp_path: Path,
+) -> None:
+    decision = LocalOcrRouter(
+        vision=_Vision(OcrPageResult(engine="apple_vision", lines=())),
+        rapid=_ImageEngine(OcrPageResult(engine="rapidocr", lines=())),
+        light=_ImageEngine(OcrPageResult(engine="light_ocr", lines=())),
+    ).recognize_page(_pdf(tmp_path / "book.pdf", gray_text=True), page_index=0)
 
     assert decision.outcome.status == "skipped"

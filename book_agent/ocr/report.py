@@ -18,7 +18,31 @@ def write_ocr_report(
 
     if not paths.ocr_reports.is_dir():
         paths.ocr_reports.mkdir(parents=True, exist_ok=True)
-    lines = [f"# OCR 处理报告：{title}", "", f"书籍 ID：`{book_id}`", ""]
+    rows = list(skipped_pages)
+    counts = {
+        "recognized": 0,
+        "blank": 0,
+        "image_only": 0,
+        "skipped": len(rows),
+    }
+    if outcome_counts is not None:
+        counts.update(
+            {key: int(outcome_counts.get(key, 0)) for key in counts}
+        )
+    lines = [
+        "---",
+        f"book_id: {book_id}",
+        f"recognized_pages: {counts['recognized']}",
+        f"blank_pages: {counts['blank']}",
+        f"image_only_pages: {counts['image_only']}",
+        f"skipped_pages: {counts['skipped']}",
+        "---",
+        "",
+        f"# OCR 处理报告：{title}",
+        "",
+        f"书籍 ID：`{book_id}`",
+        "",
+    ]
     if outcome_counts is not None:
         lines.extend(
             [
@@ -31,7 +55,6 @@ def write_ocr_report(
                 "",
             ]
         )
-    rows = list(skipped_pages)
     if not rows:
         lines.extend(["## 结果", "", "没有跳过的 PDF 页面。", ""])
     else:

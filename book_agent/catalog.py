@@ -396,10 +396,17 @@ views:
         source_link = self._vault_link(book.get("original_path"))
         parsed_link = self._vault_link(book.get("parsed_path"))
         report = self.paths.ocr_reports / f"{book_id}-OCR处理报告.md"
-        report_link = self._vault_link(str(report)) if report.is_file() else ""
+        try:
+            report_info = report.lstat()
+            report_exists = stat.S_ISREG(report_info.st_mode) and not stat.S_ISLNK(
+                report_info.st_mode
+            )
+        except OSError:
+            report_exists = False
+        report_link = self._vault_link(str(report)) if report_exists else ""
         job = self.database.get_ocr_job(book_id)
         library_status = str(book.get("status") or "unknown")
-        if report_link:
+        if report_link and self._report_has_warnings(report):
             ocr_status = "warning"
         elif job:
             ocr_status = str(job.get("status"))
@@ -433,6 +440,16 @@ views:
             "",
         ]
         return "\n".join(lines)
+
+    @staticmethod
+    def _report_has_warnings(report: Path) -> bool:
+        try:
+            with report.open("r", encoding="utf-8", errors="replace") as source:
+                header = source.read(4096)
+        except OSError:
+            return True
+        match = re.search(r"(?m)^skipped_pages:\s*(\d+)\s*$", header)
+        return match is None or int(match.group(1)) > 0
 
     @staticmethod
     def _write_atomically(directory_fd: int, name: str, content: str) -> None:

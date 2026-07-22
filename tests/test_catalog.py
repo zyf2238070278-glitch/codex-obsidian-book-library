@@ -137,6 +137,22 @@ def test_sync_book_rejects_catalog_directory_symlink(tmp_path: Path) -> None:
     assert list(outside.iterdir()) == []
 
 
+def test_clean_ocr_report_is_linked_without_warning_status(tmp_path: Path) -> None:
+    service, paths, _ = _catalog(tmp_path)
+    book_id = "a" * 24
+    paths.ocr_reports.mkdir(parents=True, exist_ok=True)
+    (paths.ocr_reports / f"{book_id}-OCR处理报告.md").write_text(
+        "---\nskipped_pages: 0\n---\n# OCR 处理报告\n",
+        encoding="utf-8",
+    )
+
+    card = service.sync_book(_book(paths))
+
+    text = card.read_text(encoding="utf-8")
+    assert 'ocr_status: "not_required"' in text
+    assert "OCR处理报告" in text
+
+
 def test_sync_all_is_idempotent_and_writes_four_base_views(tmp_path: Path) -> None:
     service, paths, database = _catalog(tmp_path)
     for index, (title, source_format) in enumerate(

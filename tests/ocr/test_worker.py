@@ -77,6 +77,9 @@ def test_worker_resumes_first_missing_page_and_cleans_after_searchable(tmp_path)
     assert engine.requested_pages == [2, 3]
     assert database.get_ocr_job(book_id)["status"] == "completed"
     assert database.list_ocr_pages(book_id) == []
+    report = paths.ocr_reports / f"{book_id}-OCR处理报告.md"
+    assert report.is_file()
+    assert "识别文字页：3" in report.read_text(encoding="utf-8")
 
 
 def test_worker_syncs_catalog_after_searchable_completion(tmp_path):
@@ -92,7 +95,7 @@ def test_worker_syncs_catalog_after_searchable_completion(tmp_path):
     )
 
     assert worker.run_once() is True
-    assert catalog.book_ids == [book_id]
+    assert catalog.book_ids == [book_id, book_id]
 
 
 def test_worker_uses_real_catalog_by_default(tmp_path):
@@ -153,7 +156,7 @@ def test_page_fails_after_two_retries_and_worker_can_continue(tmp_path):
     assert engine.requested_pages == [1, 1, 1]
     assert database.get_ocr_job(book_id)["status"] == "failed"
     assert database.list_ocr_pages(book_id) == []
-    assert catalog.book_ids == [book_id]
+    assert catalog.book_ids == [book_id, book_id]
 
 
 def test_invalid_ocr_payload_never_becomes_page_text(tmp_path):

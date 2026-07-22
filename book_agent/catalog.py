@@ -14,23 +14,37 @@ from book_agent.config import AppPaths
 from book_agent.storage import Database
 
 
-_CATEGORY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("小说", ("小说", "第1章", "旧日之主")),
+_TITLE_CATEGORY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
     ("色彩科学与调色", ("调色", "colour book", "colour sense", "color correction")),
     ("虚拟现实与数字媒体", ("虚拟现实", "vr影像", "vr 影像")),
     ("摄影艺术与史论", ("摄影史", "摄影师", "照片的本质", "photograph")),
     ("电视与视频工程", ("电视原理", "电视技术", "广播电视")),
     ("影视制作与技术", ("影视技术", "视频技术", "电影制作")),
     ("艺术理论", ("艺术学", "艺术理论", "introduction to art")),
+    ("小说", ("小说", "旧日之主")),
+)
+
+_PREVIEW_CATEGORY_RULES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("色彩科学与调色", ("色彩校正", "colour sense", "color grading")),
+    ("虚拟现实与数字媒体", ("虚拟现实", "virtual reality")),
+    ("摄影艺术与史论", ("摄影艺术", "摄影史", "photographic")),
+    ("电视与视频工程", ("电视原理", "广播电视工程")),
+    ("影视制作与技术", ("影视制作", "电影制作技术", "视频技术")),
+    ("艺术理论", ("艺术学概论", "艺术理论")),
+    ("小说", ("旧日支配者", "网络小说")),
 )
 
 
 def classify_book(title: str, author: str | None, preview: str) -> str:
     """Return one deterministic primary category from bounded book metadata."""
 
-    haystack = "\n".join((title, author or "", preview[:4000])).casefold()
-    for category, terms in _CATEGORY_RULES:
-        if any(term.casefold() in haystack for term in terms):
+    title_haystack = "\n".join((title, author or "")).casefold()
+    for category, terms in _TITLE_CATEGORY_RULES:
+        if any(term.casefold() in title_haystack for term in terms):
+            return category
+    preview_haystack = preview[:4000].casefold()
+    for category, terms in _PREVIEW_CATEGORY_RULES:
+        if any(term.casefold() in preview_haystack for term in terms):
             return category
     return "待分类"
 

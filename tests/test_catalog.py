@@ -13,6 +13,30 @@ def test_classifier_uses_curated_taxonomy() -> None:
     assert classify_book("我操作的少女正在成为旧日之主", None, "") == "小说"
 
 
+def test_classifier_assigns_all_active_library_titles_before_preview_noise() -> None:
+    expected = {
+        "照片的本质": "摄影艺术与史论",
+        "摄影师之眼": "摄影艺术与史论",
+        "世界摄影史": "摄影艺术与史论",
+        "调色师手册 电影和视频调色专业技法 第2版": "色彩科学与调色",
+        "调色师手册 -电影和视频调色专业技法": "色彩科学与调色",
+        "Colour Sense & Measurement - Chinese GPT Translation Same Layout": "色彩科学与调色",
+        "视频技术基础 插图版": "影视制作与技术",
+        "电影制作技术手册 (刘戈三) (z-library.sk, 1lib.sk, z-lib.sk)": "影视制作与技术",
+        "影视技术基础 插图修订 第3版": "影视制作与技术",
+        "现代电视原理": "电视与视频工程",
+        "虚拟现实（VR）影像拍摄与制作（数字媒体艺术与技术丛书）": "虚拟现实与数字媒体",
+        "艺术学概论（第5版）": "艺术理论",
+        "我操作的少女正在成为旧日之主": "小说",
+    }
+    noisy_preview = "第1章 小说 color correction 摄影 虚拟现实 艺术理论"
+
+    assert {
+        title: classify_book(title, None, noisy_preview)
+        for title in expected
+    } == expected
+
+
 def test_classifier_uses_bounded_preview_and_safe_fallback() -> None:
     assert classify_book("新书", None, "虚拟现实影像制作") == "虚拟现实与数字媒体"
     assert classify_book("完全未知主题", None, "没有匹配词") == "待分类"

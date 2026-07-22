@@ -30,6 +30,7 @@ ENABLED_TOOLS = (
     "start_pending_ocr",
     "ocr_status",
     "pause_ocr",
+    "sync_book_catalog",
 )
 
 VAULT_DIRECTORIES = (
@@ -38,6 +39,7 @@ VAULT_DIRECTORIES = (
     Path("书库/20-解析文本"),
     Path("书库/30-AI读书笔记"),
     Path("书库/40-OCR报告"),
+    Path("书库/50-书目卡片"),
 )
 
 

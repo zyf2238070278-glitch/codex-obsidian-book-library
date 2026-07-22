@@ -23,6 +23,7 @@ TOOL_NAMES = (
     "start_pending_ocr",
     "ocr_status",
     "pause_ocr",
+    "sync_book_catalog",
 )
 
 ROOT = Path(os.environ.get("BOOK_LIBRARY_ROOT", os.getcwd())).expanduser().resolve()
@@ -62,6 +63,13 @@ def list_books(status: Optional[str] = None) -> dict[str, Any]:
     """List library book metadata, optionally filtered by import status."""
 
     return library_tools.list_books(status=status)
+
+
+@mcp.tool()
+def sync_book_catalog() -> dict[str, Any]:
+    """Synchronize Obsidian catalog metadata without returning book text."""
+
+    return library_tools.sync_book_catalog()
 
 
 @mcp.tool()

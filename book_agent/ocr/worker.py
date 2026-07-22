@@ -20,6 +20,7 @@ from typing import Any, Protocol
 
 import fitz
 
+from book_agent.catalog import CatalogService
 from book_agent.config import AppPaths
 from book_agent.indexing import BookIndexer
 from book_agent.models import ParsedBook, SourceUnit
@@ -101,6 +102,7 @@ class OcrWorker:
         indexer: BookIndexer,
         *,
         worker_id: str | None = None,
+        catalog: CatalogService | Any | None = None,
         lease_seconds: int = _LEASE_SECONDS,
         clock: Callable[[], datetime] = _now,
         monotonic: Callable[[], float] = time.monotonic,
@@ -119,6 +121,7 @@ class OcrWorker:
         self.database = database
         self.engine = engine
         self.indexer = indexer
+        self.catalog = catalog if catalog is not None else CatalogService(paths, database)
         self.worker_id = worker_id
         self.lease_seconds = lease_seconds
         self.clock = clock
@@ -319,6 +322,13 @@ class OcrWorker:
                 return
             self.database.complete_ocr_job(book_id, self.worker_id, now=self.clock())
             self.database.delete_ocr_page_checkpoints(book_id)
+            if self.catalog is not None:
+                refreshed = self.database.get_book(book_id)
+                if refreshed is not None:
+                    try:
+                        self.catalog.sync_book(refreshed)
+                    except (OSError, UnicodeError, ValueError):
+                        pass
         finally:
             document.close()
 

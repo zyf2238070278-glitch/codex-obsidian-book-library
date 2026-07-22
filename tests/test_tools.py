@@ -66,6 +66,44 @@ def test_build_tools_splits_existing_external_vault_from_project_data(
     assert not (project / "vault").exists()
 
 
+def test_import_creates_catalog_card_without_separate_sync(
+    library: LibraryTools,
+    tmp_path: Path,
+) -> None:
+    source = _write_chinese_book(tmp_path / "摄影师之眼.txt")
+
+    imported = library.import_book(str(source), title="摄影师之眼")
+
+    assert imported["ok"] is True
+    cards = list(library.paths.catalog_cards.glob(f"*-{imported['book_id']}.md"))
+    assert len(cards) == 1
+    assert 'primary_category: "摄影艺术与史论"' in cards[0].read_text(encoding="utf-8")
+
+
+def test_sync_book_catalog_returns_only_bounded_metadata(
+    library: LibraryTools,
+    tmp_path: Path,
+) -> None:
+    source = _write_chinese_book(tmp_path / "艺术学概论.txt")
+    imported = library.import_book(str(source), title="艺术学概论")
+    for card in library.paths.catalog_cards.glob("*.md"):
+        card.unlink()
+
+    synced = library.sync_book_catalog()
+
+    assert synced == {
+        "ok": True,
+        "total": 1,
+        "created": 1,
+        "updated": 0,
+        "failed": 0,
+        "errors": [],
+        "base_path": str(library.paths.catalog_base),
+    }
+    assert imported["book_id"] not in json.dumps(synced, ensure_ascii=False)
+    assert "text" not in json.dumps(synced, ensure_ascii=False).casefold()
+
+
 @pytest.mark.parametrize("vault_kind", ["missing", "file", "symlink"])
 def test_build_tools_rejects_invalid_explicit_vault_without_writing(
     tmp_path: Path,

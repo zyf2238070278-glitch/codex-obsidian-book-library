@@ -5,10 +5,11 @@ import hashlib
 import os
 import stat
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Any, Iterator
 
+from book_agent.catalog import CatalogService
 from book_agent.config import AppPaths
 from book_agent.indexing import BookIndexer
 from book_agent.parsers import (
@@ -93,6 +94,7 @@ class ImportService:
         *,
         vault_root_identity: tuple[int, int] | None = None,
         indexer: BookIndexer | None = None,
+        catalog: CatalogService | None = None,
     ) -> None:
         self.paths = paths
         self.database = database
@@ -112,6 +114,7 @@ class ImportService:
                 vault_root_identity=vault_root_identity,
             )
         )
+        self.catalog = catalog if catalog is not None else CatalogService(paths, database)
 
     def import_book(
         self,
@@ -130,7 +133,7 @@ class ImportService:
             book_id = content_hash[:24]
             try:
                 with self._book_lock(book_id):
-                    return self._import_locked(
+                    result = self._import_locked(
                         source_path=source_path,
                         suffix=suffix,
                         content_hash=content_hash,
@@ -138,6 +141,7 @@ class ImportService:
                         title=title,
                         author=author,
                     )
+                return self._sync_catalog(result)
             except _ContentHashDrift:
                 if attempt + 1 == _MAX_HASH_DRIFT_ATTEMPTS:
                     break
@@ -152,6 +156,26 @@ class ImportService:
             "待导入文件在复制期间持续发生变化，"
             f"已停止导入（共尝试 {_MAX_HASH_DRIFT_ATTEMPTS} 次）：{source_path}"
         )
+
+    def _sync_catalog(self, result: ImportResult) -> ImportResult:
+        try:
+            book = self.database.get_book(result.book_id)
+            if book is not None:
+                self.catalog.sync_book(
+                    book,
+                    preview=CatalogService._preview(book.get("parsed_path")),
+                )
+                self.catalog._write_atomically(
+                    self.paths.catalog_base,
+                    self.catalog._base_content(),
+                )
+        except (OSError, UnicodeError, ValueError) as exc:
+            detail = str(exc).strip() or exc.__class__.__name__
+            return replace(
+                result,
+                message=f"{result.message} 书目同步失败：{detail[:240]}",
+            )
+        return result
 
     def _import_locked(
         self,

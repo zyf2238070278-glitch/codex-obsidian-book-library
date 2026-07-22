@@ -118,11 +118,32 @@ def _user_categories(text: str) -> tuple[str, tuple[str, ...]]:
 
 
 class CatalogService:
-    def __init__(self, paths: AppPaths, database: Database) -> None:
+    def __init__(
+        self,
+        paths: AppPaths,
+        database: Database,
+        *,
+        vault_root_identity: tuple[int, int] | None = None,
+    ) -> None:
         self.paths = paths
         self.database = database
+        self._vault_root_identity = vault_root_identity
+
+    def _validate_vault_root(self) -> None:
+        try:
+            info = self.paths.vault.lstat()
+        except OSError as exc:
+            raise ValueError("Managed vault root is unavailable") from exc
+        if stat.S_ISLNK(info.st_mode) or not stat.S_ISDIR(info.st_mode):
+            raise ValueError("Managed vault root must be a real directory")
+        identity = (info.st_dev, info.st_ino)
+        if self._vault_root_identity is None:
+            self._vault_root_identity = identity
+        elif identity != self._vault_root_identity:
+            raise ValueError(f"Managed vault root identity changed: {self.paths.vault}")
 
     def sync_book(self, book: Mapping[str, Any], preview: str = "") -> Path:
+        self._validate_vault_root()
         book_id = str(book.get("book_id") or "")
         if _BOOK_ID.fullmatch(book_id) is None:
             raise ValueError("book_id must be exactly 24 lowercase hexadecimal characters")
@@ -149,6 +170,7 @@ class CatalogService:
         return card
 
     def sync_all(self) -> CatalogSyncResult:
+        self._validate_vault_root()
         books = self.database.list_books()
         created = 0
         updated = 0

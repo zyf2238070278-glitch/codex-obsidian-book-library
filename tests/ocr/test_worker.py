@@ -57,6 +57,15 @@ class _Indexer:
         return type("Result", (), {"status": self.status, "passage_count": self.passages})()
 
 
+class _Catalog:
+    def __init__(self) -> None:
+        self.book_ids: list[str] = []
+
+    def sync_book(self, book: dict[str, object]) -> Path:
+        self.book_ids.append(str(book["book_id"]))
+        return Path("card.md")
+
+
 def test_worker_resumes_first_missing_page_and_cleans_after_searchable(tmp_path):
     paths, database, _pdf, book_id = _app(tmp_path)
     database.claim_next_ocr_job("worker-a", 60)
@@ -68,6 +77,36 @@ def test_worker_resumes_first_missing_page_and_cleans_after_searchable(tmp_path)
     assert engine.requested_pages == [2, 3]
     assert database.get_ocr_job(book_id)["status"] == "completed"
     assert database.list_ocr_pages(book_id) == []
+
+
+def test_worker_syncs_catalog_after_searchable_completion(tmp_path):
+    paths, database, _pdf, book_id = _app(tmp_path, pages=1)
+    catalog = _Catalog()
+    worker = OcrWorker(
+        paths,
+        database,
+        _Engine({1: "recognized"}),
+        _Indexer(database, book_id),
+        worker_id="worker-a",
+        catalog=catalog,
+    )
+
+    assert worker.run_once() is True
+    assert catalog.book_ids == [book_id]
+
+
+def test_worker_uses_real_catalog_by_default(tmp_path):
+    paths, database, _pdf, book_id = _app(tmp_path, pages=1)
+    worker = OcrWorker(
+        paths,
+        database,
+        _Engine({1: "recognized"}),
+        _Indexer(database, book_id),
+        worker_id="worker-a",
+    )
+
+    assert worker.run_once() is True
+    assert len(list(paths.catalog_cards.glob(f"*-{book_id}.md"))) == 1
 
 
 def test_blank_pages_still_complete(tmp_path):

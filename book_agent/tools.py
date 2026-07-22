@@ -10,6 +10,7 @@ import re
 import stat
 from typing import Any
 
+from book_agent.catalog import CatalogService
 from book_agent.config import AppPaths, MAX_PREVIEWS
 from book_agent.embeddings import E5EmbeddingProvider, NullEmbeddingProvider
 from book_agent.importer import ImportService
@@ -184,6 +185,7 @@ class LibraryTools:
         embedding_provider: object,
         indexer: BookIndexer | None = None,
         ocr_service: OcrService | Any | None = None,
+        catalog: CatalogService | Any | None = None,
     ) -> None:
         self.paths = paths
         self.database = database
@@ -193,6 +195,7 @@ class LibraryTools:
         self.embedding_provider = embedding_provider
         self.indexer = indexer
         self.ocr_service = ocr_service
+        self.catalog = catalog
 
     @staticmethod
     def _guard(operation: Callable[[], dict[str, Any]]) -> dict[str, Any]:
@@ -223,6 +226,25 @@ class LibraryTools:
                 raise ValueError("status 必须是字符串或 null。")
             books = [_book_metadata(book) for book in self.database.list_books(status)]
             return {"ok": True, "count": len(books), "books": books}
+
+        return self._guard(operation)
+
+    def sync_book_catalog(self) -> dict[str, Any]:
+        """Synchronize Obsidian catalog metadata without returning book text."""
+
+        def operation() -> dict[str, Any]:
+            if self.catalog is None:
+                raise RuntimeError("书目同步服务未配置。")
+            result = self.catalog.sync_all()
+            return {
+                "ok": True,
+                "total": result.total,
+                "created": result.created,
+                "updated": result.updated,
+                "failed": result.failed,
+                "errors": list(result.errors),
+                "base_path": str(self.paths.catalog_base),
+            }
 
         return self._guard(operation)
 
@@ -484,12 +506,18 @@ def build_tools(
         provider,
         vault_root_identity=explicit_vault_identity,
     )
+    catalog = CatalogService(
+        paths,
+        database,
+        vault_root_identity=explicit_vault_identity,
+    )
     importer = ImportService(
         paths,
         database,
         provider,
         vault_root_identity=explicit_vault_identity,
         indexer=indexer,
+        catalog=catalog,
     )
     retriever = Retriever(database, provider)
     notes = NoteService(
@@ -507,4 +535,5 @@ def build_tools(
         embedding_provider=provider,
         indexer=indexer,
         ocr_service=ocr_service,
+        catalog=catalog,
     )
